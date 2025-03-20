@@ -38,6 +38,9 @@ def dm_to_cam_pc(dm, cam):
     y = (v - cy) / fy  # (H, W)
     z = dm  # (H, W)
 
+    mask = z > 0 # mask for negative/zero z
+    x, y, z = x[mask], y[mask], z[mask]
+
     cam_pc = np.stack([x * z, y * z, z], axis=-1).reshape(-1, 3)  # (N, 3)
     return cam_pc  # (N, 3)
 
@@ -112,7 +115,7 @@ def dm_to_cam_pm(dm, cam):
         cam (tuple): (intrinsics, extrinsics) - Camera parameters.
     
     Returns:
-        numpy.ndarray: (H, W, 3) - Camera point map in cam coordinates.
+        numpy.ndarray: (H, W, 4) - Camera point map in cam coordinates.
     """
     intrinsics, _ = cam
     H, W = dm.shape  # (H, W)
@@ -123,7 +126,9 @@ def dm_to_cam_pm(dm, cam):
     y = (v - cy) / fy  # (H, W)
     z = dm  # (H, W)
     cam_pm = np.stack([x * z, y * z, z], axis=-1)  # (H, W, 3)
-    return cam_pm  # (H, W, 3)
+    mask = (z > 0).astype(np.uint8)  # (H, W)
+    cam_pm = np.concatenate([cam_pm, mask[..., None]], axis=-1)  # (H, W, 4)
+    return cam_pm  # (H, W, 4)
 
 
 def cam_pc_to_cam_pm(cam_pc, cam, image_shape, valid=False):

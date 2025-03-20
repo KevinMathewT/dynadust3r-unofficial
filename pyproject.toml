@@ -38,6 +38,8 @@ jax = "0.4.27"
 jaxlib = "0.4.27"
 optax = "^0.2.4"
 chex = "^0.1.89"
+yt-dlp = "2024.11.18"
+einops = "^0.8.1"
 
 [build-system]
 requires = ["poetry-core"]

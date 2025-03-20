@@ -304,9 +304,16 @@ def visualize_sequence_from_pms(pms, motion_map, image_seq=None, name="seq_pm"):
     T = len(pms)
     assert motion_map.shape[0] == T - 1
 
+    print(f"Frame {0}: pm shape = {pms[0].shape}")
     pm = pms[0].reshape(-1, 4)
     valid_mask = pm[:, 3] > 0
     pc_valid = pm[valid_mask][:, :3]
+
+    img_flat = image_seq[0].reshape(-1, 3)
+    print(f"Frame {0}: pm shape = {pm.shape}")
+    print(f"Frame {0}: valid_mask shape = {valid_mask.shape}, count = {valid_mask.sum()}")
+    print(f"Frame {0}: image_seq[0] shape = {image_seq[0].shape}, reshaped shape = {img_flat.shape}")
+
     colors = image_seq[0].reshape(-1, 3)[valid_mask] if image_seq is not None else None
 
     for t in range(T):

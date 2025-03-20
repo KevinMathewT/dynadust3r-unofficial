@@ -7,6 +7,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 
+from loaders.utils import geometry as geo
+
+def get_scale(self, world_pc, dm, cam):
+    cam_pc = geo.world_pc_to_cam_pc(world_pc, cam)
+    cam_dm_pc = geo.dm_to_cam_pc(dm, cam)
+    cam_pm = geo.cam_pc_to_cam_pm(cam_pc, cam, dm.shape)
+    cam_dm_pm = geo.cam_pc_to_cam_pm(cam_dm_pc, cam, dm.shape)
+
+    scale = geo.compute_scale_difference(cam_pm, cam_dm_pm)
+    return scale
+
 def compute_point_cloud_scale_stats(pc1, pc2):
     """
     Compute the mean, median, and standard deviation of distances for two point clouds.

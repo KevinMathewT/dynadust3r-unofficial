@@ -19,22 +19,14 @@ class PointOdyssey:
         self.dataset_label = "pointodyssey"
         self.split = dset
 
-    def get_scale(self, world_pc, dm, cam):
-        cam_pc = geo.world_pc_to_cam_pc(world_pc, cam)
-        cam_dm_pc = geo.dm_to_cam_pc(dm, cam)
-        cam_pm = geo.cam_pc_to_cam_pm(cam_pc, cam, dm.shape)
-        cam_dm_pm = geo.cam_pc_to_cam_pm(cam_dm_pc, cam, dm.shape)
-
-        scale = geo.compute_scale_difference(cam_pm, cam_dm_pm)
-        return scale
-
     def get_frame_info(self, sequence_path, frame_index):
         image = cv2.imread(f"{sequence_path}/rgbs/rgb_{frame_index:05d}.jpg")[
             :, :, ::-1
         ]  # (H, W, 3)
-        dm = cv2.imread(
+        dm_16bit = cv2.imread(
             f"{sequence_path}/depths/depth_{frame_index:05d}.png", cv2.IMREAD_ANYDEPTH
         )  # (H, W)
+        dm = dm_16bit.astype(np.float32) / 65535.0 * 1000.0
 
         annotations = np.load(f"{sequence_path}/anno.npz", allow_pickle=True)
         intrinsics = annotations["intrinsics"][frame_index]  # (3, 3)
@@ -43,12 +35,6 @@ class PointOdyssey:
         world_pc = annotations["trajs_3d"][frame_index]  # (N, 3)
         validity = annotations["visibs"][frame_index][..., np.newaxis]  # (N, 1)
         # validity = annotations["valids"][frame_index][..., np.newaxis]  # (N, 1)
-
-        # scale = self.get_scale(world_pc, dm, cam)
-        # print("calculated scale: ", scale)
-
-        # world_pc = world_pc * scale if scale is not None else world_pc  # (N, 3)
-        # world_pc_valid = np.concatenate([world_pc, visibility], axis=1)  # (N, 4)
         world_pc_valid = np.concatenate([world_pc, validity], axis=1)  # (N, 4)
 
         return {
@@ -76,7 +62,7 @@ def main():
         else:
             print(k, v[0].shape, v[1].shape)
 
-    viz.visualize_cam_movement_in_world(dataset, seq_path, num_frames=10)
+    # viz.visualize_cam_movement_in_world(dataset, seq_path, num_frames=10)
 
     world_pc_valid = frame_info["world_pc_valid"]
     dm = frame_info["dm"]
@@ -95,6 +81,10 @@ def main():
     print(f"Camera DM PC min/max: {cam_dm_pc.min()}, {cam_dm_pc.max()}")
     print(f"Camera DM PC sample: {cam_dm_pc[:5]}")
 
+    print("Min depth:", np.min(dm))
+    print("Max depth:", np.max(dm))
+    print("Number of (0,0,0) points:", np.sum((cam_pc == [0, 0, 0]).all(axis=1)))
+    print("Number of (0,0,0) points:", np.sum((cam_dm_pc == [0, 0, 0]).all(axis=1)))
 
     print("Visualizing Point Cloud...")
     viz.visualize_pc(
@@ -104,7 +94,7 @@ def main():
         valid=True,
         pc_in_cam_coords=True,
     )
-
+    print("Visualizing Point Cloud Done.")
 
     print("Visualizing Point Cloud...")
     viz.visualize_pc(
@@ -115,6 +105,7 @@ def main():
         pc_in_cam_coords=True,
         # name="cam_dm_pc",
     )
+    print("Visualizing Point Cloud Done.")
 
     print("Visualizing Point Map...")
     viz.visualize_pm(
@@ -151,7 +142,7 @@ def main():
     print(f"valid in cam_pc: {[int(cpv[:, -1].sum()) for cpv in cam_pc_valids]}")
 
     cam_pms = [geo.cam_pc_to_cam_pm(cam_pc_valids[i], (cams[i][0], None), frame_infos[i]["dm"].shape, valid=True) for i in range(t)]
-
+    cam_dm_pms = [geo.dm_to_cam_pm(frame_infos[i]["dm"], cams[i]) for i in range(t)]
     print(f"valid in cam_pm: {[cp[..., -1].sum() for cp in cam_pms]}")
 
     motion_map = geo.get_motion_map_from_cam_pc(cam_pc_valids, cams[0][0], frame_infos[0]["dm"].shape)
@@ -160,7 +151,8 @@ def main():
     for ti in range(motion_map.shape[0]):
         print(f"valid in motion_map at t={ti}: {frame_infos[ti]['world_pc_valid'].shape[0]} + {frame_infos[ti + 1]['world_pc_valid'].shape[0]} -> {int(cam_pc_valids[ti][:, -1].sum())} + {int(cam_pc_valids[ti + 1][:, -1].sum())} -> {int(motion_map[ti, ..., -1].sum())}")
 
-    viz.visualize_sequence_from_pms(np.asarray(cam_pms), motion_map, images)
+    viz.visualize_sequence_from_pms(np.asarray(cam_pms), motion_map, images, name="cam_pms_motion_map")
+    viz.visualize_sequence_from_pms(np.asarray(cam_dm_pms), motion_map, images, name="cam_dm_pms_motion_map")
 
 
 if __name__ == "__main__":

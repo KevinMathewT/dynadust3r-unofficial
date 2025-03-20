@@ -905,6 +905,17 @@ files = [
 six = ">=1.4.0"
 
 [[package]]
+name = "einops"
+version = "0.8.1"
+description = "A new flavour of deep learning operations"
+optional = false
+python-versions = ">=3.8"
+files = [
+    {file = "einops-0.8.1-py3-none-any.whl", hash = "sha256:919387eb55330f5757c6bea9165c5ff5cfe63a642682ea788a6d472576d81737"},
+    {file = "einops-0.8.1.tar.gz", hash = "sha256:de5d960a7a761225532e0f1959e5315ebeafc0cd43394732f103ca44b9837e84"},
+]
+
+[[package]]
 name = "etils"
 version = "1.12.0"
 description = "Collection of common python utils"
@@ -6647,6 +6658,27 @@ multidict = ">=4.0"
 propcache = ">=0.2.0"
 
 [[package]]
+name = "yt-dlp"
+version = "2024.11.18"
+description = "A feature-rich command-line audio/video downloader"
+optional = false
+python-versions = ">=3.9"
+files = [
+    {file = "yt_dlp-2024.11.18-py3-none-any.whl", hash = "sha256:b9741695911dc566498b5f115cdd6b1abbc5be61cb01fd98abe649990a41656c"},
+    {file = "yt_dlp-2024.11.18.tar.gz", hash = "sha256:b8a4c23d3c9afd7e476bcdb87f38b6c0e8e12e3a239d7988f13acb434200f54d"},
+]
+
+[package.extras]
+build = ["build", "hatchling", "pip", "setuptools (>=71.0.2)", "wheel"]
+curl-cffi = ["curl-cffi (==0.5.10)", "curl-cffi (>=0.5.10,!=0.6.*,<0.7.2)"]
+default = ["brotli", "brotlicffi", "certifi", "mutagen", "pycryptodomex", "requests (>=2.32.2,<3)", "urllib3 (>=1.26.17,<3)", "websockets (>=13.0,<14)"]
+dev = ["autopep8 (>=2.0,<3.0)", "pre-commit", "pytest (>=8.1,<9.0)", "pytest-rerunfailures (>=14.0,<15.0)", "ruff (>=0.7.0,<0.8.0)"]
+pyinstaller = ["pyinstaller (>=6.11.1)"]
+secretstorage = ["cffi", "secretstorage"]
+static-analysis = ["autopep8 (>=2.0,<3.0)", "ruff (>=0.7.0,<0.8.0)"]
+test = ["pytest (>=8.1,<9.0)", "pytest-rerunfailures (>=14.0,<15.0)"]
+
+[[package]]
 name = "zstandard"
 version = "0.23.0"
 description = "Zstandard bindings for Python"
@@ -6761,4 +6793,4 @@ cffi = ["cffi (>=1.11)"]
 [metadata]
 lock-version = "2.0"
 python-versions = "3.10.2"
-content-hash = "b5cdcaff0ccef866a8c7eaf4a6cfe1f4b8fde13795b78b545d08f73d0a6b8607"
+content-hash = "427cfc0757695623cb3b64ea079a78fe8391beca12ad51f5a34ab7b6f8d1b044"

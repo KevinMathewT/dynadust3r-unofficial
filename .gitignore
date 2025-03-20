@@ -175,3 +175,4 @@ cython_debug/
 
 tmp/
 data/
+stereo4d_dataset/
