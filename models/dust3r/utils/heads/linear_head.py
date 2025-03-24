@@ -6,7 +6,7 @@
 # --------------------------------------------------------
 import torch.nn as nn
 import torch.nn.functional as F
-from dust3r.heads.postprocess import postprocess
+from models.dust3r.utils.heads.postprocess import postprocess
 
 
 class LinearPts3d (nn.Module):
