@@ -5,11 +5,6 @@ from typing import List
 from croco.models.dpt_block import DPTOutputAdapter  # noqa
 
 class TimePosEmbedding(nn.Module):
-    """
-    Computes sinusoidal time positional embeddings for a scalar t in [0,1].
-    Output is of shape [B, emb_dim], where emb_dim is typically 128.
-    """
-
     def __init__(self, emb_dim=128):
         super().__init__()
         self.emb_dim = emb_dim
@@ -26,11 +21,6 @@ class TimePosEmbedding(nn.Module):
         return angle_rads  # [B, emb_dim]
 
 class MotionDPTOutputAdapter(DPTOutputAdapter):
-    """
-    Motion-aware DPTOutputAdapter that injects time conditioning into each layer
-    using sinusoidal embeddings + MLP, following the DynaDUSt3R design.
-    """
-
     def __init__(self, time_pos_emb, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.time_pos_emb = time_pos_emb
