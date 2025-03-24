@@ -36,9 +36,9 @@ class MotionDPTOutputAdapter(DPTOutputAdapter):
         self.time_pos_emb = time_pos_emb
         self.linear_projections = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(self.time_pos_emb.emb_dim, 32),  # [B, 32]
+                nn.Linear(self.time_pos_emb.emb_dim, out_dim),  # [B, out_dim]
                 nn.SiLU(),
-                nn.Linear(32, out_dim)  # [B, out_dim]
+                nn.Linear(out_dim, out_dim)  # [B, out_dim]
             ) for out_dim in self.layer_dims
         ])
 
