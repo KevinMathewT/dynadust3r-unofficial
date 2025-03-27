@@ -1,0 +1,7 @@
+name: conf
+alpha: 0.2
+inner:
+  name: regr3d
+  norm_mode: avg_dis
+  gt_scale: false
+  reduction: mean

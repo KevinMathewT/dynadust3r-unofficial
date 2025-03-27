@@ -1,0 +1,19 @@
+model: {}
+dataset:
+  pointodyssey:
+    name: pointodyssey
+    path: data/pointodyssey
+    split: sample
+    max_frame_window: 10
+    pm_source: 3d_tracks
+optim:
+  name: adamw
+  lr: 0.001
+  betas:
+  - 0.9
+  - 0.95
+sched:
+  name: cosine
+  warmup_pct: 0.1
+train:
+  epochs: 100

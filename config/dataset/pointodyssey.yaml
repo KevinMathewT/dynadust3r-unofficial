@@ -1,0 +1,6 @@
+name: pointodyssey
+path: data/pointodyssey
+train_split: train
+valid_split: valid
+max_frame_window: 10
+pm_source: 3d_tracks # dm / 3d_tracks

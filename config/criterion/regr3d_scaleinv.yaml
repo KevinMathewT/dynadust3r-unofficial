@@ -1,0 +1,4 @@
+name: regr3d_scaleinv
+norm_mode: avg_dis
+gt_scale: false
+reduction: mean

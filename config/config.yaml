@@ -1,0 +1,28 @@
+defaults:
+  - model: dynadust3r
+  - optim: adamw
+  - sched: cosine
+  - criterion: conf  # or regr3d, regr3d_shiftinv, etc.
+  - dataset/pointodyssey@dataset.pointodyssey
+  - _self_
+
+train:
+  epochs: 100
+  grad_clip: 0
+
+valid:
+  interval: 5
+  save: 
+    save_best: True
+    best_metric: loss
+    lower_is_better: True
+    output_dir: weights/
+
+data:
+  loader: pointodyssey
+  batch_size: 32
+  num_workers: 4
+
+logging:
+  use_wandb: True
+  wandb_interval: 1
