@@ -2,14 +2,19 @@ import yaml
 import torch
 from accelerate import Accelerator
 
+import hydra
+from pprint import pprint
+from omegaconf import DictConfig, OmegaConf
+
 from models import get_model
 from loaders import get_loaders
 from criterion import get_criterion
 from optimizer import get_optimizer, get_scheduler
 
 from utils.train_utils import setup_distributed
+from engine import train_one_epoch
 
-def main(config):
+def run(config):
     setup_distributed()
 
     accelerator = Accelerator()
@@ -41,3 +46,18 @@ def main(config):
     for epoch in range(config.train.epochs):
         train_one_epoch(model, train_loader, valid_loader, criterion, optimizer, scheduler, accelerator, epoch, config)
 # 
+
+
+@hydra.main(version_base=None, config_path="config", config_name="config")
+def main(config: DictConfig):
+    print(f"----- Config -----")
+    print(OmegaConf.to_yaml(config))
+    print(f"-----------------")
+
+    run(config)
+
+if __name__ == "__main__":
+    # Initialize wandb
+    # init_wandb(config, args.config)
+
+    main()

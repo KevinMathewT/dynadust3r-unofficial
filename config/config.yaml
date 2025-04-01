@@ -20,7 +20,8 @@ valid:
 
 data:
   loader: pointodyssey
-  batch_size: 32
+  size: 512
+  batch_size: 2
   num_workers: 4
 
 logging:

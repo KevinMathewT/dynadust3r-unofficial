@@ -19,13 +19,13 @@ class PointOdyssey(StereoMotionBase):
         super().__init__(config)
         print("loading pointodyssey dataset...")
         
-        # Dataset-specific parameters
+        # dataset-specific parames
         if not valid:
             self.split = config.dataset.pointodyssey.train_split
         else:
             self.split = config.dataset.pointodyssey.valid_split
         
-        # Initialize sequence paths
+        # init sequence paths
         split_dir = os.path.join(self.dataset_location, self.split)
         if not os.path.exists(split_dir):
             raise ValueError(f"Dataset split directory not found: {split_dir}")
@@ -38,14 +38,14 @@ class PointOdyssey(StereoMotionBase):
                os.path.exists(os.path.join(seq_path, "anno.npz")):
                 self.sequence_paths.append(seq_path)
         
-        # Count frames in each sequence
+        # count frames in each sequence
         self.frame_counts = []
         for seq_path in self.sequence_paths:
             rgb_dir = os.path.join(seq_path, "rgbs")
             rgb_files = [f for f in os.listdir(rgb_dir) if f.endswith(".jpg")]
             self.frame_counts.append(len(rgb_files))
         
-        # Compute triplets
+        # compute triplets
         self._compute_triplets()
 
     def get_frame_info(self, sequence_path, frame_index):

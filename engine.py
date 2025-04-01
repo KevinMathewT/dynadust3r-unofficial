@@ -4,9 +4,6 @@ import wandb
 import numpy as np
 import time
 
-from utils.metrics import compute_metrics
-from utils.checkpoint import save_checkpoint
-
 
 def train_one_epoch(
     model,
@@ -68,7 +65,7 @@ def train_one_epoch(
         
         # compute metrics
         with torch.no_grad():
-            batch_metrics = compute_metrics(batch, outputs)
+            batch_metrics = model.compute_metrics(batch, outputs)
             
             for k, v in batch_metrics.items():
                 if k not in metrics:
@@ -200,7 +197,7 @@ def valid_one_epoch(
                 loss, loss_details = criterion(batch, outputs)
             
             # compute metrics
-            batch_metrics = compute_metrics(batch, outputs)
+            batch_metrics = model.compute_metrics(batch, outputs)
             
             for k, v in batch_metrics.items():
                 if k not in metrics:
@@ -263,7 +260,7 @@ def valid_one_epoch(
             model.best_metric = metric_val
         
         if is_best:
-            save_checkpoint(
+            model.save_checkpoint(
                 {
                     "epoch": epoch + 1,
                     "state_dict": accelerator.unwrap_model(model).state_dict(),
@@ -275,7 +272,7 @@ def valid_one_epoch(
                 filename=f"{config.valid.save.output_dir}/checkpoint_{epoch+1}.pth",
             )
     
-    # Collect results
+    # collect results
     results = {"loss": losses.avg}
     for k, meter in metrics.items():
         results[k] = meter.avg

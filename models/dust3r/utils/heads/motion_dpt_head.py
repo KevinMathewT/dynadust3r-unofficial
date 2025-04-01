@@ -4,7 +4,7 @@ import torch.nn as nn
 from einops import rearrange
 from typing import List
 from models.dust3r.utils.heads.postprocess import postprocess
-import dust3r.utils.path_to_croco  # noqa: F401
+# import dust3r.utils.path_to_croco  # noqa: F401
 from croco.models.dpt_block import DPTOutputAdapter  # noqa
 
 # taken from: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/embeddings.py#L27

@@ -33,6 +33,10 @@ def get_loaders(config):
         sampler=valid_sampler,
     )
 
+    # print dataset sizes
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Validation dataset size: {len(valid_dataset)}")
+
     # Debug print after loaders are created
     print(f"Global batch size: {config.data.batch_size}")
     if train_sampler:
@@ -44,5 +48,5 @@ def get_loaders(config):
         batch_keys = list(batch.keys())  # Dynamically check available keys
         print(f"Local batch size per GPU: {batch['image'][batch_keys[0]].size(0)}")
         break
-
+    
     return train_loader, valid_loader

@@ -22,11 +22,9 @@ def seed_everything(seed):
 
 
 def setup_distributed(seed=42):
-    if torch.cuda.device_count() > 1 and not is_initialized():
-        try:
-            init_process_group(backend="nccl", init_method="env://")
-        except ValueError as e:
-            print(f"Distributed setup skipped: {e}")
+    is_ddp = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    if is_ddp and not is_initialized():
+        init_process_group(backend="nccl", init_method="env://")
 
     print(f"[{os.environ.get('RANK', 0)}] Setting random seed to {seed}")
     seed_everything(seed)

@@ -1,6 +1,9 @@
 name: pointodyssey
-path: data/pointodyssey
-train_split: train
-valid_split: valid
+path: /scratch/projects/fouheylab/km6748/point_odyssey/
+train_split: test # train, test, sample
+valid_split: sample # train, test, sample
+# path: /scratch/km6748/vision-experiments/data/pointodyssey/pointodyssey
+# train_split: sample
+# valid_split: sample
 max_frame_window: 10
 pm_source: 3d_tracks # dm / 3d_tracks

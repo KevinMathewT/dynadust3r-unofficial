@@ -4,7 +4,6 @@
 import torch
 import cv2
 import numpy as np
-from utils.vo_eval import save_trajectory_tum_format
 from PIL import Image
 
 def get_stride_distribution(strides, dist_type='uniform'):
@@ -142,10 +141,10 @@ def invalid_to_zeros(arr, valid_mask, ndim=999):
         arr = arr.flatten(-2 - (arr.ndim - ndim), -2)
     return arr, nnz
 
-def save_tum_poses(traj, path):
-    # traj = self.get_tum_poses()
-    save_trajectory_tum_format(traj, path)
-    return traj[0] # return the poses
+# def save_tum_poses(traj, path):
+#     # traj = self.get_tum_poses()
+#     save_trajectory_tum_format(traj, path)
+#     return traj[0] # return the poses
 
 def save_focals(focals, path):
     # convert focal to txt
