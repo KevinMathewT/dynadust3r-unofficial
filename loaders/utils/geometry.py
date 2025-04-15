@@ -3,7 +3,11 @@ Author: Kevin Mathew T
 Date: 2025-03-10
 """
 
+import cv2
+import torch
 import numpy as np
+from PIL import Image
+
 from scipy.spatial.transform import Rotation
 
 
@@ -38,11 +42,12 @@ def dm_to_cam_pc(dm, cam):
     y = (v - cy) / fy  # (H, W)
     z = dm  # (H, W)
 
-    mask = z > 0 # mask for negative/zero z
+    mask = z > 0  # mask for negative/zero z
     x, y, z = x[mask], y[mask], z[mask]
 
     cam_pc = np.stack([x * z, y * z, z], axis=-1).reshape(-1, 3)  # (N, 3)
     return cam_pc  # (N, 3)
+
 
 def cam_pc_to_world_pc(cam_pc, cam):
     """
@@ -61,10 +66,11 @@ def cam_pc_to_world_pc(cam_pc, cam):
         numpy.ndarray: (N, 3) - World point cloud in world coordinates.
     """
     _, extrinsics = cam
-    R = extrinsics[:3, :3] # (3, 3)
-    t = extrinsics[:3, 3] # (3,)
-    world_pc = (R.T @ (cam_pc - t).T).T # (N, 3)
-    return world_pc # (N, 3)
+    R = extrinsics[:3, :3]  # (3, 3)
+    t = extrinsics[:3, 3]  # (3,)
+    world_pc = (R.T @ (cam_pc - t).T).T  # (N, 3)
+    return world_pc  # (N, 3)
+
 
 def world_pc_to_cam_pc(world_pc, cam):
     """
@@ -87,6 +93,7 @@ def world_pc_to_cam_pc(world_pc, cam):
     cam_pc = (R @ world_pc.T).T + t  # (N, 3)
     return cam_pc  # (N, 3)
 
+
 def dm_to_world_pc(dm, cam):
     """
     Converts a dm directly to a world point cloud.
@@ -106,14 +113,15 @@ def dm_to_world_pc(dm, cam):
     world_pc = cam_pc_to_world_pc(cam_pc, cam)
     return world_pc  # (N, 3)
 
+
 def dm_to_cam_pm(dm, cam):
     """
     Converts a dm to a cam point map (H, W, 3), where each pixel contains a 3D point.
-    
+
     Args:
         dm (numpy.ndarray): (H, W) - Depth map with per-pixel depth values.
         cam (tuple): (intrinsics, extrinsics) - Camera parameters.
-    
+
     Returns:
         numpy.ndarray: (H, W, 4) - Camera point map in cam coordinates.
     """
@@ -131,9 +139,48 @@ def dm_to_cam_pm(dm, cam):
     return cam_pm  # (H, W, 4)
 
 
+def cam_pc_to_cam_pm_with_torch(cam_pc, cam, image_shape, valid=False):
+    """
+    Projects a cam-space point cloud (N,3) or (N,4) onto an image plane and
+    stores the corresponding 3D points in a (H, W, 4) tensor at their respective pixel locations.
+    The last channel in the output (H, W, 4) indicates whether a pixel is valid (1) or invalid (0).
+
+    Args:
+        cam_pc (torch.Tensor): (N, 3) or (N, 4) - 3D points in cam coordinates.
+        cam (tuple): (intrinsics, extrinsics) - Camera parameters (extrinsics ignored).
+        image_shape (tuple): (H, W) - Shape of the target image.
+        valid (bool): If True, uses the fourth channel of cam_pc for validity.
+
+    Returns:
+        torch.Tensor: (H, W, 4) - Camera point map with validity mask in the last channel.
+    """
+    intrinsics, _ = cam
+    height, width = image_shape
+
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+
+    x, y, z = cam_pc[:, 0], cam_pc[:, 1], cam_pc[:, 2]
+    u = (x * fx / z + cx).int()
+    v = (y * fy / z + cy).int()
+
+    cam_pm = torch.zeros((height, width, 4), dtype=cam_pc.dtype, device=cam_pc.device)
+
+    # negative z
+    validity_mask = (z > 0) & (u >= 0) & (u < width) & (v >= 0) & (v < height)
+
+    if valid and cam_pc.shape[1] == 4:
+        validity_mask = validity_mask & (cam_pc[:, 3] > 0)
+
+    cam_pm[v[validity_mask], u[validity_mask], :3] = cam_pc[validity_mask, :3]
+    cam_pm[v[validity_mask], u[validity_mask], 3] = 1  # mark valid pixels
+
+    return cam_pm
+
+
 def cam_pc_to_cam_pm(cam_pc, cam, image_shape, valid=False):
     """
-    Projects a cam-space point cloud (N,3) or (N,4) onto an image plane and 
+    Projects a cam-space point cloud (N,3) or (N,4) onto an image plane and
     stores the corresponding 3D points in a (H, W, 4) array at their respective pixel locations.
     The last channel in the output (H, W, 4) indicates whether a pixel is valid (1) or invalid (0).
 
@@ -192,7 +239,9 @@ def compute_scale_difference(approx_pm, actual_pm):
     if len(approx_points) == 0:
         return None  # no valid points
 
-    scale_ratios = np.linalg.norm(actual_points, axis=1) / np.linalg.norm(approx_points, axis=1)
+    scale_ratios = np.linalg.norm(actual_points, axis=1) / np.linalg.norm(
+        approx_points, axis=1
+    )
     print(f"Scale Ratios: {scale_ratios}")
     return np.median(scale_ratios)
 
@@ -200,12 +249,12 @@ def compute_scale_difference(approx_pm, actual_pm):
 def get_motion_map_from_cam_pc(cam_pc_valid_list, ref_intrinsics, image_dimensions):
     """
     Computes a motion map between consecutive frames.
-    
+
     Args:
         cam_pc_valid_list (list of numpy.ndarray): List of (N, 4) camera point clouds with validity mask.
         ref_intrinsics (numpy.ndarray): (3, 3) Camera intrinsic matrix.
         image_dimensions (tuple): (H, W) Image height and width.
-    
+
     Returns:
         numpy.ndarray: (T-1, H, W, 4) Motion map where the last channel indicates validity.
     """
@@ -224,7 +273,11 @@ def get_motion_map_from_cam_pc(cam_pc_valid_list, ref_intrinsics, image_dimensio
 
         motion_3d = cam_pc_target_valid - cam_pc_ref_valid  # (M, 3)
 
-        x, y, z = cam_pc_ref_valid[:, 0], cam_pc_ref_valid[:, 1], cam_pc_ref_valid[:, 2]  # (M,)
+        x, y, z = (
+            cam_pc_ref_valid[:, 0],
+            cam_pc_ref_valid[:, 1],
+            cam_pc_ref_valid[:, 2],
+        )  # (M,)
         fx, fy = ref_intrinsics[0, 0], ref_intrinsics[1, 1]  # (scalar, scalar)
         cx, cy = ref_intrinsics[0, 2], ref_intrinsics[1, 2]  # (scalar, scalar)
 
@@ -245,3 +298,216 @@ def get_motion_map_from_cam_pc(cam_pc_valid_list, ref_intrinsics, image_dimensio
         motion_map[i, v_valid, u_valid, 3] = 1  # (M_valid,)
 
     return motion_map  # (T-1, H, W, 4)
+
+
+##################################################
+#        CROPPING AND RESIZING FUNCTIONS         #
+##################################################
+
+
+def crop_image_depthmap(image, depthmap, intrinsics, crop_bbox):
+    """
+    Apply consistent crop to image, depthmap and adjust camera intrinsics.
+
+    Args:
+        image: RGB image array (H, W, 3) or PIL Image
+        depthmap: Depth map array (H, W)
+        intrinsics: Camera intrinsic matrix (3, 3)
+        crop_bbox: Crop bounding box as (left, top, right, bottom)
+
+    Returns:
+        tuple: (cropped_image, cropped_depthmap, adjusted_intrinsics)
+    """
+    l, t, r, b = crop_bbox
+
+    if not isinstance(image, Image.Image):
+        image = Image.fromarray(image)  # convert to pil image
+
+    cropped_image = image.crop((l, t, r, b))  # (new_W, new_H)
+    cropped_depthmap = depthmap[t:b, l:r]  # (new_H, new_W)
+
+    adjusted_intrinsics = intrinsics.copy()  # (3, 3)
+    adjusted_intrinsics[0, 2] -= l  # adjust cx
+    adjusted_intrinsics[1, 2] -= t  # adjust cy
+
+    return cropped_image, cropped_depthmap, adjusted_intrinsics
+
+
+def rescale_image_depthmap(image, depthmap, intrinsics, target_resolution, force=True):
+    """
+    Rescale image and depthmap to match target resolution with appropriate interpolation.
+
+    Args:
+        image: RGB image (PIL Image or numpy array)
+        depthmap: Depth map array (H, W)
+        intrinsics: Camera intrinsic matrix (3, 3)
+        target_resolution: Target resolution as (width, height)
+        force: Whether to force rescaling even if downscaling not needed
+
+    Returns:
+        tuple: (resized_image, resized_depthmap, adjusted_intrinsics)
+    """
+    if not isinstance(image, Image.Image):
+        image = Image.fromarray(image)  # convert to pil image
+
+    input_resolution = np.array(image.size)  # (W, H)
+    target_resolution = np.array(target_resolution)  # (W, H)
+
+    scale_factor = max(target_resolution / input_resolution) + 1e-8  # scaling factor
+
+    if scale_factor >= 1 and not force:
+        return image, depthmap, intrinsics
+
+    output_resolution = np.floor(input_resolution * scale_factor).astype(int)  # (W, H)
+
+    try:
+        resized_image = image.resize(
+            tuple(output_resolution),
+            resample=(
+                Image.Resampling.LANCZOS
+                if scale_factor < 1
+                else Image.Resampling.BICUBIC
+            ),
+        )  # (new_W, new_H)
+    except AttributeError:
+        resized_image = image.resize(
+            tuple(output_resolution),
+            resample=Image.Resampling.LANCZOS if scale_factor < 1 else Image.Resampling.BICUBIC,
+        )  # (new_W, new_H)
+
+    if depthmap is not None:
+        resized_depthmap = cv2.resize(
+            depthmap, tuple(output_resolution), interpolation=cv2.INTER_NEAREST
+        )  # (new_H, new_W)
+    else:
+        resized_depthmap = None
+
+    adjusted_intrinsics = compute_camera_matrix_for_crop(
+        intrinsics, input_resolution, output_resolution, scaling=scale_factor
+    )  # (3, 3)
+
+    return resized_image, resized_depthmap, adjusted_intrinsics
+
+
+def compute_camera_matrix_for_crop(
+    intrinsics,
+    input_resolution,
+    output_resolution,
+    scaling=1,
+    offset_factor=0.5,
+    offset=None,
+):
+    """
+    Compute adjusted camera matrix for a crop/resize operation.
+
+    Args:
+        intrinsics: Camera intrinsic matrix (3, 3)
+        input_resolution: Input image resolution (width, height)
+        output_resolution: Output image resolution (width, height)
+        scaling: Scaling factor for focal length
+        offset_factor: Factor for determining crop offset (0.5 = center)
+        offset: Explicit offset (if None, calculated from offset_factor)
+
+    Returns:
+        numpy.ndarray: Adjusted camera intrinsic matrix (3, 3)
+    """
+    input_resolution = np.asarray(input_resolution)  # (W, H)
+    output_resolution = np.asarray(output_resolution)  # (W, H)
+
+    margins = np.asarray(input_resolution) * scaling - output_resolution  # (W, H)
+    assert np.all(
+        margins >= 0.0
+    ), "Output resolution cannot be larger than scaled input"
+
+    if offset is None:
+        offset = offset_factor * margins  # (W, H)
+
+    adjusted_intrinsics = intrinsics.copy()  # (3, 3)
+    adjusted_intrinsics[0, 0] *= scaling  # scale fx
+    adjusted_intrinsics[1, 1] *= scaling  # scale fy
+    adjusted_intrinsics[0, 2] = (
+        adjusted_intrinsics[0, 2] * scaling - offset[0]
+    )  # adjust cx
+    adjusted_intrinsics[1, 2] = (
+        adjusted_intrinsics[1, 2] * scaling - offset[1]
+    )  # adjust cy
+
+    return adjusted_intrinsics
+
+
+def crop_resize_if_necessary(image, depthmap, intrinsics, output_resolution):
+    """
+    Apply appropriate cropping and resizing to maintain geometric consistency.
+
+    Args:
+        image: RGB image (PIL Image or numpy array)
+        depthmap: Depth map array (H, W)
+        intrinsics: Camera intrinsic matrix (3, 3)
+        output_resolution: Target output resolution (width, height)
+
+    Returns:
+        tuple: (processed_image, processed_depthmap, adjusted_intrinsics)
+    """
+    if not isinstance(image, Image.Image):
+        image = Image.fromarray(image)  # convert to pil image
+
+    W, H = image.size  # (W, H)
+    cx, cy = intrinsics[:2, 2].round().astype(int)  # (cx, cy)
+
+    min_margin_x = min(cx, W - cx)  # horizontal margin
+    min_margin_y = min(cy, H - cy)  # vertical margin
+
+    l, t = cx - min_margin_x, cy - min_margin_y  # left, top
+    r, b = cx + min_margin_x, cy + min_margin_y  # right, bottom
+    crop_bbox = (l, t, r, b)  # (l, t, r, b)
+
+    # print(f"depthmap: {depthmap}")
+    # import loaders.utils.viz as viz
+    # viz.visualize_dm(depthmap, image=image, cam=(intrinsics, None), name="before_first_crop")
+
+    image, depthmap, intrinsics = crop_image_depthmap(
+        image, depthmap, intrinsics, crop_bbox
+    )  # initial crop
+
+    image, depthmap, intrinsics = rescale_image_depthmap(
+        image, depthmap, intrinsics, output_resolution
+    )  # resize to target
+
+    final_intrinsics = compute_camera_matrix_for_crop(
+        intrinsics, image.size, output_resolution
+    )  # (3, 3)
+
+    W, H = image.size  # (W, H)
+    out_width, out_height = output_resolution  # (out_W, out_H)
+    l, t = np.int32(np.round(intrinsics[:2, 2] - final_intrinsics[:2, 2]))  # (l, t)
+    r, b = l + out_width, t + out_height  # (r, b)
+    final_crop_bbox = (l, t, r, b)  # (l, t, r, b)
+
+    image, depthmap, intrinsics = crop_image_depthmap(
+        image, depthmap, intrinsics, final_crop_bbox
+    )  # final crop
+
+    # viz.visualize_dm(depthmap, image=image, cam=(intrinsics, None), name="after_final_image_crop")
+
+    return image, depthmap, intrinsics
+
+
+def bbox_from_intrinsics_in_out(input_intrinsics, output_intrinsics, output_resolution):
+    """
+    Compute crop bounding box from input and output intrinsics.
+
+    Args:
+        input_intrinsics: Input camera intrinsic matrix (3, 3)
+        output_intrinsics: Output camera intrinsic matrix (3, 3)
+        output_resolution: Output resolution (width, height)
+
+    Returns:
+        tuple: Crop bounding box (left, top, right, bottom)
+    """
+    out_width, out_height = output_resolution  # (W, H)
+    l, t = np.int32(
+        np.round(input_intrinsics[:2, 2] - output_intrinsics[:2, 2])
+    )  # (l, t)
+    crop_bbox = (l, t, l + out_width, t + out_height)  # (l, t, r, b)
+
+    return crop_bbox

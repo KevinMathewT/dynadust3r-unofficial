@@ -7,6 +7,7 @@
 from copy import deepcopy
 import torch
 import os
+import numpy as np
 from packaging import version
 import huggingface_hub
 
@@ -14,8 +15,15 @@ from models.dust3r.utils.misc import fill_default_args, freeze_all_params, is_sy
 from models.dust3r.utils.heads import head_factory, motion_head_factory
 from models.dust3r.utils.patch_embed import get_patch_embed
 
+import loaders.utils.geometry as geom
+from loaders.utils.viz import (
+    visualize_image, 
+    visualize_pm, 
+    visualize_sequence_from_pms
+)
+
 # import dust3r.utils.path_to_croco  # noqa: F401
-from models.dust3r.croco.croco import CroCoNet  # noqa
+from models.croco.croco import CroCoNet  # noqa
 
 inf = float('inf')
 
@@ -25,22 +33,7 @@ assert version.parse(hf_version_number) >= version.parse("0.22.0"), ("Outdated h
 
 
 def load_model(model_path, device, verbose=True):
-    if verbose:
-        print('... loading model from', model_path)
-    ckpt = torch.load(model_path, map_location='cpu')
-    args = ckpt['args'].model.replace("ManyAR_PatchEmbed", "PatchEmbedDust3R")
-    if 'landscape_only' not in args:
-        args = args[:-1] + ', landscape_only=False)'
-    else:
-        args = args.replace(" ", "").replace('landscape_only=True', 'landscape_only=False')
-    assert "landscape_only=False" in args
-    if verbose:
-        print(f"instantiating : {args}")
-    net = eval(args)
-    s = net.load_state_dict(ckpt['model'], strict=False)
-    if verbose:
-        print(s)
-    return net.to(device)
+    pass
 
 
 class DynaDUSt3R(
@@ -57,7 +50,9 @@ class DynaDUSt3R(
 
     def __init__(self,
                  output_mode='pts3d',
+                 motion_output_mode='pts3d',
                  head_type='linear',
+                 motion_head_type='linear',
                  depth_mode=('exp', -inf, inf),
                  conf_mode=('exp', 1, inf),
                  freeze='none',
@@ -72,8 +67,11 @@ class DynaDUSt3R(
 
         # dust3r specific initialization
         self.dec_blocks2 = deepcopy(self.dec_blocks)
-        self.set_downstream_head(output_mode, head_type, landscape_only, depth_mode, conf_mode, **croco_kwargs)
+        self.set_downstream_head(output_mode, motion_output_mode, head_type, motion_head_type, landscape_only, depth_mode, conf_mode, **croco_kwargs)
         self.set_freeze(freeze)
+
+        # random test stuff:
+        self.k = 0
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kw):
@@ -111,12 +109,15 @@ class DynaDUSt3R(
         """ No prediction head """
         return
 
-    def set_downstream_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode, patch_size, img_size,
+    def set_downstream_head(self, output_mode, motion_output_mode, head_type, motion_head_type, landscape_only, depth_mode, conf_mode, patch_size, img_size,
                             **kw):
+        self.device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
         assert img_size[0] % patch_size == 0 and img_size[1] % patch_size == 0, \
             f'{img_size=} must be multiple of {patch_size=}'
         self.output_mode = output_mode
+        self.motion_output_mode = motion_output_mode
         self.head_type = head_type
+        self.motion_head_type = motion_head_type
         self.depth_mode = depth_mode
         self.conf_mode = conf_mode
         # allocate point heads
@@ -127,14 +128,18 @@ class DynaDUSt3R(
         self.head2 = transpose_to_landscape(self.downstream_head2, activate=landscape_only)
         
         # allocate motion heads
-        self.motion_head1 = motion_head_factory(head_type, output_mode, self, has_conf=bool(conf_mode), time_pos_emb_dim=self.time_pos_emb_dim)
-        self.motion_head2 = motion_head_factory(head_type, output_mode, self, has_conf=bool(conf_mode), time_pos_emb_dim=self.time_pos_emb_dim)
+        self.motion_head1 = motion_head_factory(motion_head_type, motion_output_mode, self, has_conf=bool(conf_mode), time_pos_emb_dim=self.time_pos_emb_dim)
+        self.motion_head2 = motion_head_factory(motion_head_type, motion_output_mode, self, has_conf=bool(conf_mode), time_pos_emb_dim=self.time_pos_emb_dim)
         # magic wrapper
         self.mhead1 = transpose_to_landscape(self.motion_head1, activate=landscape_only)
         self.mhead2 = transpose_to_landscape(self.motion_head2, activate=landscape_only)
 
     def _encode_image(self, image, true_shape):
         # embed the image into patches  (x has size B x Npatches x C)
+        # print(f"image shape: {image.shape}")
+        # print(f"image type: {image.dtype}")
+        # print(f"true_shape: {true_shape}")
+        # print(f"true_shape type: {true_shape.dtype}")
         x, pos = self.patch_embed(image, true_shape=true_shape)
 
         # add positional embedding without cls token
@@ -222,11 +227,17 @@ class DynaDUSt3R(
         # extract views from batch
         left_view = {
             'img': batch['left_image'],  # (B, C, H, W)
-            'true_shape': batch['left_image'].shape[-2:]  # (H, W)
+            'true_shape': torch.tensor(
+                batch['left_image'].shape[-2:])[None]
+                    .repeat(batch['left_image'].size(0), 1),  # (B, 2)
+            'instance': batch['left_instance'],  # [B x string]
         }
         right_view = {
             'img': batch['right_image'],  # (B, C, H, W)
-            'true_shape': batch['right_image'].shape[-2:]  # (H, W)
+            'true_shape': torch.tensor(
+                batch['right_image'].shape[-2:])[None]
+                    .repeat(batch['right_image'].size(0), 1),  # (B, 2)
+            'instance': batch['right_instance'],  # [B x string]
         }
         
         # get time query if available
@@ -242,7 +253,7 @@ class DynaDUSt3R(
         dec_left, dec_right = self._decoder(feat_left, pos_left, feat_right, pos_right)
         # dec_left, dec_right: lists of tensors, each tensor (B, S, D) - features from multiple decoder layers
 
-        with torch.amp.autocast(enabled=False):
+        with torch.amp.autocast(device_type=self.device_type, enabled=False):
             # get 3d points for both views
             res_left = self._downstream_head(1, [tok.float() for tok in dec_left], shape_left)
             # res_left: dict with 'map_pred': (B, H, W, 3), 'map_pred_conf': optional (B, H, W, 1)
@@ -294,51 +305,212 @@ class DynaDUSt3R(
         # 'right_motion_map_pred_conf': optional (B, H, W, 1) - confidence for right view motion
         # 'batch_size': integer - batch size for metrics calculation
     
-    def get_loss(self, criterion, batch, outputs):
+
+    def compute_static_loss(self, criterion, batch, outputs, device):
         """
-        Compute loss between model outputs and ground truth.
+        Computes loss for static 3D reconstruction.
         
-        Parameters:
-            criterion: Loss function
-            batch: Dictionary with ground truth data
-            outputs: Dictionary with model predictions
-            
+        Args:
+            criterion: Loss criterion
+            batch (dict): Batch data with ground truth
+            outputs (dict): Model predictions
+            device: PyTorch device
+        
         Returns:
-            tuple: (loss, loss_details)
+            tuple: (static_loss, static_loss_details)
         """
-        # prepare ground truth data
+        batch_size = batch['left_image'].size(0)
+        identity = torch.eye(4).unsqueeze(0).repeat(batch_size, 1, 1).to(device)
+        
         gt_left = {
-            'pts3d': batch['left_pm'][..., :3],  # (B, H, W, 3)
-            'valid_mask': batch['left_pm'][..., 3] > 0,  # (B, H, W)
-            'camera_pose': torch.eye(4).unsqueeze(0).repeat(batch['left_image'].size(0), 1, 1).to(batch['left_image'].device)
+            'pts3d': batch['left_pm'][..., :3],
+            'valid_mask': batch['left_pm'][..., 3] > 0,
+            'camera_pose': identity
         }
         
         gt_right = {
-            'pts3d': batch['right_pm'][..., :3],  # (B, H, W, 3)
-            'valid_mask': batch['right_pm'][..., 3] > 0,  # (B, H, W)
-            'camera_pose': torch.eye(4).unsqueeze(0).repeat(batch['right_image'].size(0), 1, 1).to(batch['right_image'].device)
+            'pts3d': batch['right_pm'][..., :3],
+            'valid_mask': batch['right_pm'][..., 3] > 0,
+            'camera_pose': identity
         }
         
-        # prepare prediction data
-        pred_left = {
-            'pts3d': outputs['left_map_pred'],  # (B, H, W, 3)
-        }
+        pred_left = {'pts3d': outputs['left_map_pred']}
+        pred_right = {'pts3d_in_other_view': outputs['right_map_pred_in_left_frame']}
         
-        pred_right = {
-            'pts3d_in_other_view': outputs['right_map_pred_in_left_frame'],  # (B, H, W, 3)
-        }
-        
-        # add confidence if available
         if 'left_map_pred_conf' in outputs:
             pred_left['conf'] = outputs['left_map_pred_conf']
         
         if 'right_map_pred_conf' in outputs:
             pred_right['conf'] = outputs['right_map_pred_conf']
         
-        # compute loss using criterion
-        loss, loss_details = criterion(gt_left, gt_right, pred_left, pred_right)
+        return criterion(gt_left, gt_right, pred_left, pred_right)
+
+
+    def get_motion_predictions(self, outputs, batch, device):
+        """
+        Computes predicted 3D point maps (with visibility masks) from motion outputs by reprojecting motion-compensated
+        predicted point maps using camera intrinsics and depth-based z-buffering.
+        Args:
+            outputs (dict): A dictionary containing predicted point maps and motion vectors.
+                - 'left_map_pred': Tensor of shape (B, H, W, 3) — predicted 3D point map from the left view.
+                - 'left_motion_map_pred': Tensor of shape (B, H, W, 3) — predicted motion vectors for left view.
+                - 'right_map_pred_in_left_frame': Tensor of shape (B, H, W, 3) — predicted right-view point map aligned to left.
+                - 'right_motion_map_pred': Tensor of shape (B, H, W, 3) — predicted motion vectors for right view.
+            batch (dict): A dictionary containing input batch data.
+                - 'left_pm': Tensor of shape (B, H, W, 4) — ground-truth left point map with validity in 4th channel.
+                - 'mid_pm': Tensor of shape (B, H, W, 4) — mid frame point map with 4th channel indicating validity.
+                - 'cam': List of tuples — each containing (intrinsics, extrinsics) for each sample in batch. Intrinsics is (3,3)/(4,4).
+            device (torch.device): Device to place all computation on.
+        Returns:
+            pred_L (torch.Tensor): Reprojected 3D point map for left image after motion compensation, shape (B, H, W, 4).
+                                Last channel is a binary mask indicating valid projected points.
+            pred_R (torch.Tensor): Same as pred_L but for right image, reprojected in left frame.
+        """
+        batch_size = outputs['left_map_pred'].shape[0]
+        height, width = outputs['left_map_pred'].shape[1:3]
         
-        return loss, loss_details
+        # Initialize output lists
+        pred_L = []
+        pred_R = []
+        
+        for b in range(batch_size):
+            # Extract maps and motions for this batch
+            # left_map = outputs['left_map_pred'][b]  # (H, W, 3)
+            left_map = batch['left_pm'][b][..., :3]  # (H, W, 3)
+            left_motion = outputs['left_motion_map_pred'][b]  # (H, W, 3)
+            # right_map = outputs['right_map_pred_in_left_frame'][b]  # (H, W, 3)
+            right_map = batch['right_pm'][b][..., :3]  # (H, W, 3)
+            right_motion = outputs['right_motion_map_pred'][b]  # (H, W, 3)
+            
+            # Reshape to point clouds
+            left_pc = left_map.reshape(-1, 3)  # (H*W, 3)
+            left_motion_pc = left_motion.reshape(-1, 3)  # (H*W, 3)
+            right_pc = right_map.reshape(-1, 3)  # (H*W, 3)
+            right_motion_pc = right_motion.reshape(-1, 3)  # (H*W, 3)
+            
+            # Apply motion
+            left_pc_moved = left_pc + left_motion_pc  # (H*W, 3)
+            right_pc_moved = right_pc + right_motion_pc  # (H*W, 3)
+
+            # Reproject using camera parameters
+            camera = batch['cam'][b]
+            left_pm = geom.cam_pc_to_cam_pm_with_torch(left_pc_moved, camera, (height, width))
+            right_pm = geom.cam_pc_to_cam_pm_with_torch(right_pc_moved, camera, (height, width))
+            
+            pred_L.append(left_pm)
+            pred_R.append(right_pm)
+
+            # visualize
+            if (b + self.k) % 2 == 0:
+                if (b + self.k) % 4 == 0:
+                    pms = [left_pc, left_pm]
+                    motion_map = left_motion_pc.unsqueeze(0)
+                    visualize_sequence_from_pms(
+                        pms=pms,
+                        motion_map=motion_map,
+                        name="left_motion_in_batch_" + str(b)
+                    )
+
+                    pms = [left_pc, batch['mid_pm'][b][..., :3]]
+                    motion_map = batch['left_to_mid_motion'][b][..., :3].unsqueeze(0)
+                    visualize_sequence_from_pms(
+                        pms=pms,
+                        motion_map=motion_map,
+                        name="gt_left_motion_in_batch_" + str(b)
+                    )
+
+                if (b + self.k) % 4 == 2:
+                    pms = [right_pc, right_pm]
+                    motion_map = right_motion_pc.unsqueeze(0)
+                    visualize_sequence_from_pms(
+                        pms=pms,
+                        motion_map=motion_map,
+                        name="right_motion_in_batch_" + str(b)
+                    )
+
+                    pms = [right_pc, batch['mid_pm'][b][..., :3]]
+                    motion_map = batch['right_to_mid_motion'][b][..., :3].unsqueeze(0)
+                    visualize_sequence_from_pms(
+                        pms=pms,
+                        motion_map=motion_map,
+                        name="gt_right_motion_in_batch_" + str(b)
+                    )
+
+                self.k += 1
+            
+        
+        # Stack results along batch dimension
+        pred_L = torch.stack(pred_L, dim=0)
+        pred_R = torch.stack(pred_R, dim=0)
+        
+        return pred_L, pred_R
+
+
+    def compute_motion_loss(self, criterion, batch, outputs, device):
+        if ('left_motion_map_pred' not in outputs or 
+            'right_motion_map_pred' not in outputs or 
+            'mid_pm' not in batch):
+            return 0.0, {}  # ()
+
+        pred_L, pred_R = self.get_motion_predictions(outputs, batch, device)  # (B, H, W, 3), (B, H, W, 3)
+        B = batch['left_pm'].shape[0]  # (B)
+        eye = torch.eye(4).unsqueeze(0).repeat(B, 1, 1).to(device)  # (B, 4, 4)
+
+        gt_L = {
+            'pts3d': batch['mid_pm'][..., :3],  # (B, H, W, 3)
+            'valid_mask': batch['mid_pm'][..., 3] > 0,  # (B, H, W)
+            'camera_pose': eye  # (B, 4, 4)
+        }
+        gt_R = {
+            'pts3d': batch['mid_pm'][..., :3],  # (B, H, W, 3)
+            'valid_mask': batch['mid_pm'][..., 3] > 0,  # (B, H, W)
+            'camera_pose': eye  # (B, 4, 4)
+        }
+        pred_l = {
+            'pts3d': pred_L[..., :3],  # (B, H, W, 3)
+            'valid_mask': pred_L[..., 3] > 0,  # (B, H, W)
+            'camera_pose': eye  # (B, 4, 4)
+        }
+        pred_r = {
+            'pts3d': pred_R[..., :3],  # (B, H, W, 3)
+            'valid_mask': pred_R[..., 3] > 0,  # (B, H, W)
+            'camera_pose': eye  # (B, 4, 4)
+        }
+        if 'left_motion_map_pred_conf' in outputs:
+            pred_l['conf'] = outputs['left_motion_map_pred_conf']  # (B, H, W, 1)
+        if 'right_motion_map_pred_conf' in outputs:
+            pred_r['conf'] = outputs['right_motion_map_pred_conf']  # (B, H, W, 1)
+        loss = criterion(gt_L, gt_R, pred_l, pred_r)  # scalar
+        return loss  # scalar, dict
+
+
+
+    def get_loss(self, criterion, batch, outputs):
+        """
+        Compute total loss combining static reconstruction and motion prediction.
+        
+        Args:
+            criterion: Loss criterion
+            batch (dict): Batch data containing ground truth
+            outputs (dict): Model outputs containing predictions
+            
+        Returns:
+            tuple: (total_loss, loss_details)
+        """
+        device = batch['left_pm'].device
+        
+        static_loss, static_details = self.compute_static_loss(criterion, batch, outputs, device)
+        motion_loss, motion_details = self.compute_motion_loss(criterion, batch, outputs, device)
+        
+        # Combine losses - with motion loss scaling factor if needed
+        motion_weight = 0.0  # Adjust this value as needed (0.5, 0.1, etc.)
+        total_loss = static_loss + motion_weight * motion_loss
+        
+        loss_details = {**static_details, **motion_details}
+        loss_details['static_loss'] = static_loss.item()
+        loss_details['motion_loss'] = motion_loss.item() if isinstance(motion_loss, torch.Tensor) else motion_loss
+        
+        return total_loss, loss_details
 
     def compute_metrics(self, batch, outputs):
         """
@@ -401,6 +573,103 @@ class DynaDUSt3R(
         
         return metrics
 
+    def save_visualizations(self, batch, outputs, epoch, batch_idx, path):
+        import os
+        import numpy as np
+
+        if batch['left_pm'].shape[0] == 0:
+            return
+
+        i = 0
+        device = batch['left_pm'].device
+
+        out_dir = os.path.join(path, f"viz_e{epoch}_b{batch_idx}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        left_img  = batch['left_image'][i].detach().cpu().permute(1,2,0).numpy()
+        mid_img   = batch['mid_image'][i].detach().cpu().permute(1,2,0).numpy()
+        right_img = batch['right_image'][i].detach().cpu().permute(1,2,0).numpy()
+
+        visualize_image(left_img,  name="left_image")
+        visualize_image(mid_img,   name="mid_image")
+        visualize_image(right_img, name="right_image")
+
+        left_pm  = batch['left_pm'][i].detach().cpu().numpy()
+        mid_pm   = batch['mid_pm'][i].detach().cpu().numpy()
+        right_pm = batch['right_pm'][i].detach().cpu().numpy()
+
+        # CHANGE ONLY THIS LINE:
+        cam = batch['cam'][i].detach().cpu().numpy() if 'cam' in batch else None
+
+        visualize_pm(left_pm,  image=left_img,  cam=cam, name="left_pm")
+        visualize_pm(mid_pm,   image=None,   cam=cam, name="mid_pm")
+        visualize_pm(right_pm, image=None, cam=cam, name="right_pm")
+
+        left_to_mid  = batch['left_to_mid_motion'][i].detach().cpu().numpy()
+        right_to_mid = batch['right_to_mid_motion'][i].detach().cpu().numpy()
+
+        tracks_left_gt  = np.stack([left_pm, mid_pm], axis=0)
+        tracks_right_gt = np.stack([right_pm, mid_pm], axis=0)
+        motion_left_gt  = left_to_mid[np.newaxis, ...]
+        motion_right_gt = right_to_mid[np.newaxis, ...]
+
+        images_left_gt  = [left_img, None]
+        images_right_gt = [None, None]
+
+        visualize_sequence_from_pms(
+            pms=tracks_left_gt,
+            motion_map=motion_left_gt,
+            image_seq=images_left_gt,
+            name="tracks_left_gt"
+        )
+        visualize_sequence_from_pms(
+            pms=tracks_right_gt,
+            motion_map=motion_right_gt,
+            image_seq=images_right_gt,
+            name="tracks_right_gt"
+        )
+
+        pred_L, pred_R = self.get_motion_predictions(outputs, batch, device)
+        midL = pred_L[i].detach().cpu().numpy()
+        midR = pred_R[i].detach().cpu().numpy()
+
+        left_motion_3d  = outputs['left_motion_map_pred'][i].detach().cpu().numpy()
+        right_motion_3d = outputs['right_motion_map_pred'][i].detach().cpu().numpy()
+
+        tracks_left_pred  = np.stack([left_pm, midL], axis=0)
+        tracks_right_pred = np.stack([right_pm, midR], axis=0)
+
+        motion_left_pred  = np.zeros((1, *left_pm.shape), dtype=left_pm.dtype)
+        motion_right_pred = np.zeros((1, *right_pm.shape), dtype=right_pm.dtype)
+
+        motion_left_pred[0, ..., :3]  = left_motion_3d
+        motion_right_pred[0, ..., :3] = right_motion_3d
+
+        mask_0 = (tracks_left_pred[0, ..., 3] > 0)
+        mask_1 = (tracks_left_pred[1, ..., 3] > 0)
+        motion_left_pred[0, ..., 3] = (mask_0 & mask_1).astype(np.float32)
+
+        mask_0 = (tracks_right_pred[0, ..., 3] > 0)
+        mask_1 = (tracks_right_pred[1, ..., 3] > 0)
+        motion_right_pred[0, ..., 3] = (mask_0 & mask_1).astype(np.float32)
+
+        images_left_pred  = [left_img, None]
+        images_right_pred = [right_img, None]
+
+        visualize_sequence_from_pms(
+            pms=tracks_left_pred,
+            motion_map=motion_left_pred,
+            image_seq=images_left_pred,
+            name="tracks_left_pred"
+        )
+        visualize_sequence_from_pms(
+            pms=tracks_right_pred,
+            motion_map=motion_right_pred,
+            image_seq=images_right_pred,
+            name="tracks_right_pred"
+        )
+
+
     def save_checkpoint(self, state, is_best, filename):
         """
         Save model checkpoint.
@@ -417,6 +686,67 @@ class DynaDUSt3R(
         if is_best:
             best_filename = filename.replace('checkpoint_', 'model_best_')
             torch.save(state, best_filename)
+
+
+    @staticmethod
+    def load_model(cfg, device):
+        """
+        Load a DynaDUSt3R model from config, optionally downloading pretrained DUSt3R weights
+        and copying point head weights to motion heads.
+
+        Args:
+            cfg (omegaconf.DictConfig): Config with model parameters.
+            device (str): Device to map weights to.
+
+        Returns:
+            DynaDUSt3R: Initialized model instance.
+        """
+        import subprocess
+        from omegaconf import OmegaConf
+
+        # Extract model parameters from config
+        model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
+        model_cfg.pop('name', None)
+        use_pretrained = model_cfg.pop('use_pretrained', False)
+        pretrained_url = model_cfg.pop('pretrained_link', None)
+
+        # Instantiate the model
+        model = DynaDUSt3R(**model_cfg)
+
+        if use_pretrained and pretrained_url is not None:
+            print(f"using pretrained weights from {pretrained_url}")
+            os.makedirs("weights/pretrained", exist_ok=True)
+            filename = os.path.basename(pretrained_url)
+            save_path = os.path.join("weights/pretrained", filename)
+
+            # Download if not already present
+            if not os.path.exists(save_path):
+                print(f"downloading pretrained weights to {save_path}.")
+                subprocess.run(["wget", pretrained_url, "-O", save_path], check=True)
+            else:
+                print(f"pretrained weights already exist at {save_path}.")
+
+            # Load the checkpoint
+            checkpoint = torch.load(save_path, map_location=device, weights_only=False)
+
+            # Some checkpoints have 'model' and 'args' keys, so extract the raw state dict if needed
+            if isinstance(checkpoint, dict) and 'model' in checkpoint:
+                sd = checkpoint['model']
+            else:
+                sd = checkpoint
+
+            # Copy DUSt3R point-head keys into motion-head keys
+            for k, v in list(sd.items()):
+                if k.startswith('head1'):
+                    sd[k.replace('head1', 'mhead1')] = v.clone()
+                elif k.startswith('head2'):
+                    sd[k.replace('head2', 'mhead2')] = v.clone()
+
+            # Load into the DynaDUSt3R model
+            model.load_state_dict(sd, strict=False)
+            print(f"loaded pretrained weights successfully from {save_path}.")
+
+        return model
 
 
 if __name__ == "__main__":

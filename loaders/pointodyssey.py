@@ -50,7 +50,7 @@ class PointOdyssey(StereoMotionBase):
 
     def get_frame_info(self, sequence_path, frame_index):
         """
-        Get information for a specific frame
+        Get information for a specific frame with consistent cropping
         
         Args:
             sequence_path: Path to the sequence directory
@@ -63,22 +63,28 @@ class PointOdyssey(StereoMotionBase):
         dm_16bit = cv2.imread(
             f"{sequence_path}/depths/depth_{frame_index:05d}.png", cv2.IMREAD_ANYDEPTH
         )  # (H, W)
-        dm = dm_16bit.astype(np.float32) / 65535.0 * 1000.0
+        dm = dm_16bit.astype(np.float32) / 65535.0 * 1000.0 # convert to float depths # (H, W)
 
         annotations = np.load(f"{sequence_path}/anno.npz", allow_pickle=True)
         intrinsics = annotations["intrinsics"][frame_index]  # (3, 3)
-        extrinsics = annotations["extrinsics"][frame_index]  # (4, 4) homogeneous
-        cam = (intrinsics, extrinsics)
+        extrinsics = annotations["extrinsics"][frame_index]  # (4, 4)
+        cam = (intrinsics, extrinsics) # ((3,3), (4,4))
         world_pc = annotations["trajs_3d"][frame_index]  # (N, 3)
         validity = annotations["visibs"][frame_index][..., np.newaxis]  # (N, 1)
         # validity = annotations["valids"][frame_index][..., np.newaxis]  # (N, 1)
         world_pc_valid = np.concatenate([world_pc, validity], axis=1)  # (N, 4)
+        
 
+        if self.config.data.crop:
+            output_resolution = (self.config.data.size, self.config.data.size)  # (W, H)
+            image, dm, cam = self.crop_data(image, dm, cam, output_resolution) # apply cropping
+        
         return {
             "image": image,  # (H, W, 3)
             "world_pc_valid": world_pc_valid,  # (N, 4) scaled by factor "scale"
             "cam": cam,  # ((3, 3), (4, 4) homogeneous)
             "dm": dm,  # convert to meters, (H, W)
+            "instance": os.path.split(f"{sequence_path}/rgbs/rgb_{frame_index:05d}.jpg")[1] # string
         }
 
 
@@ -90,21 +96,28 @@ from omegaconf import DictConfig, open_dict
 # python -m loaders.pointodyssey dataset.pointodyssey.split=sample dataset.pointodyssey.max_frame_window=30
 @hydra.main(version_base=None, config_path="../config", config_name="config")
 def main(config: DictConfig):
+    import torch
     import loaders.utils.viz as viz
     
     # create dataset instance with 3d tracks
     with open_dict(config):
-        config.dataset.pointodyssey.pm_source = "3d_tracks"
+        config.dataset.pointodyssey.pm_source = "dm"
     
     dataset_tracks = PointOdyssey(config)
     print(f"total triplets: {len(dataset_tracks)}")
     
     # get a sample triplet
-    sample_idx = 31000
+    sample_idx = 0
     sample_tracks = dataset_tracks[sample_idx]
     
     # print basic info about the triplet
     print(f"triplet frames: idxs={sample_tracks['idxs']}")
+    print("------------------------")    
+    for k, v in sample_tracks.items():
+        if isinstance(v, torch.Tensor):
+            print(k, v.size(), v.dtype)
+        else:
+            print(k)
     
     # prepare point maps and images for visualization
     track_pms = np.array([
@@ -114,10 +127,36 @@ def main(config: DictConfig):
     ])
     
     images = [
-        sample_tracks['left_image'],
-        sample_tracks['mid_image'],
-        sample_tracks['right_image']
+        sample_tracks['left_image'].permute(1, 2, 0).numpy(),
+        None,
+        None,
     ]
+
+    viz.visualize_image(sample_tracks['left_image'].permute(1, 2, 0).numpy(), name="left_image")
+    # viz.visualize_dm(sample_tracks['left_dm'], name="left_dm")
+    viz.visualize_image(sample_tracks['mid_image'].permute(1, 2, 0).numpy(), name="mid_image")
+    # viz.visualize_dm(sample_tracks['mid_dm'], name="mid_dm")
+    viz.visualize_image(sample_tracks['right_image'].permute(1, 2, 0).numpy(), name="right_image")
+    # viz.visualize_dm(sample_tracks['right_dm'], name="right_dm")
+
+    viz.visualize_pm(
+        track_pms[0], 
+        image=images[0], 
+        cam=sample_tracks['cam'], 
+        name="left_pm"
+    )
+    viz.visualize_pm(
+        track_pms[1], 
+        image=None, 
+        cam=sample_tracks['cam'], 
+        name="mid_pm"
+    )
+    viz.visualize_pm(
+        track_pms[2], 
+        image=None, 
+        cam=sample_tracks['cam'], 
+        name="right_pm"
+    )
     
     # prepare motion maps
     left_to_mid = sample_tracks['left_to_mid_motion']
@@ -133,53 +172,65 @@ def main(config: DictConfig):
     # 2. tracks + right_to_mid
     right_to_mid_map = np.zeros((1, h, w, 4), dtype=np.float32)
     right_to_mid_map[0] = right_to_mid
-    
-    # create dataset instance with depth maps
-    with open_dict(config):
-        config.dataset.pointodyssey.pm_source = "dm"
-    
-    dataset_dm = PointOdyssey(config)
-    sample_dm = dataset_dm[sample_idx]
-    
-    # prepare point maps for depth-based visualization
-    dm_pms = np.array([
-        sample_dm['left_pm'],
-        sample_dm['mid_pm'],
-        sample_dm['right_pm']
-    ])
-    
-    # visualize all 4 combinations
-    print("visualizing 3d tracks + left to mid motion...")
+
     viz.visualize_sequence_from_pms(
         track_pms[:2],  # just left and mid for left_to_mid
         left_to_mid_map, 
         images[:2], 
         name="tracksl"
     )
-    
-    print("visualizing 3d tracks + right to mid motion...")
+
     viz.visualize_sequence_from_pms(
         np.array([track_pms[2], track_pms[1]]),  # right and mid for right_to_mid
-        right_to_mid_map, 
-        [images[2], images[1]], 
+        right_to_mid_map,
+        [images[2], images[1]],
         name="tracksr"
     )
+
+    ###
     
-    print("visualizing depth maps + left to mid motion...")
-    viz.visualize_sequence_from_pms(
-        dm_pms[:2],  # just left and mid for left_to_mid
-        left_to_mid_map, 
-        images[:2], 
-        name="dml"
-    )
+    # dataset_dm = PointOdyssey(config)
+    # sample_dm = dataset_dm[sample_idx]
     
-    print("visualizing depth maps + right to mid motion...")
-    viz.visualize_sequence_from_pms(
-        np.array([dm_pms[2], dm_pms[1]]),  # right and mid for right_to_mid
-        right_to_mid_map, 
-        [images[2], images[1]], 
-        name="dmr"
-    )
+    # # prepare point maps for depth-based visualization
+    # dm_pms = np.array([
+    #     sample_dm['left_pm'],
+    #     sample_dm['mid_pm'],
+    #     sample_dm['right_pm']
+    # ])
+    
+    # # visualize all 4 combinations
+    # print("visualizing 3d tracks + left to mid motion...")
+    # viz.visualize_sequence_from_pms(
+    #     track_pms[:2],  # just left and mid for left_to_mid
+    #     left_to_mid_map, 
+    #     images[:2], 
+    #     name="tracksl"
+    # )
+    
+    # print("visualizing 3d tracks + right to mid motion...")
+    # viz.visualize_sequence_from_pms(
+    #     np.array([track_pms[2], track_pms[1]]),  # right and mid for right_to_mid
+    #     right_to_mid_map, 
+    #     [images[2], images[1]], 
+    #     name="tracksr"
+    # )
+    
+    # print("visualizing depth maps + left to mid motion...")
+    # viz.visualize_sequence_from_pms(
+    #     dm_pms[:2],  # just left and mid for left_to_mid
+    #     left_to_mid_map, 
+    #     images[:2], 
+    #     name="dml"
+    # )
+    
+    # print("visualizing depth maps + right to mid motion...")
+    # viz.visualize_sequence_from_pms(
+    #     np.array([dm_pms[2], dm_pms[1]]),  # right and mid for right_to_mid
+    #     right_to_mid_map, 
+    #     [images[2], images[1]], 
+    #     name="dmr"
+    # )
 
     # seq_path = "data/pointodyssey/sample/r4_new_f"
     # frame_info = dataset.get_frame_info(seq_path, 0)

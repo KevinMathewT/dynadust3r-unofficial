@@ -38,8 +38,8 @@ def visualize_cam_movement_in_world(dataset, seq_path, num_frames):
     and logs each frame's camera parameters under a "pinhole/{i}" namespace.
     """
 
-    rr.init("Camera_Movement", spawn=True)
-    rr.spawn()
+    rr.init("Camera_Movement")
+    rr.connect_tcp("127.0.0.1:9876")
 
     for i in range(num_frames):
         frame_info = dataset.get_frame_info(seq_path, i)
@@ -88,7 +88,7 @@ def visualize_pc(pc_valid, image=None, cam=None, valid=True, name="point_cloud",
     """
     
     rr.init(name)
-    rr.spawn()
+    rr.connect_tcp("127.0.0.1:9876")
 
     if cam is not None:
         intrinsics, extrinsics = cam
@@ -169,7 +169,8 @@ def visualize_motion_map(motion_map, pm, cam=None, valid=True, name="motion_map"
 
     segments = np.stack([points_3d, points_3d + motion_vectors], axis=1)
 
-    rr.init(name, spawn=True)
+    rr.init(name)
+    rr.connect_tcp("127.0.0.1:9876")
     rr.log(name, rr.SeriesLine(segments=segments))
     if extrinsics is not None:
         translation, quaternion = decompose_extrinsics(extrinsics)
@@ -181,25 +182,63 @@ def visualize_motion_map(motion_map, pm, cam=None, valid=True, name="motion_map"
             principal_point=[intrinsics[0, 2], intrinsics[1, 2]]
         ))
 
-def visualize_dm(dm, cam=None, name="dm"):
+
+def visualize_dm(dm, cam=None, image=None, name="dm"):
     """
     Visualizes a depth map.
 
     Args:
         dm (numpy.ndarray): (H, W) - Depth values.
         cam (tuple): (intrinsics, extrinsics) - Camera parameters (optional)
+        image (numpy.ndarray): (H, W, 3) - RGB image for colorization (optional).
         name (str): Name for the visualization.
     """
     rr.init(name, spawn=True)
-    rr.log(name, rr.Image(dm))
+    rr.connect_tcp("127.0.0.1:9876")
+
+    if cam is not None:
+        intr, _ = cam
+        H, W = dm.shape
+        fx, fy, cx, cy = intr[0, 0], intr[1, 1], intr[0, 2], intr[1, 2]
+        rr.log(
+            f"{name}/cam",
+            rr.Pinhole(
+                width=W,
+                height=H,
+                focal_length=(fx, fy),
+                principal_point=(cx, cy),
+            ),
+        )
+        rr.log(f"{name}/cam/depth", rr.DepthImage(dm, meter=1.0, colormap="turbo"))
+        if image is not None:
+            rr.log(f"{name}/cam/image", rr.Image(image))
+    else:
+        rr.log(f"{name}/depth", rr.DepthImage(dm, meter=1.0, colormap="turbo"))
+        if image is not None:
+            rr.log(f"{name}/image", rr.Image(image))
+
+
+def visualize_image(image, cam=None, name="image"):
+    """
+    Visualizes an RGB image.
+    Args:
+        image (numpy.ndarray): (H, W, 3) - RGB image.
+        cam (tuple): (intrinsics, extrinsics) - Camera parameters (optional)
+        name (str): Name for the visualization.
+    """
+
+    rr.init(name)
+    rr.connect_tcp("127.0.0.1:9876")
+    rr.log(name, rr.Image(image))
     intrinsics, _ = cam if cam is not None else (None, None)
     if intrinsics is not None:
-        H, W = dm.shape
+        H, W = image.shape
         rr.log("cam/im", rr.Pinhole(
             resolution=[W, H],
             focal_length=[intrinsics[0, 0], intrinsics[1, 1]],
             principal_point=[intrinsics[0, 2], intrinsics[1, 2]]
         ))
+
 
 def visualize_pm(pm, image=None, cam=None, valid=True, name="pm", pc_in_cam_coords=True):
     """
@@ -227,7 +266,8 @@ def visualize_pm(pm, image=None, cam=None, valid=True, name="pm", pc_in_cam_coor
         None (logs visualization data to rerun).
     """
     rr.init(name)
-    rr.spawn()
+    rr.connect_tcp("127.0.0.1:9876")
+    
 
     if cam is not None:
         intrinsics, extrinsics = cam
@@ -285,61 +325,91 @@ def visualize_pm(pm, image=None, cam=None, valid=True, name="pm", pc_in_cam_coor
         rr.log("cam", rr.Image(image))
 
 
-def visualize_sequence_from_pms(pms, motion_map, image_seq=None, name="seq_pm"):
+def visualize_sequence_from_pms(pms, motion_map, image_seq=None, name="seq_pm", save=False, path=None):
     """
     Visualizes a sequence of point maps with motion vectors, logging frames at separate timesteps in Rerun.
 
     Parameters:
-    - pms: List or array of (H, W, 4) point maps (3D positions + validity mask).
-    - motion_map: (T-1, H, W, 4) motion vectors between consecutive frames.
+    - pms: List or array of (H, W, 4) or (H, W, 3) or (N, 4) or (N, 3) point maps (3D positions [+ optional validity mask]).
+    - motion_map: (T-1, H, W, 4) or (T-1, H, W, 3) or (T-1, N, 4) or (T-1, N, 3) motion vectors.
     - image_seq: Optional list of (H, W, 3) images for color visualization.
     - name: String identifier for the visualization session.
-
-    Logging strategy:
-    - `2t`: Source point cloud + motion vectors.
-    - `2t+1`: Motion vectors + next frame's point cloud.
+    - save: Boolean flag to save the recording to a .rrd file.
+    - path: File path to save the .rrd file if save is True.
     """
+    def to_np(x):
+        if hasattr(x, 'detach'):  # likely a torch tensor
+            return x.detach().cpu().numpy()
+        return x
+    
+    def ensure_4d(x):
+        if x.shape[-1] == 3:
+            if x.ndim == 3:
+                x = np.concatenate([x, np.ones((x.shape[0], x.shape[1], 1), dtype=x.dtype)], axis=-1)
+                x = x.reshape(-1, 4)
+            else:
+                x = np.concatenate([x, np.ones((x.shape[0], 1), dtype=x.dtype)], axis=-1)
+            return x
+        return x.reshape(-1, 4) if x.ndim == 3 else x
+
     rr.init(name)
-    rr.spawn()
+    rr.connect_tcp("127.0.0.1:9876")
+    
+    pms = [to_np(pm) for pm in pms]
+    motion_map = to_np(motion_map)
+    
     T = len(pms)
     assert motion_map.shape[0] == T - 1
 
-    print(f"Frame {0}: pm shape = {pms[0].shape}")
-    pm = pms[0].reshape(-1, 4)
-    valid_mask = pm[:, 3] > 0
-    pc_valid = pm[valid_mask][:, :3]
+    if image_seq is None:
+        image_seq = [None] * T
 
-    img_flat = image_seq[0].reshape(-1, 3)
-    print(f"Frame {0}: pm shape = {pm.shape}")
-    print(f"Frame {0}: valid_mask shape = {valid_mask.shape}, count = {valid_mask.sum()}")
-    print(f"Frame {0}: image_seq[0] shape = {image_seq[0].shape}, reshaped shape = {img_flat.shape}")
+    pc = ensure_4d(pms[0])
+    valid_mask = pc[:, 3] > 0
+    pc_valid = pc[valid_mask][:, :3]
 
-    colors = image_seq[0].reshape(-1, 3)[valid_mask] if image_seq is not None else None
+    img_flat = image_seq[0].reshape(-1, 3) if image_seq[0] is not None else None
+    # print(f"Frame {0}: pm shape = {pc.shape}")
+    # print(f"Frame {0}: valid_mask shape = {valid_mask.shape}, count = {valid_mask.sum()}")
+    # if img_flat is not None:
+    #     print(f"Frame {0}: image_seq[0] shape = {image_seq[0].shape}, reshaped shape = {img_flat.shape}")
+
+    colors = (img_flat[valid_mask].astype(float) / 255.0
+        if image_seq[0] is not None
+        else np.array([[255, 95, 31]] * len(pc_valid), dtype=np.uint8) / 255.0)
 
     for t in range(T):
         rr.set_time_sequence("time", 2 * t)
         rr.log("point_cloud", rr.Points3D(positions=pc_valid, colors=colors))
 
         if t < T - 1:
-            motion = motion_map[t].reshape(-1, 4)
+            motion = ensure_4d(motion_map[t])
             motion_valid_mask = valid_mask & (motion[:, 3] > 0)
 
-            src_pts = pm[motion_valid_mask][:, :3]
+            src_pts = pc[motion_valid_mask][:, :3]
             dst_pts = src_pts + motion[motion_valid_mask][:, :3]
             lines = [np.stack([src_pts[i], dst_pts[i]]) for i in range(len(src_pts))]
 
-            rr.log("motion_vectors", rr.LineStrips3D(strips=lines))
+            rr.log("motion_vectors", rr.LineStrips3D(strips=lines, colors=[57, 255, 20], radii=0.001))
             rr.set_time_sequence("time", 2 * t + 1)
-            rr.log("motion_vectors", rr.LineStrips3D(strips=lines))
+            rr.log("motion_vectors", rr.LineStrips3D(strips=lines, colors=[57, 255, 20], radii=0.001))
 
-            pm = pms[t + 1].reshape(-1, 4)
-            valid_mask = pm[:, 3] > 0
-            pc_valid = pm[valid_mask][:, :3]
-            colors = image_seq[t + 1].reshape(-1, 3)[valid_mask] if image_seq is not None else None
+            pc_next = ensure_4d(pms[t + 1])
+            valid_mask = pc_next[:, 3] > 0
+            pc_valid = pc_next[valid_mask][:, :3]
+            
+            colors = (image_seq[t + 1].reshape(-1, 3)[valid_mask].astype(float) / 255.0
+                if image_seq[t + 1] is not None
+                else np.array([[255, 95, 31]] * len(lines), dtype=np.uint8) / 255.0)
 
             rr.log("point_cloud", rr.Points3D(positions=pc_valid, colors=colors))
+            pc = pc_next
 
-    print(f"Visualized sequence: {T} frames.")
+    # print(f"Visualized sequence: {T} frames.")
+
+    if save and path is not None:
+        rr.save(path)
+        # print(f"Saved visualization to {path}.")
 
 
 def test_visualize_pc():
@@ -358,29 +428,24 @@ def test_visualize_pc():
     print(f"Calling visualize_pc with manually created data: {test_pc_valid.shape}")
     visualize_pc(test_pc_valid, valid=True, name="test_manual_pc")
 
-
+# port forwarding: ssh -J greene -L 9091:localhost:9091 -L 9877:localhost:9877 gr011
 def test_rerun():
-    rr.init("test_rerun")
-    rr.spawn()
+    rr.init("streaming_test")
+    rr.connect_tcp("127.0.0.1:9876")
 
-    test_points = np.array([
-        [0, 0, 0],
-        [1, 1, 1],
-        [2, 0, 1],
-        [1, -1, 2],
-        [-1, 2, 0]
+    rr.set_time_sequence("frame", 0)
+
+    pts = np.array([
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
     ], dtype=np.float32)
 
-    test_colors = np.array([
-        [255, 0, 0],
-        [0, 255, 0],
-        [0, 0, 255],
-        [255, 255, 0],
-        [255, 0, 255]
-    ], dtype=np.uint8)
+    rr.log("scene/points", rr.Points3D(positions=pts))
 
-    print("Logging test points to Rerun...")
-    rr.log("test_points", rr.Points3D(positions=test_points, colors=test_colors))
-    print("Logged successfully!")
-    
     rr.disconnect()
+
+
+if __name__ == "__main__":
+    test_rerun()

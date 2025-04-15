@@ -1,0 +1,26 @@
+name: DynaDUSt3R
+use_pretrained: True
+pretrained_link: https://download.europe.naverlabs.com/ComputerVision/DUSt3R/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth
+
+output_mode: pts3d
+head_type: dpt
+motion_head_type: dpt
+depth_mode: [exp, !!float -.inf, !!float .inf]
+conf_mode: [exp, 1, !!float .inf]
+freeze: none
+landscape_only: true
+patch_embed_cls: PatchEmbedDust3R
+time_pos_emb_dim: 256
+
+# CroCo kwargs
+img_size: [512, 512]      # [512, 384], 512x512 is common
+patch_size: 16
+enc_embed_dim: 1024       # match ViT-L
+enc_depth: 24             # typical ViT-L depth
+enc_num_heads: 16         # 1024 / 64
+dec_embed_dim: 768        # checkpoint’s decoder dimension
+dec_depth: 12
+dec_num_heads: 12         # 768 / 64
+mlp_ratio: 4
+norm_im2_in_dec: true
+pos_embed: RoPE100

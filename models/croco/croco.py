@@ -13,9 +13,9 @@ import torch.nn as nn
 torch.backends.cuda.matmul.allow_tf32 = True # for gpu >= Ampere and pytorch >= 1.12
 from functools import partial
 
-from models.dust3r.croco.blocks import Block, DecoderBlock, PatchEmbed
-from models.dust3r.croco.pos_embed import get_2d_sincos_pos_embed, RoPE2D 
-from models.dust3r.croco.masking import RandomMask
+from models.croco.blocks import Block, DecoderBlock, PatchEmbed
+from models.croco.pos_embed import get_2d_sincos_pos_embed, RoPE2D 
+from models.croco.masking import RandomMask
 
 
 class CroCoNet(nn.Module):

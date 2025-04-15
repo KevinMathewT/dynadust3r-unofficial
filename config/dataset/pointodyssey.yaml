@@ -5,5 +5,5 @@ valid_split: sample # train, test, sample
 # path: /scratch/km6748/vision-experiments/data/pointodyssey/pointodyssey
 # train_split: sample
 # valid_split: sample
-max_frame_window: 10
+max_frame_window: 60
 pm_source: 3d_tracks # dm / 3d_tracks

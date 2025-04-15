@@ -1,14 +1,15 @@
 defaults:
   - model: dynadust3r
-  - optim: adamw
+  - optim: adam
   - sched: cosine
   - criterion: conf  # or regr3d, regr3d_shiftinv, etc.
   - dataset/pointodyssey@dataset.pointodyssey
   - _self_
 
 train:
-  epochs: 100
+  epochs: 50
   grad_clip: 0
+  val_interval: 20
 
 valid:
   interval: 5
@@ -20,10 +21,12 @@ valid:
 
 data:
   loader: pointodyssey
-  size: 512
+  len: 2 # total triplets
+  size: 512 # image size | also change in model/dynadust3r.yaml
+  crop: True
   batch_size: 2
-  num_workers: 4
+  num_workers: 12
 
 logging:
-  use_wandb: True
+  use_wandb: False
   wandb_interval: 1

@@ -18,12 +18,12 @@ def run(config):
     setup_distributed()
 
     accelerator = Accelerator()
+    model = get_model(config, accelerator.device)
 
     train_loader, valid_loader = get_loaders(config)
 
 
     # Initialize model, criterion, optimizer, scheduler
-    model = get_model(config)
     criterion = get_criterion(config)
     optimizer = get_optimizer(model.parameters(), config)
     scheduler = get_scheduler(optimizer, config, train_loader)
@@ -33,9 +33,9 @@ def run(config):
     accelerator.print(f"-----------------")
 
     accelerator.print(f"----- Criterion, Optimizer, Scheduler -----")
-    accelerator.print(criterion)
-    accelerator.print(optimizer)
-    accelerator.print(scheduler)
+    accelerator.print(f"criterion: {criterion}")
+    accelerator.print(f"optimizer: {optimizer}")
+    accelerator.print(f"scheduler: {scheduler}")
     accelerator.print(f"-------------------------------------------")
 
     # Prepare everything with accelerator

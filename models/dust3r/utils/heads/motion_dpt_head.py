@@ -5,7 +5,7 @@ from einops import rearrange
 from typing import List
 from models.dust3r.utils.heads.postprocess import postprocess
 # import dust3r.utils.path_to_croco  # noqa: F401
-from croco.models.dpt_block import DPTOutputAdapter  # noqa
+from models.croco.models.dpt_block import DPTOutputAdapter  # noqa
 
 # taken from: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/embeddings.py#L27
 def get_timestep_embedding(
@@ -63,12 +63,17 @@ class MotionDPTOutputAdapter(DPTOutputAdapter):
     def __init__(self, time_pos_emb_dim, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.time_pos_emb_dim = time_pos_emb_dim
+        
+        # Get the feature dimension from kwargs or use a default
+        feature_dim = kwargs.get('feature_dim', 256)
+        
+        # Create linear projections to match feature_dim for all layers
         self.linear_projections = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(time_pos_emb_dim, out_dim),  # [B, out_dim]
+                nn.Linear(time_pos_emb_dim, feature_dim),  # [B, feature_dim]
                 nn.SiLU(),
-                nn.Linear(out_dim, out_dim)  # [B, out_dim]
-            ) for out_dim in self.layer_dims
+                nn.Linear(feature_dim, feature_dim)  # [B, feature_dim]
+            ) for _ in range(len(self.layer_dims))
         ])
 
     def init(self, dim_tokens_enc=768):
@@ -92,8 +97,10 @@ class MotionDPTOutputAdapter(DPTOutputAdapter):
 
         time_emb = get_timestep_embedding(t, self.time_pos_emb_dim, downscale_freq_shift=0, flip_sin_to_cos=True)  # [B, emb_dim]
 
-        layers = [self.scratch.layer_rn[idx](l) + self.linear_projections[idx](time_emb).unsqueeze(-1).unsqueeze(-1)
-                  for idx, l in enumerate(layers)]  # list of [B, layer_dims[i], N_H, N_W]
+        layers = [
+            self.scratch.layer_rn[idx](l) + self.linear_projections[idx](time_emb).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, l.size(2), l.size(3))
+            for idx, l in enumerate(layers)
+        ]  # list of [B, layer_dims[i], N_H, N_W]
 
         path_4 = self.scratch.refinenet4(layers[3])[:, :, :layers[2].shape[2], :layers[2].shape[3]]
         path_3 = self.scratch.refinenet3(path_4, layers[2])
@@ -138,17 +145,9 @@ class PixelwiseTaskWithMotionDPT(nn.Module):
             query_time = query_time.expand(x[0].shape[0])
         
         out = self.dpt(x, image_size=(img_info[0], img_info[1]), t=query_time)
-        
-        # Create a dictionary with motion vectors
-        result = {'motion': out}
-        
-        # Add confidence if needed
-        if self.postprocess and out.shape[1] > 3:
-            motion, conf = torch.split(out, [3, out.shape[1]-3], dim=1)
-            result['motion'] = motion
-            result['conf'] = conf
-            
-        return result
+        if self.postprocess:
+            out = self.postprocess(out, self.depth_mode, self.conf_mode)
+        return out
 
 
 def create_motion_dpt_head(net, has_conf=False, time_pos_emb_dim=128):
@@ -169,7 +168,7 @@ def create_motion_dpt_head(net, has_conf=False, time_pos_emb_dim=128):
                                 last_dim=last_dim,
                                 hooks_idx=[0, l2*2//4, l2*3//4, l2],
                                 dim_tokens=[ed, dd, dd, dd],
-                                postprocess=None,  # Handle postprocessing in forward
+                                postprocess=postprocess,  # Handle postprocessing in forward
                                 depth_mode=net.depth_mode,
                                 conf_mode=net.conf_mode,
                                 time_pos_emb_dim=time_pos_emb_dim,

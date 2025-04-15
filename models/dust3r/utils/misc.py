@@ -56,14 +56,14 @@ def transpose_to_landscape(head, activate=True):
         then transpose the result in landscape 
         and stack everything back together.
     """
-    def wrapper_no(decout, true_shape):
+    def wrapper_no(decout, true_shape, *args, **kwargs):
         B = len(true_shape)
         assert true_shape[0:1].allclose(true_shape), 'true_shape must be all identical'
         H, W = true_shape[0].cpu().tolist()
-        res = head(decout, (H, W))
+        res = head(decout, (H, W), *args, **kwargs)
         return res
 
-    def wrapper_yes(decout, true_shape):
+    def wrapper_yes(decout, true_shape, *args, **kwargs):
         B = len(true_shape)
         # by definition, the batch is in landscape mode so W >= H
         H, W = int(true_shape.min()), int(true_shape.max())
@@ -74,14 +74,14 @@ def transpose_to_landscape(head, activate=True):
 
         # true_shape = true_shape.cpu()
         if is_landscape.all():
-            return head(decout, (H, W))
+            return head(decout, (H, W), *args, **kwargs)
         if is_portrait.all():
-            return transposed(head(decout, (W, H)))
+            return transposed(head(decout, (W, H), *args, **kwargs))
 
         # batch is a mix of both portraint & landscape
         def selout(ar): return [d[ar] for d in decout]
-        l_result = head(selout(is_landscape), (H, W))
-        p_result = transposed(head(selout(is_portrait), (W, H)))
+        l_result = head(selout(is_landscape), (H, W), *args, **kwargs)
+        p_result = transposed(head(selout(is_portrait), (W, H), *args, **kwargs))
 
         # allocate full result
         result = {}

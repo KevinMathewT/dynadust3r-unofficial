@@ -6,10 +6,9 @@ MODELS = {
     "DynaDUSt3R": DynaDUSt3R,
 }
 
-def get_model(config):
+def get_model(config, device):
     model_name = config.model.name
     if model_name not in MODELS:
         raise ValueError(f"Model {model_name} not found in available models: {MODELS.keys()}")
-    model = MODELS[model_name](config)
 
-    return model
+    return MODELS[model_name].load_model(config, device)

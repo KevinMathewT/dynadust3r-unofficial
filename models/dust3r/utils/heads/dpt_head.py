@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from models.dust3r.utils.heads.postprocess import postprocess
 # import models.dust3r.utils.path_to_croco  # noqa: F401
-from croco.models.dpt_block import DPTOutputAdapter  # noqa
+from models.croco.models.dpt_block import DPTOutputAdapter  # noqa
 
 
 class DPTOutputAdapter_fix(DPTOutputAdapter):

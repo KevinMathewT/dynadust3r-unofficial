@@ -15,7 +15,7 @@ from models.dust3r.utils.heads import head_factory
 from models.dust3r.utils.patch_embed import get_patch_embed
 
 # import dust3r.utils.path_to_croco  # noqa: F401
-from models.dust3r.croco.croco import CroCoNet  # noqa
+from models.croco.croco import CroCoNet  # noqa
 
 inf = float('inf')
 

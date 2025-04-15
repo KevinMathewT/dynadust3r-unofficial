@@ -7,7 +7,7 @@
 # --------------------------------------------------------
 import torch
 # import dust3r.utils.path_to_croco  # noqa: F401
-from croco.models.blocks import PatchEmbed  # noqa
+from models.croco.models.blocks import PatchEmbed  # noqa
 
 
 def get_patch_embed(patch_embed_cls, img_size, patch_size, enc_embed_dim):
