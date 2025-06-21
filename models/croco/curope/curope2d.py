@@ -8,6 +8,7 @@ try:
 except ModuleNotFoundError:
     from . import curope as _kernels # run `python setup.py build_ext --inplace`
 
+# poetry run pip install -e models/croco/curope
 
 class cuRoPE2D_func (torch.autograd.Function):
 

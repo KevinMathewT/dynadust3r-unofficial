@@ -7,6 +7,7 @@ authors = ["Kevin Mathew T <mathewtkevin@gmail.com>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
+curope = {path = "models/croco/curope", develop = true}
 python = "3.10.2"
 gdown = "^5.2.0"
 numpy = "<2.2.0"
@@ -15,7 +16,6 @@ matplotlib = "^3.10.0"
 ipykernel = "^6.29.5"
 rerun-sdk = "^0.22.1"
 opencv-python = "^4.11.0.86"
-wandb = "^0.19.5"
 torchvision = "^0.21.0"
 torch = "^2.6.0"
 pillow = "^11.1.0"
@@ -44,6 +44,14 @@ einops = "^0.8.1"
 hydra-core = "^1.3.2"
 accelerate = "^1.5.2"
 croco = {path = "submodules/croco", develop = true}
+lmdb = "^1.6.2"
+msgpack = "^1.1.0"
+decord = "^0.6.0"
+webdataset = "^0.2.111"
+wids = "0.1.11"
+gnureadline = "^8.2.13"
+wandb = {extras = ["media"], version = "^0.20.1"}
+nvitop = "^1.5.1"
 
 [build-system]
 requires = ["poetry-core"]

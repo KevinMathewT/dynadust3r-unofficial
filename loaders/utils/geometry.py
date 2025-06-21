@@ -11,6 +11,82 @@ from PIL import Image
 from scipy.spatial.transform import Rotation
 
 
+def inv(mat):
+    """
+    Invert a pose matrix.
+
+    Supports:
+      - 4×4 homogeneous matrices
+      - 3×4 [R|t] matrices
+
+    Args:
+        mat (np.ndarray or torch.Tensor): shape (...,4,4) or (...,3,4)
+
+    Returns:
+        np.ndarray or torch.Tensor: inverted 4×4 matrix
+    """
+    is_torch = isinstance(mat, torch.Tensor)
+    h, w = mat.shape[-2:]
+    if h == 4 and w == 4:
+        return torch.linalg.inv(mat) if is_torch else np.linalg.inv(mat)
+    if h == 3 and w == 4:
+        if is_torch:
+            R, t = mat[:, :3], mat[:, 3]
+            Ri = R.transpose(-2, -1)
+            ti = -Ri @ t.unsqueeze(-1)
+            E = torch.eye(4, dtype=mat.dtype, device=mat.device)
+            E[:3, :3], E[:3, 3] = Ri, ti.squeeze(-1)
+            return E
+        R, t = mat[:, :3], mat[:, 3]
+        Ri, ti = R.T, -R.T @ t
+        E = np.eye(4, dtype=mat.dtype)
+        E[:3, :3], E[:3, 3] = Ri, ti
+        return E
+    raise ValueError(f"Can't invert matrix of shape {mat.shape}")
+
+
+def recolor(pm, cam1, cam2, img2):
+    """
+    Recolor a point map (wrt cam1) using colors from cam2's image.
+
+    Args:
+        pm (np.ndarray): (H, W, 4) point map in cam1 coords (X,Y,Z,valid)
+        cam1 (tuple): (intrinsics, extrinsics) of cam1
+        cam2 (tuple): (intrinsics, extrinsics) of cam2
+        img2 (np.ndarray): (H2, W2, 3) image from cam2
+
+    Returns:
+        np.ndarray: (H, W, 3) RGB image in cam1 pixel grid
+    """
+    intrinsics1, extrinsics1 = cam1
+    intrinsics2, extrinsics2 = cam2
+    H, W = pm.shape[:2]
+
+    mask = pm[..., 3] > 0
+    pts_cam1 = pm[mask, :3]
+
+    R1, t1 = extrinsics1[:3, :3], extrinsics1[:3, 3]
+    # cam1 -> world
+    pts_world = (R1.T @ (pts_cam1 - t1).T).T
+
+    R2, t2 = extrinsics2[:3, :3], extrinsics2[:3, 3]
+    # world -> cam2
+    pts_cam2 = (R2 @ pts_world.T).T + t2
+
+    # project into cam2 image
+    uvw = (intrinsics2 @ pts_cam2.T).T
+    u = (uvw[:, 0] / uvw[:, 2]).astype(int)
+    v = (uvw[:, 1] / uvw[:, 2]).astype(int)
+
+    valid = (uvw[:, 2] > 0) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    out = np.zeros((H * W, 3), dtype=img2.dtype)
+
+    idx = np.flatnonzero(mask.ravel())[valid]
+    out[idx] = img2[v[valid], u[valid]]
+
+    return out.reshape(H, W, 3)
+
+
 def decompose_extrinsics(extrinsics):
     """
     Decomposes a 4x4 extrinsic matrix into translation and rotation (as quaternion).
@@ -200,21 +276,148 @@ def cam_pc_to_cam_pm(cam_pc, cam, image_shape, valid=False):
     cx, cy = intrinsics[0, 2], intrinsics[1, 2]
 
     x, y, z = cam_pc[:, 0], cam_pc[:, 1], cam_pc[:, 2]
-    u = (x * fx / z + cx).astype(int)
-    v = (y * fy / z + cy).astype(int)
+    
+    # Pre-filter valid z values to avoid division by zero/negative values
+    z_valid = (z > 1e-6) & np.isfinite(z)  # Use small epsilon instead of 0
+    
+    # Initialize with invalid values
+    u = np.full_like(x, -1, dtype=int)
+    v = np.full_like(y, -1, dtype=int)
+    
+    # Only compute projections for valid z values
+    if np.any(z_valid):
+        u_valid = x[z_valid] * fx / z[z_valid] + cx
+        v_valid = y[z_valid] * fy / z[z_valid] + cy
+        
+        # Check for finite values before casting
+        finite_mask = np.isfinite(u_valid) & np.isfinite(v_valid)
+        
+        if np.any(finite_mask):
+            u[z_valid] = np.where(finite_mask, u_valid.astype(int), -1)
+            v[z_valid] = np.where(finite_mask, v_valid.astype(int), -1)
 
     cam_pm = np.zeros((height, width, 4), dtype=cam_pc.dtype)
 
-    # negative z
-    validity_mask = (z > 0) & (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    # Create comprehensive validity mask
+    validity_mask = (
+        z_valid &  # z is positive and finite
+        (u >= 0) & (u < width) & 
+        (v >= 0) & (v < height)
+    )
 
     if valid and cam_pc.shape[1] == 4:
         validity_mask &= cam_pc[:, 3] > 0
 
-    cam_pm[v[validity_mask], u[validity_mask], :3] = cam_pc[validity_mask, :3]
-    cam_pm[v[validity_mask], u[validity_mask], 3] = 1  # mark valid pixels
+    # Only process valid points
+    if np.any(validity_mask):
+        valid_indices = np.where(validity_mask)[0]
+        cam_pm[v[valid_indices], u[valid_indices], :3] = cam_pc[valid_indices, :3]
+        cam_pm[v[valid_indices], u[valid_indices], 3] = 1  # mark valid pixels
 
     return cam_pm
+
+
+def create_pm_in_ref_frame(world_pc, validity, cam_source, cam_reference, 
+                                       image_shape, pm_source="3d_tracks"):
+    """
+    Creates a point map where pixels correspond to cam_source's image space, 
+    but 3D coordinates are expressed in cam_reference's coordinate frame.
+    
+    Args:
+        world_pc (np.ndarray): (N, 3) - 3D points in world coordinates
+        validity (np.ndarray): (N, 1) - Validity mask for each point
+        cam_source (tuple): (intrinsics, extrinsics) - Camera to project points onto
+        cam_reference (tuple): (intrinsics, extrinsics) - Camera whose coordinate frame to use
+        image_shape (tuple): (H, W) - Shape of the output point map
+        pm_source (str): Either "3d_tracks" (sparse) or "dm" (dense)
+        
+    Returns:
+        np.ndarray: (H, W, 4) - Point map with pixels in source image space and 
+                                 3D coords in reference frame
+    """
+    h, w = image_shape
+    
+    # Transform points to reference camera coordinates (for storage)
+    cam_pc_in_ref = world_pc_to_cam_pc(world_pc, cam_reference)  # (N, 3)
+    
+    # Transform points to source camera coordinates (for projection)
+    cam_pc_in_source = world_pc_to_cam_pc(world_pc, cam_source)  # (N, 3)
+    
+    # Initialize output point map
+    pm = np.zeros((h, w, 4), dtype=np.float32)
+    
+    if pm_source == "3d_tracks":
+        # Sparse tracks - manually project each point
+        intrinsics = cam_source[0]
+        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+        cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+        
+        for i in range(len(cam_pc_in_source)):
+            if validity[i] > 0:
+                x, y, z = cam_pc_in_source[i]
+                if z > 0:  # Valid depth
+                    u = int(x * fx / z + cx)
+                    v = int(y * fy / z + cy)
+                    if 0 <= u < w and 0 <= v < h:
+                        # Store 3D point in reference camera coordinates
+                        pm[v, u, :3] = cam_pc_in_ref[i]
+                        pm[v, u, 3] = 1
+                        
+    else:  # Dense point map
+        # First create point map in source camera coordinates to get pixel positions
+        cam_pc_in_source_valid = np.concatenate([cam_pc_in_source, validity], axis=1)
+        pm_source = cam_pc_to_cam_pm(cam_pc_in_source_valid, (cam_source[0], None), 
+                                     image_shape, valid=True)
+        
+        # Now fill in the reference camera coordinates
+        valid_mask = pm_source[..., 3] > 0
+        if np.any(valid_mask):
+            # Extract valid points and transform
+            valid_points_source = pm_source[valid_mask, :3]
+            # Transform from source to world to reference
+            valid_points_world = cam_pc_to_world_pc(valid_points_source, cam_source)
+            valid_points_ref = world_pc_to_cam_pc(valid_points_world, cam_reference)
+            # Put back into point map
+            pm[valid_mask, :3] = valid_points_ref
+            pm[valid_mask, 3] = 1
+            
+    return pm
+
+
+def create_pm_from_dm_in_ref_frame(depthmap, cam_source, cam_reference):
+    """
+    Creates a point map from a depth map where pixels correspond to the source camera's 
+    image space, but 3D coordinates are expressed in the reference camera's frame.
+    
+    Args:
+        depthmap (np.ndarray): (H, W) - Depth map from source camera
+        cam_source (tuple): (intrinsics, extrinsics) - Camera that captured the depth map
+        cam_reference (tuple): (intrinsics, extrinsics) - Camera whose coordinate frame to use
+        
+    Returns:
+        np.ndarray: (H, W, 4) - Point map with 3D coords in reference frame
+    """
+    # First create point map in source camera's coordinate system
+    pm_in_source = dm_to_cam_pm(depthmap, cam_source)  # (H, W, 4)
+    
+    # Transform the 3D coordinates to reference camera frame
+    h, w = depthmap.shape
+    pm_in_reference = np.zeros((h, w, 4), dtype=np.float32)
+    valid_mask = pm_in_source[..., 3] > 0
+    
+    if np.any(valid_mask):
+        # Extract valid 3D points
+        valid_points_source = pm_in_source[valid_mask, :3]  # (N, 3) in source camera coords
+        
+        # Transform to world then to reference camera
+        valid_points_world = cam_pc_to_world_pc(valid_points_source, cam_source)
+        valid_points_ref = world_pc_to_cam_pc(valid_points_world, cam_reference)
+        
+        # Put back into point map maintaining pixel locations
+        pm_in_reference[valid_mask, :3] = valid_points_ref
+        pm_in_reference[valid_mask, 3] = 1
+        
+    return pm_in_reference
 
 
 def compute_scale_difference(approx_pm, actual_pm):
@@ -244,6 +447,106 @@ def compute_scale_difference(approx_pm, actual_pm):
     )
     print(f"Scale Ratios: {scale_ratios}")
     return np.median(scale_ratios)
+
+
+def get_motion_map_from_world_pc(
+    world_pc_valid_list: list[np.ndarray],
+    cam_list: list[tuple[np.ndarray, np.ndarray]],
+    image_dimensions: tuple[int, int],
+) -> np.ndarray:
+    """
+    build per-pixel 3-d motion maps **from every source frame to the *last* frame**  
+    while expressing  ΔP  in the **reference camera** (= `cam_list[0]`) coordinates.
+
+    for each k ∈ [0, T-2] we store  
+
+        ΔP = P_last^ref − P_k^ref         # (M, 3) in ref-cam coords  
+
+    at the pixel (u,v) where P_k projects in frame-k’s image grid.
+
+    Args
+    ----
+    world_pc_valid_list : list[np.ndarray]
+        length T list of arrays shaped (N, 4): xyz (world) + validity flag.
+        all arrays share track ordering, so row-i is the same point across time.
+    cam_list : list[tuple[np.ndarray, np.ndarray]]
+        length T list of (intrinsics (3,3), extrinsics (4,4)) for each frame.
+        `cam_list[0]` is chosen as the *reference* camera.
+    image_dimensions : (H, W)
+        height and width of the images (assumed identical for every frame).
+
+    Returns
+    -------
+    np.ndarray
+        motion volume of shape (T-1, H, W, 4).  
+        for k ∈ [0, T-2]:
+
+            motion_map[k, v, u, :3]  – ΔP in reference-cam coords  
+            motion_map[k, v, u,  3]  – 1 if the pixel is valid, else 0
+    """
+    import numpy as np
+    import loaders.utils.geometry as geo
+
+    H, W = image_dimensions                     # image size
+    T = len(world_pc_valid_list)                # number of frames
+    assert T == len(cam_list), "list lengths must match"
+
+    ref_cam = cam_list[0]                       # ((3,3), (4,4))
+
+    # data for last (target) frame
+    world_pc_last   = world_pc_valid_list[-1]   # (N,4)
+    last_valid_mask = world_pc_last[:, 3] > 0   # (N,)
+
+    motion_map = np.zeros((T - 1, H, W, 4), dtype=np.float32)
+
+    for k in range(T - 1):
+        intr_k, _ = cam_list[k]                 # intrinsics of source frame-k
+        world_pc_k = world_pc_valid_list[k]     # (N,4)
+
+        # tracks visible in both k and last
+        valid_mask = (world_pc_k[:, 3] > 0) & last_valid_mask  # (N,)
+        if not np.any(valid_mask):
+            continue                            # no overlapping tracks
+
+        world_k    = world_pc_k  [valid_mask, :3]              # (M,3)
+        world_last = world_pc_last[valid_mask, :3]             # (M,3)
+
+        # transform to reference camera coordinates
+        cam_ref_k    = geo.world_pc_to_cam_pc(world_k,    ref_cam)  # (M,3)
+        cam_ref_last = geo.world_pc_to_cam_pc(world_last, ref_cam)  # (M,3)
+
+        motion_3d = cam_ref_last - cam_ref_k                 # (M,3)
+
+        # project world_k to pixel grid of frame-k
+        cam_k = geo.world_pc_to_cam_pc(world_k, cam_list[k]) # (M,3)
+
+        x, y, z = cam_k[:, 0], cam_k[:, 1], cam_k[:, 2]      # (M,)
+        fx, fy = intr_k[0, 0], intr_k[1, 1]
+        cx, cy = intr_k[0, 2], intr_k[1, 2]
+
+        z_pos = z > 0                                        # filter behind-cam
+        if not np.any(z_pos):
+            continue
+
+        x, y, z   = x[z_pos], y[z_pos], z[z_pos]             # (M',)  (M' ≤ M)
+        motion_3d = motion_3d[z_pos]                         # (M',3)
+
+        u = np.round(fx * x / z + cx).astype(int)            # (M',)
+        v = np.round(fy * y / z + cy).astype(int)            # (M',)
+
+        in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        if not np.any(in_bounds):
+            continue
+
+        u, v        = u[in_bounds], v[in_bounds]             # (M_valid,)
+        motion_valid = motion_3d[in_bounds]                  # (M_valid,3)
+
+        # write to motion map
+        motion_map[k, v, u, :3] = motion_valid               # xyz displacements
+        motion_map[k, v, u,  3] = 1                          # validity flag
+
+    return motion_map
+
 
 
 def get_motion_map_from_cam_pc(cam_pc_valid_list, ref_intrinsics, image_dimensions):
@@ -324,7 +627,9 @@ def crop_image_depthmap(image, depthmap, intrinsics, crop_bbox):
         image = Image.fromarray(image)  # convert to pil image
 
     cropped_image = image.crop((l, t, r, b))  # (new_W, new_H)
-    cropped_depthmap = depthmap[t:b, l:r]  # (new_H, new_W)
+    cropped_depthmap = (
+        depthmap[t:b, l:r] if depthmap is not None else None
+    )  # (new_H, new_W)
 
     adjusted_intrinsics = intrinsics.copy()  # (3, 3)
     adjusted_intrinsics[0, 2] -= l  # adjust cx
@@ -372,7 +677,11 @@ def rescale_image_depthmap(image, depthmap, intrinsics, target_resolution, force
     except AttributeError:
         resized_image = image.resize(
             tuple(output_resolution),
-            resample=Image.Resampling.LANCZOS if scale_factor < 1 else Image.Resampling.BICUBIC,
+            resample=(
+                Image.Resampling.LANCZOS
+                if scale_factor < 1
+                else Image.Resampling.BICUBIC
+            ),
         )  # (new_W, new_H)
 
     if depthmap is not None:

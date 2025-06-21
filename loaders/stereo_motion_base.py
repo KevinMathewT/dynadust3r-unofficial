@@ -8,7 +8,7 @@ import loaders.utils.geometry as geo
 
 
 class StereoMotionBase(Dataset):
-    def __init__(self, config):
+    def __init__(self, config, valid: bool = False):
         """
         Base class for stereo motion datasets that handles loading and processing of
         multi-view time series data for stereo and motion analysis.
@@ -20,15 +20,14 @@ class StereoMotionBase(Dataset):
 
         Args:
             config: Configuration object containing dataset parameters including:
-                - dataset.pointodyssey.name: Name identifier for the dataset
-                - dataset.pointodyssey.path: Base directory path to dataset files
-                - dataset.pointodyssey.max_frame_window: Maximum temporal window size for frame triplets
+                - dataset.<dataset>.name: Name identifier for the dataset
+                - dataset.<dataset>.path: Base directory path to dataset files
+                - dataset.<dataset>.max_frame_window: Maximum temporal window size for frame triplets
+            valid: Whether this is a validation dataset (affects triplet count)
         """
         # initialize common parameters
         self.config = config
-        self.dataset_label = config.dataset.pointodyssey.name
-        self.dataset_location = config.dataset.pointodyssey.path
-        self.max_frame_window = config.dataset.pointodyssey.max_frame_window
+        self.is_valid = valid  # Store whether this is validation dataset
 
         self.sequence_paths = []
 
@@ -48,8 +47,10 @@ class StereoMotionBase(Dataset):
         import numpy as np
 
         self.triplets = []  # initialize triplets list
-        target_triplets = self.config.data.len  # get target dataset size from config
-
+        
+        # Use appropriate target based on whether this is validation or training
+        target_triplets = self.config.data.valid_len if self.is_valid else self.config.data.len
+        
         while (
             len(self.triplets) < target_triplets
         ):  # generate triplets through uniform sampling
@@ -104,112 +105,105 @@ class StereoMotionBase(Dataset):
                 - sequence_idx: Index of the sequence this triplet belongs to (scalar tensor)
                 - left_instance, right_instance: Identifiers for left and right frames (string)
         """
-        # get triplet info
-        seq_idx, left_frame, mid_frame, right_frame = self.triplets[index]
-        sequence_path = self.sequence_paths[seq_idx]
 
-        # fetch frame info
-        left_info = self.get_frame_info(sequence_path, left_frame)  # dict
-        mid_info = self.get_frame_info(sequence_path, mid_frame)  # dict
-        right_info = self.get_frame_info(sequence_path, right_frame)  # dict
+        while True:
+            # get triplet info
+            seq_idx, left_frame, mid_frame, right_frame = self.triplets[index]
+            sequence_path = self.sequence_paths[seq_idx]
 
-        reference_cam = left_info["cam"]  # ((3, 3), (4, 4))
-        image_shape = left_info["dm"].shape  # (H, W)
+            try:
+                # fetch frame info
+                left_info = self.get_frame_info(sequence_path, left_frame)
+                mid_info = self.get_frame_info(sequence_path, mid_frame)
+                right_info = self.get_frame_info(sequence_path, right_frame)
+                
+                # Assert that all frames have tracks
+                assert len(left_info["world_pc_valid"]) > 0, f"left frame {sequence_path}:{left_frame} has no tracks"
+                assert len(mid_info["world_pc_valid"]) > 0, f"mid frame {sequence_path}:{mid_frame} has no tracks"  
+                assert len(right_info["world_pc_valid"]) > 0, f"right frame {sequence_path}:{right_frame} has no tracks"
+                
+                break
+            except Exception as e:
+                print(f"error loading triplet: {seq_idx}:{sequence_path}, {left_frame}, {mid_frame}, {right_frame}")
+                print(f"error: {e}")
+                index = np.random.randint(0, len(self.triplets))
 
-        left_world_pc = left_info["world_pc_valid"][:, :3]  # (N_left, 3)
-        mid_world_pc = mid_info["world_pc_valid"][:, :3]  # (N_mid, 3)
-        right_world_pc = right_info["world_pc_valid"][:, :3]  # (N_right, 3)
+        reference_cam = left_info["cam"]  # Use left camera as reference
+        
+        # Extract world points and validity
+        left_world_pc = left_info["world_pc_valid"][:, :3]
+        mid_world_pc = mid_info["world_pc_valid"][:, :3]
+        right_world_pc = right_info["world_pc_valid"][:, :3]
+        
+        left_valid = left_info["world_pc_valid"][:, 3:4]
+        mid_valid = mid_info["world_pc_valid"][:, 3:4]
+        right_valid = right_info["world_pc_valid"][:, 3:4]
 
-        left_valid = left_info["world_pc_valid"][:, 3:4]  # (N_left, 1)
-        mid_valid = mid_info["world_pc_valid"][:, 3:4]  # (N_mid, 1)
-        right_valid = right_info["world_pc_valid"][:, 3:4]  # (N_right, 1)
-
-        # convert points to camera coordinates
-        left_cam_pc = geo.world_pc_to_cam_pc(
-            left_world_pc, reference_cam
-        )  # (N_left, 3)
-        mid_cam_pc = geo.world_pc_to_cam_pc(mid_world_pc, reference_cam)  # (N_mid, 3)
-        right_cam_pc = geo.world_pc_to_cam_pc(
-            right_world_pc, reference_cam
-        )  # (N_right, 3)
-
-        left_cam_pc_valid = np.concatenate(
-            [left_cam_pc, left_valid], axis=1
-        )  # (N_left, 4)
-        mid_cam_pc_valid = np.concatenate([mid_cam_pc, mid_valid], axis=1)  # (N_mid, 4)
-        right_cam_pc_valid = np.concatenate(
-            [right_cam_pc, right_valid], axis=1
-        )  # (N_right, 4)
-
-        image_shape = left_info["dm"].shape  # (H, W)
-
-        # get dataset config
-        dataset_config = getattr(self.config.dataset, self.dataset_label.lower(), None)
-        if (
-            dataset_config is not None
-            and getattr(dataset_config, "pm_source", "") == "3d_tracks"
-        ):
-            left_pm = geo.cam_pc_to_cam_pm(
-                left_cam_pc_valid, (reference_cam[0], None), image_shape, valid=True
-            )  # (H, W, 4)
-            mid_pm = geo.cam_pc_to_cam_pm(
-                mid_cam_pc_valid, (reference_cam[0], None), image_shape, valid=True
-            )  # (H, W, 4)
-            right_pm = geo.cam_pc_to_cam_pm(
-                right_cam_pc_valid, (reference_cam[0], None), image_shape, valid=True
-            )  # (H, W, 4)
-
-        elif (
-            dataset_config is not None
-            and getattr(dataset_config, "pm_source", "") == "dm"
-        ):
-            left_pm = geo.dm_to_cam_pm(left_info["dm"], reference_cam)  # (H, W, 4)
-
-            # process mid frame
-            mid_dm_pc = geo.dm_to_cam_pc(
-                mid_info["dm"], mid_info["cam"]
-            )  # (N_mid_dense, 3)
-            mid_dm_world_pc = geo.cam_pc_to_world_pc(
-                mid_dm_pc, mid_info["cam"]
-            )  # (N_mid_dense, 3)
-            mid_dm_left_pc = geo.world_pc_to_cam_pc(
-                mid_dm_world_pc, reference_cam
-            )  # (N_mid_dense, 3)
-            mid_pm = geo.cam_pc_to_cam_pm(
-                mid_dm_left_pc, (reference_cam[0], None), image_shape, valid=True
-            )  # (H, W, 4)
-
-            # process right frame
-            right_dm_pc = geo.dm_to_cam_pc(
-                right_info["dm"], right_info["cam"]
-            )  # (N_right_dense, 3)
-            right_dm_world_pc = geo.cam_pc_to_world_pc(
-                right_dm_pc, right_info["cam"]
-            )  # (N_right_dense, 3)
-            right_dm_left_pc = geo.world_pc_to_cam_pc(
-                right_dm_world_pc, reference_cam
-            )  # (N_right_dense, 3)
-            right_pm = geo.cam_pc_to_cam_pm(
-                right_dm_left_pc, (reference_cam[0], None), image_shape, valid=True
-            )  # (H, W, 4)
+        # Get dataset config
+        dataset_config = getattr(self.config.dataset, self.config.data.loader.lower(), None)
+        pm_source = getattr(dataset_config, "pm_source", "") if dataset_config else ""
+        
+        if pm_source == "3d_tracks":
+            # Create point maps with proper coordinate transforms
+            left_pm = geo.create_pm_in_ref_frame(
+                left_world_pc, left_valid, left_info["cam"], reference_cam, 
+                left_info["image"].shape[:2], pm_source="3d_tracks"
+            )
+            
+            mid_pm = geo.create_pm_in_ref_frame(
+                mid_world_pc, mid_valid, mid_info["cam"], reference_cam, 
+                mid_info["image"].shape[:2], pm_source="3d_tracks"
+            )
+            
+            right_pm = geo.create_pm_in_ref_frame(
+                right_world_pc, right_valid, right_info["cam"], reference_cam, 
+                right_info["image"].shape[:2], pm_source="3d_tracks"
+            )
+            
+        elif pm_source == "dm":
+            # Create point maps from depth maps
+            left_pm = geo.dm_to_cam_pm(left_info["dm"], reference_cam)
+            
+            mid_pm = geo.create_pm_from_dm_in_ref_frame(
+                mid_info["dm"], mid_info["cam"], reference_cam
+            )
+            
+            right_pm = geo.create_pm_from_dm_in_ref_frame(
+                right_info["dm"], right_info["cam"], reference_cam
+            )
+            
         else:
             raise NotImplementedError("point map source not implemented")
 
-        # compute motion maps
-        left_to_mid_motion = geo.get_motion_map_from_cam_pc(
-            [left_cam_pc_valid, mid_cam_pc_valid], reference_cam[0], image_shape
-        )[
-            0
-        ]  # (H, W, 4)
+        # ---------------------------------------------------------------
+        # Compute motion maps: left→mid  and  right→mid
+        # ---------------------------------------------------------------
+        world_pc_valid_list = [
+            left_info ["world_pc_valid"],   # (N,4) left
+            right_info["world_pc_valid"],   # (N,4) right
+            mid_info  ["world_pc_valid"],   # (N,4) mid   ← target
+        ]
+        cam_list = [
+            left_info ["cam"],
+            right_info["cam"],
+            mid_info  ["cam"],              # ← target
+        ]
 
-        right_to_mid_motion = geo.get_motion_map_from_cam_pc(
-            [right_cam_pc_valid, mid_cam_pc_valid], reference_cam[0], image_shape
-        )[
-            0
-        ]  # (H, W, 4)
+        motion_maps = geo.get_motion_map_from_world_pc(
+            world_pc_valid_list,
+            cam_list,
+            left_info["image"].shape[:2],   # (H,W) – any is fine; function only uses per-frame intrinsics
+        )
+        left_to_mid_motion  = motion_maps[0]   # stored on left grid
+        right_to_mid_motion = motion_maps[1]   # stored on right grid
 
-        # print("left instance: ", left_info.get("instance", None))
-        # print("right instance: ", right_info.get("instance", None))
+        # Process images
+        m = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        s = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+
+        left_image = (left_info["image"].astype(np.float32) / 255 - m) / s
+        mid_image = (mid_info["image"].astype(np.float32) / 255 - m) / s
+        right_image = (right_info["image"].astype(np.float32) / 255 - m) / s
 
         return {
             "left_pm": torch.from_numpy(left_pm.copy()).float(),  # (H, W, 4)
@@ -217,15 +211,17 @@ class StereoMotionBase(Dataset):
             "right_pm": torch.from_numpy(right_pm.copy()).float(),  # (H, W, 4)
             "left_to_mid_motion": torch.from_numpy(left_to_mid_motion.copy()).float(),  # (H, W, 4)
             "right_to_mid_motion": torch.from_numpy(right_to_mid_motion.copy()).float(),  # (H, W, 4)
-            "left_image": torch.from_numpy(left_info["image"].copy()).permute(2, 0, 1).float(),  # (3, H, W)
-            "mid_image": torch.from_numpy(mid_info["image"].copy()).permute(2, 0, 1).float(),  # (3, H, W)
-            "right_image": torch.from_numpy(right_info["image"].copy()).permute(2, 0, 1).float(),  # (3, H, W)
+            "left_image": torch.from_numpy(left_image.copy()).permute(2, 0, 1).float(),  # (3, H, W)
+            "mid_image": torch.from_numpy(mid_image.copy()).permute(2, 0, 1).float(),  # (3, H, W)
+            "right_image": torch.from_numpy(right_image.copy()).permute(2, 0, 1).float(),  # (3, H, W)
             "idxs": torch.tensor((left_frame, mid_frame, right_frame)).float(),  # tensor of shape (3,)
             "mid_tq": torch.tensor((mid_frame - left_frame) / (right_frame - left_frame)).float(),  # scalar tensor
             "sequence_idx": torch.tensor(seq_idx).float(),  # scalar tensor
             "left_instance": left_info.get("instance", None),  # string
             "right_instance": right_info.get("instance", None),  # string
             "cam": left_info["cam"],  # ((3,3), (4,4))
+            "cam_mid": mid_info["cam"],  # ((3,3), (4,4))
+            "cam_right": right_info["cam"],  # ((3,3), (4,4))
         }
 
 

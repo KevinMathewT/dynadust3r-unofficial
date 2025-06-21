@@ -191,6 +191,11 @@ class Regr3D (Criterion, MultiLoss):
         l2 = self.criterion(pred_pts2[mask2], gt_pts2[mask2])
         self_name = type(self).__name__
         details = {self_name + '_pts3d_1': float(l1.mean()), self_name + '_pts3d_2': float(l2.mean())}
+        # print(f'{self_name} loss: {details}')
+        # for i in range(mask1.shape[0]):
+        #     print(f'{i} | mask1: {mask1[i].sum()} | mask2: {mask2[i].sum()}')
+        #     print(f'{i} | og mask1: {gt1["valid_mask"][i].sum()} | og mask2: {gt2["valid_mask"][i].sum()}')
+        #     print(f'{i} | mask shape: {mask1[i].shape} | {mask2[i].shape} | {mask1[i].dtype} | {mask2[i].dtype}')
         return Sum((l1, mask1), (l2, mask2)), (details | monitoring)
 
 
@@ -221,9 +226,9 @@ class ConfLoss (MultiLoss):
         # compute per-pixel loss
         ((loss1, msk1), (loss2, msk2)), details = self.pixel_loss(gt1, gt2, pred1, pred2, **kw)
         if loss1.numel() == 0:
-            print('NO VALID POINTS in img1', force=True)
+            print('NO VALID POINTS in img1')
         if loss2.numel() == 0:
-            print('NO VALID POINTS in img2', force=True)
+            print('NO VALID POINTS in img2')
 
         # weight by confidence
         conf1, log_conf1 = self.get_conf_log(pred1['conf'][msk1])

@@ -1,0 +1,14 @@
+name: stereo4dv2
+path: /scratch/projects/fouheylab/km6748/stereo4d-data/
+lefteye_dir: /scratch/projects/fouheylab/km6748/stereo4d-data/lefteye-perspective
+meta_dir: /scratch/projects/fouheylab/km6748/stereo4d-data/meta
+train_split: train # train, test
+valid_split: test # train, test
+# path: /scratch/projects/fouheylab/km6748/stereo4d-data/
+# train_split: sample
+# valid_split: sample
+max_frame_window: 60
+pm_source: 3d_tracks # dm / 3d_tracks
+
+# dataset specific
+hfov: 60

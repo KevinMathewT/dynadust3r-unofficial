@@ -172,9 +172,11 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
-
+.vscode/
+.v
 tmp/
 data/
 stereo4d_dataset/
 outputs/
 weights/
+wandb/

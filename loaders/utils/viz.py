@@ -240,89 +240,128 @@ def visualize_image(image, cam=None, name="image"):
         ))
 
 
-def visualize_pm(pm, image=None, cam=None, valid=True, name="pm", pc_in_cam_coords=True):
+def visualize_pm(pm, image=None, cam=None, valid=True, name="pm", pc_in_cam_coords=True, colors=None, save=False, path=None):
     """
     Visualizes a point map using rerun for 3D logging and visualization.
 
     Args:
-        pm (numpy.ndarray): A (H, W, C) point map where each pixel represents a 3D point.
-        image (numpy.ndarray, optional): Corresponding RGB image (H, W, 3) used for colorizing points. Defaults to None.
-        cam (tuple, optional): A tuple containing (intrinsics, extrinsics) matrices.
-            - intrinsics (numpy.ndarray): 3x3 camera intrinsic matrix.
-            - extrinsics (numpy.ndarray): 4x4 transformation matrix (world-to-camera).
+        pm (numpy.ndarray or list of numpy.ndarray): Either a single (H, W, C) point map or a sequence of T point maps
+            with shape (T, H, W, C). If only one time step is provided, it will be unsqueezed to shape (1, H, W, C).
+        image (numpy.ndarray or list of numpy.ndarray, optional): Corresponding RGB image(s) per timestep, either
+            a single (H, W, 3) array or list of T arrays. Defaults to None.
+        cam (tuple or list of tuples, optional): Either a single (intrinsics, extrinsics) tuple or a list of T such tuples.
+            intrinsics: 3x3 camera intrinsic matrix.
+            extrinsics: 4x4 transformation matrix (world-to-camera).
             Defaults to None.
         valid (bool, optional): If True, filters out invalid points using the validity column if present. Defaults to True.
         name (str, optional): The name for logging in rerun. Defaults to "pm".
         pc_in_cam_coords (bool, optional): If True, assumes the point cloud is already in camera coordinates.
             If False, transforms world coordinates to camera coordinates using extrinsics. Defaults to True.
+        colors (numpy.ndarray or list of numpy.ndarray, optional): Either a single (N,3) color array or a list of T such arrays.
+            Optional array to use directly as point colors. Defaults to None.
+        save (bool, optional): If True, saves the rerun recording to `path`. Defaults to False.
+        path (str, optional): File path to save the .rrd file if `save` is True. Defaults to None.
 
     Behavior:
         - If `pm` contains a validity column (4th channel), filters points based on the `valid` flag.
-        - If `image` and `cam` are provided, projects the point cloud into image space for colorization.
+        - Supports multiple timesteps: logs each timestep with `rr.set_time_sequence("time", t)`.
+        - If only one timestep is provided, it is unsqueezed.
+        - If `colors` is provided, uses that for coloring.
+        - Else if `image` and `cam` are provided, projects the point cloud into image space for colorization.
         - Logs the point cloud and camera information to rerun for visualization.
         - If `pc_in_cam_coords` is False, transforms the point cloud using extrinsics.
-
-    Returns:
-        None (logs visualization data to rerun).
     """
     rr.init(name)
+    if save and path is not None:
+        rr.save(path)  # must be called before the first log
+        print(f"Saved visualization to {path}.")
     rr.connect_tcp("127.0.0.1:9876")
-    
 
-    if cam is not None:
-        intrinsics, extrinsics = cam
-    
-    H, W, C = pm.shape
-    pc_valid = pm.reshape(-1, C)
-    
-    if pc_valid.shape[1] == 4:
-        if valid:
-            pc_valid = pc_valid[pc_valid[:, 3] > 0][:, :3]
-        else:
-            pc_valid = pc_valid[:, :3]
-    
-    if image is not None and cam is not None:
-        intrinsics, extrinsics = cam
-        
-        if not pc_in_cam_coords:
-            pc_h = np.hstack((pc_valid, np.ones((pc_valid.shape[0], 1))))
-            cam_coords = (extrinsics @ pc_h.T).T[:, :3]
-        else:
-            cam_coords = pc_valid
-        
-        uv = (intrinsics @ cam_coords.T).T
-        uv /= uv[:, 2:3]
-        uv = uv[:, :2].astype(int)
-        
-        h, w, _ = image.shape
-        mask = (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
-        colors = np.zeros((pc_valid.shape[0], 3), dtype=np.uint8)
-        colors[mask] = image[uv[mask, 1], uv[mask, 0]]
-    else:
-        colors = None
-    
-    rr.log(name, rr.Points3D(positions=pc_valid, colors=colors))
+    # normalize pm to array with time dim
+    if isinstance(pm, list):
+        pm = np.stack(pm, axis=0)  # (T, H, W, C)
+    elif isinstance(pm, np.ndarray) and pm.ndim == 3:
+        pm = pm[np.newaxis, ...]   # (1, H, W, C)
 
-    if image is not None and intrinsics is not None:
-        H, W, _ = image.shape
-        rr.log("cam", rr.Pinhole(
-            resolution=[W, H],
-            focal_length=[intrinsics[0, 0], intrinsics[1, 1]],
-            principal_point=[intrinsics[0, 2], intrinsics[1, 2]]
-        ))
-        
-        if not pc_in_cam_coords:
-            R = extrinsics[:3, :3]
-            t = extrinsics[:3, 3]
-            R_inv = R.T
-            t_inv = -R_inv @ t
-            inv_extrinsics = np.eye(4)
-            inv_extrinsics[:3, :3] = R_inv
-            inv_extrinsics[:3, 3] = t_inv
-            translation, quaternion = decompose_extrinsics(inv_extrinsics)
-            rr.log("cam_pose", rr.Transform3D(translation=translation, quaternion=quaternion))
-        
-        rr.log("cam", rr.Image(image))
+    T = pm.shape[0]
+
+    # helper to wrap scalar or list into length-T list
+    def wrap(var):
+        if var is None:
+            return [None] * T
+        if isinstance(var, list):
+            return var
+        return [var] * T
+
+    image_seq = wrap(image)
+    cam_seq   = wrap(cam)
+    color_seq = wrap(colors)
+
+    for t in range(T):
+        rr.set_time_sequence("time", t)
+
+        pm_t      = pm[t]
+        image_t   = image_seq[t]
+        cam_t     = cam_seq[t]
+        colors_t  = color_seq[t]
+
+        if cam_t is not None:
+            intrinsics, extrinsics = cam_t
+
+        H, W, C = pm_t.shape
+        pc_valid = pm_t.reshape(-1, C)
+
+        if pc_valid.shape[1] == 4:
+            if valid:
+                pc_valid = pc_valid[pc_valid[:, 3] > 0][:, :3]
+            else:
+                pc_valid = pc_valid[:, :3]
+
+        if colors_t is not None:
+            colors = colors_t
+        elif image_t is not None and cam_t is not None:
+            intrinsics, extrinsics = cam_t
+
+            if not pc_in_cam_coords:
+                pc_h = np.hstack((pc_valid, np.ones((pc_valid.shape[0], 1))))
+                cam_coords = (extrinsics @ pc_h.T).T[:, :3]
+            else:
+                cam_coords = pc_valid
+
+            uv = (intrinsics @ cam_coords.T).T
+            uv /= uv[:, 2:3]
+            uv = uv[:, :2].astype(int)
+
+            h, w, _ = image_t.shape
+            mask = (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+            colors = np.zeros((pc_valid.shape[0], 3), dtype=np.uint8)
+            colors[mask] = image_t[uv[mask, 1], uv[mask, 0]]
+        else:
+            colors = None
+
+        rr.log(name, rr.Points3D(positions=pc_valid, colors=colors))
+
+        if image_t is not None and cam_t is not None:
+            H_img, W_img, _ = image_t.shape
+            rr.log("cam", rr.Pinhole(
+                resolution=[W_img, H_img],
+                focal_length=[intrinsics[0, 0], intrinsics[1, 1]],
+                principal_point=[intrinsics[0, 2], intrinsics[1, 2]]
+            ))
+
+            if not pc_in_cam_coords:
+                R = extrinsics[:3, :3]
+                t_vec = extrinsics[:3, 3]
+                R_inv = R.T
+                t_inv = -R_inv @ t_vec
+                inv_extrinsics = np.eye(4)
+                inv_extrinsics[:3, :3] = R_inv
+                inv_extrinsics[:3, 3] = t_inv
+                translation, quaternion = decompose_extrinsics(inv_extrinsics)
+                rr.log("cam_pose", rr.Transform3D(translation=translation, quaternion=quaternion))
+
+            rr.log("cam", rr.Image(image_t))
+    
 
 
 def visualize_sequence_from_pms(pms, motion_map, image_seq=None, name="seq_pm", save=False, path=None):
@@ -330,8 +369,8 @@ def visualize_sequence_from_pms(pms, motion_map, image_seq=None, name="seq_pm", 
     Visualizes a sequence of point maps with motion vectors, logging frames at separate timesteps in Rerun.
 
     Parameters:
-    - pms: List or array of (H, W, 4) or (H, W, 3) or (N, 4) or (N, 3) point maps (3D positions [+ optional validity mask]).
-    - motion_map: (T-1, H, W, 4) or (T-1, H, W, 3) or (T-1, N, 4) or (T-1, N, 3) motion vectors.
+    - pms: List or array of (H, W, 4) or (H, W, 3) point maps or (N, 4) or (N, 3) point clouds (3D positions [+ optional validity mask]).
+    - motion_map: (T-1, H, W, 4) or (T-1, H, W, 3) motion maps or (T-1, N, 4) or (T-1, N, 3) motion vectors.
     - image_seq: Optional list of (H, W, 3) images for color visualization.
     - name: String identifier for the visualization session.
     - save: Boolean flag to save the recording to a .rrd file.
@@ -353,6 +392,9 @@ def visualize_sequence_from_pms(pms, motion_map, image_seq=None, name="seq_pm", 
         return x.reshape(-1, 4) if x.ndim == 3 else x
 
     rr.init(name)
+    if save and path is not None:
+        rr.save(path)  # must be called before the first log
+        print(f"Saved visualization to {path}.")
     rr.connect_tcp("127.0.0.1:9876")
     
     pms = [to_np(pm) for pm in pms]
@@ -405,12 +447,6 @@ def visualize_sequence_from_pms(pms, motion_map, image_seq=None, name="seq_pm", 
             rr.log("point_cloud", rr.Points3D(positions=pc_valid, colors=colors))
             pc = pc_next
 
-    # print(f"Visualized sequence: {T} frames.")
-
-    if save and path is not None:
-        rr.save(path)
-        # print(f"Saved visualization to {path}.")
-
 
 def test_visualize_pc():
     test_points = np.array([
@@ -429,6 +465,7 @@ def test_visualize_pc():
     visualize_pc(test_pc_valid, valid=True, name="test_manual_pc")
 
 # port forwarding: ssh -J greene -L 9091:localhost:9091 -L 9877:localhost:9877 gr011
+# rerun viewer: rerun --web-viewer
 def test_rerun():
     rr.init("streaming_test")
     rr.connect_tcp("127.0.0.1:9876")

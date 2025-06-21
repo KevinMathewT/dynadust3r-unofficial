@@ -6,7 +6,9 @@ Date: 2025-03-10
 import os
 import cv2
 import numpy as np
+
 from .stereo_motion_base import StereoMotionBase
+from .utils import geometry as geom
 
 class PointOdyssey(StereoMotionBase):
     def __init__(self, config, valid=False):
@@ -18,6 +20,10 @@ class PointOdyssey(StereoMotionBase):
         """
         super().__init__(config)
         print("loading pointodyssey dataset...")
+
+        self.dataset_label = config.dataset.pointodyssey.name
+        self.dataset_location = config.dataset.pointodyssey.path
+        self.max_frame_window = config.dataset.pointodyssey.max_frame_window
         
         # dataset-specific parames
         if not valid:
@@ -106,232 +112,86 @@ def main(config: DictConfig):
     dataset_tracks = PointOdyssey(config)
     print(f"total triplets: {len(dataset_tracks)}")
     
-    # get a sample triplet
-    sample_idx = 0
-    sample_tracks = dataset_tracks[sample_idx]
-    
-    # print basic info about the triplet
-    print(f"triplet frames: idxs={sample_tracks['idxs']}")
-    print("------------------------")    
-    for k, v in sample_tracks.items():
-        if isinstance(v, torch.Tensor):
-            print(k, v.size(), v.dtype)
-        else:
-            print(k)
-    
-    # prepare point maps and images for visualization
-    track_pms = np.array([
-        sample_tracks['left_pm'],
-        sample_tracks['mid_pm'],
-        sample_tracks['right_pm']
-    ])
-    
-    images = [
-        sample_tracks['left_image'].permute(1, 2, 0).numpy(),
-        None,
-        None,
-    ]
+    for sample_idx in range(20, 30):
+        sample_tracks = dataset_tracks[sample_idx]
 
-    viz.visualize_image(sample_tracks['left_image'].permute(1, 2, 0).numpy(), name="left_image")
-    # viz.visualize_dm(sample_tracks['left_dm'], name="left_dm")
-    viz.visualize_image(sample_tracks['mid_image'].permute(1, 2, 0).numpy(), name="mid_image")
-    # viz.visualize_dm(sample_tracks['mid_dm'], name="mid_dm")
-    viz.visualize_image(sample_tracks['right_image'].permute(1, 2, 0).numpy(), name="right_image")
-    # viz.visualize_dm(sample_tracks['right_dm'], name="right_dm")
+        # print basic info about the triplet
+        print(f"triplet frames: idxs={sample_tracks['idxs']}")
+        print("------------------------")
+        for k, v in sample_tracks.items():
+            if isinstance(v, torch.Tensor):
+                print(k, v.size(), v.dtype)
+            else:
+                print(k)
 
-    viz.visualize_pm(
-        track_pms[0], 
-        image=images[0], 
-        cam=sample_tracks['cam'], 
-        name="left_pm"
-    )
-    viz.visualize_pm(
-        track_pms[1], 
-        image=None, 
-        cam=sample_tracks['cam'], 
-        name="mid_pm"
-    )
-    viz.visualize_pm(
-        track_pms[2], 
-        image=None, 
-        cam=sample_tracks['cam'], 
-        name="right_pm"
-    )
-    
-    # prepare motion maps
-    left_to_mid = sample_tracks['left_to_mid_motion']
-    right_to_mid = sample_tracks['right_to_mid_motion']
-    
-    # create single-step motion maps for each visualization
-    h, w, _ = sample_tracks['left_pm'].shape
-    
-    # 1. tracks + left_to_mid
-    left_to_mid_map = np.zeros((1, h, w, 4), dtype=np.float32)
-    left_to_mid_map[0] = left_to_mid
-    
-    # 2. tracks + right_to_mid
-    right_to_mid_map = np.zeros((1, h, w, 4), dtype=np.float32)
-    right_to_mid_map[0] = right_to_mid
+        # prepare point maps and images for visualization
+        track_pms = np.array(
+            [sample_tracks["left_pm"], sample_tracks["mid_pm"], sample_tracks["right_pm"]]
+        )
 
-    viz.visualize_sequence_from_pms(
-        track_pms[:2],  # just left and mid for left_to_mid
-        left_to_mid_map, 
-        images[:2], 
-        name="tracksl"
-    )
+        c1 = sample_tracks["cam"]   # or sample_tracks["cam"]
+        c2 = sample_tracks["cam_mid"]
+        c3 = sample_tracks["cam_right"]
 
-    viz.visualize_sequence_from_pms(
-        np.array([track_pms[2], track_pms[1]]),  # right and mid for right_to_mid
-        right_to_mid_map,
-        [images[2], images[1]],
-        name="tracksr"
-    )
+        img_l = sample_tracks["left_image"].permute(1,2,0).numpy()
+        img_m = sample_tracks["mid_image"].permute(1,2,0).numpy()
+        img_r = sample_tracks["right_image"].permute(1,2,0).numpy()
 
-    ###
-    
-    # dataset_dm = PointOdyssey(config)
-    # sample_dm = dataset_dm[sample_idx]
-    
-    # # prepare point maps for depth-based visualization
-    # dm_pms = np.array([
-    #     sample_dm['left_pm'],
-    #     sample_dm['mid_pm'],
-    #     sample_dm['right_pm']
-    # ])
-    
-    # # visualize all 4 combinations
-    # print("visualizing 3d tracks + left to mid motion...")
-    # viz.visualize_sequence_from_pms(
-    #     track_pms[:2],  # just left and mid for left_to_mid
-    #     left_to_mid_map, 
-    #     images[:2], 
-    #     name="tracksl"
-    # )
-    
-    # print("visualizing 3d tracks + right to mid motion...")
-    # viz.visualize_sequence_from_pms(
-    #     np.array([track_pms[2], track_pms[1]]),  # right and mid for right_to_mid
-    #     right_to_mid_map, 
-    #     [images[2], images[1]], 
-    #     name="tracksr"
-    # )
-    
-    # print("visualizing depth maps + left to mid motion...")
-    # viz.visualize_sequence_from_pms(
-    #     dm_pms[:2],  # just left and mid for left_to_mid
-    #     left_to_mid_map, 
-    #     images[:2], 
-    #     name="dml"
-    # )
-    
-    # print("visualizing depth maps + right to mid motion...")
-    # viz.visualize_sequence_from_pms(
-    #     np.array([dm_pms[2], dm_pms[1]]),  # right and mid for right_to_mid
-    #     right_to_mid_map, 
-    #     [images[2], images[1]], 
-    #     name="dmr"
-    # )
+        images = [
+            img_l,
+            geom.recolor(track_pms[1], c1, c2, img_m),
+            geom.recolor(track_pms[2], c1, c3, img_r),
+        ]
 
-    # seq_path = "data/pointodyssey/sample/r4_new_f"
-    # frame_info = dataset.get_frame_info(seq_path, 0)
+        viz.visualize_image(
+            sample_tracks["left_image"].permute(1, 2, 0).numpy(), name="left_image"
+        )
+        # viz.visualize_dm(sample_tracks['left_dm'], name="left_dm")
+        viz.visualize_image(
+            sample_tracks["mid_image"].permute(1, 2, 0).numpy(), name="mid_image"
+        )
+        # viz.visualize_dm(sample_tracks['mid_dm'], name="mid_dm")
+        viz.visualize_image(
+            sample_tracks["right_image"].permute(1, 2, 0).numpy(), name="right_image"
+        )
+        # viz.visualize_dm(sample_tracks['right_dm'], name="right_dm")
 
-    # for k, v in frame_info.items():
-    #     if isinstance(v, np.ndarray):
-    #         print(k, v.shape)
-    #     else:
-    #         print(k, v[0].shape, v[1].shape)
+        viz.visualize_pm(
+            track_pms[0], image=images[0], cam=sample_tracks["cam"], name="left_pm"
+        )
+        viz.visualize_pm(track_pms[1], image=images[1], cam=sample_tracks["cam"], name="mid_pm")
+        viz.visualize_pm(
+            track_pms[2], image=images[2], cam=sample_tracks["cam"], name="right_pm"
+        )
 
-    # # viz.visualize_cam_movement_in_world(dataset, seq_path, num_frames=10)
+        # prepare motion maps
+        left_to_mid = sample_tracks["left_to_mid_motion"]
+        right_to_mid = sample_tracks["right_to_mid_motion"]
 
-    # world_pc_valid = frame_info["world_pc_valid"]
-    # dm = frame_info["dm"]
-    # cam = frame_info["cam"]
-    # world_pc = np.asarray(world_pc_valid[:, :3])
-    # cam_pc = geo.world_pc_to_cam_pc(world_pc, cam)
-    # cam_dm_pc = geo.dm_to_cam_pc(dm, cam)
-    # cam_pm = geo.cam_pc_to_cam_pm(cam_pc, cam, dm.shape)
-    # cam_pm2 = geo.cam_pc_to_cam_pm(cam_dm_pc, cam, dm.shape)
+        # create single-step motion maps for each visualization
+        h, w, _ = sample_tracks["left_pm"].shape
 
-    # print(f"world_pc_valid shape: {world_pc_valid.shape}")
-    # print(f"world_pc_valid sample: {world_pc_valid[:5]}")
-    # print(f"Depth map min/max: {dm.min()}, {dm.max()}")
-    # print(f"Camera PC min/max: {cam_pc.min()}, {cam_pc.max()}")
-    # print(f"Camera PC sample: {cam_pc[:5]}")
-    # print(f"Camera DM PC min/max: {cam_dm_pc.min()}, {cam_dm_pc.max()}")
-    # print(f"Camera DM PC sample: {cam_dm_pc[:5]}")
+        # 1. tracks + left_to_mid
+        left_to_mid_map = np.zeros((1, h, w, 4), dtype=np.float32)
+        left_to_mid_map[0] = left_to_mid
 
-    # print("Min depth:", np.min(dm))
-    # print("Max depth:", np.max(dm))
-    # print("Number of (0,0,0) points:", np.sum((cam_pc == [0, 0, 0]).all(axis=1)))
-    # print("Number of (0,0,0) points:", np.sum((cam_dm_pc == [0, 0, 0]).all(axis=1)))
+        # 2. tracks + right_to_mid
+        right_to_mid_map = np.zeros((1, h, w, 4), dtype=np.float32)
+        right_to_mid_map[0] = right_to_mid
 
-    # print("Visualizing Point Cloud...")
-    # viz.visualize_pc(
-    #     cam_pc,
-    #     image=frame_info["image"],
-    #     cam=cam,
-    #     valid=True,
-    #     pc_in_cam_coords=True,
-    # )
-    # print("Visualizing Point Cloud Done.")
+        viz.visualize_sequence_from_pms(
+            track_pms[:2],  # just left and mid for left_to_mid
+            left_to_mid_map,
+            images[:2],
+            name="tracksl",
+        )
 
-    # print("Visualizing Point Cloud...")
-    # viz.visualize_pc(
-    #     cam_dm_pc,
-    #     image=frame_info["image"],
-    #     cam=cam,
-    #     valid=True,
-    #     pc_in_cam_coords=True,
-    #     # name="cam_dm_pc",
-    # )
-    # print("Visualizing Point Cloud Done.")
-
-    # print("Visualizing Point Map...")
-    # viz.visualize_pm(
-    #     cam_pm,
-    #     image=frame_info["image"],
-    #     cam=cam,
-    #     valid=True,
-    #     pc_in_cam_coords=True,
-    # )
-
-
-    # print("Visualizing Point Map...")
-    # viz.visualize_pm(
-    #     cam_pm2,
-    #     image=frame_info["image"],
-    #     cam=cam,
-    #     valid=True,
-    #     pc_in_cam_coords=True,
-    #     # name="cam_dm_pc",
-    # )
-
-    # t = 50
-
-    # frame_infos = [dataset.get_frame_info(seq_path, i) for i in range(t)]
-    # cams = [f["cam"] for f in frame_infos]
-    # images = [f["image"] for f in frame_infos]
-
-    # world_pcs = [f["world_pc_valid"][:, :3] for f in frame_infos]
-    # valid_flags = [f["world_pc_valid"][..., 3:4] for f in frame_infos]
-
-    # cam_pcs = [geo.world_pc_to_cam_pc(world_pcs[i], cams[0]) for i in range(t)]
-    # cam_pc_valids = [np.concatenate([cam_pcs[i], valid_flags[i]], axis=1) for i in range(t)]
-
-    # print(f"valid in cam_pc: {[int(cpv[:, -1].sum()) for cpv in cam_pc_valids]}")
-
-    # cam_pms = [geo.cam_pc_to_cam_pm(cam_pc_valids[i], (cams[i][0], None), frame_infos[i]["dm"].shape, valid=True) for i in range(t)]
-    # cam_dm_pms = [geo.dm_to_cam_pm(frame_infos[i]["dm"], cams[i]) for i in range(t)]
-    # print(f"valid in cam_pm: {[cp[..., -1].sum() for cp in cam_pms]}")
-
-    # motion_map = geo.get_motion_map_from_cam_pc(cam_pc_valids, cams[0][0], frame_infos[0]["dm"].shape)
-
-    # print("--------------------------- total points -> valid points -> motion valid points")
-    # for ti in range(motion_map.shape[0]):
-    #     print(f"valid in motion_map at t={ti}: {frame_infos[ti]['world_pc_valid'].shape[0]} + {frame_infos[ti + 1]['world_pc_valid'].shape[0]} -> {int(cam_pc_valids[ti][:, -1].sum())} + {int(cam_pc_valids[ti + 1][:, -1].sum())} -> {int(motion_map[ti, ..., -1].sum())}")
-
-    # viz.visualize_sequence_from_pms(np.asarray(cam_pms), motion_map, images, name="cam_pms_motion_map")
-    # viz.visualize_sequence_from_pms(np.asarray(cam_dm_pms), motion_map, images, name="cam_dm_pms_motion_map")
+        viz.visualize_sequence_from_pms(
+            np.array([track_pms[2], track_pms[1]]),  # right and mid for right_to_mid
+            right_to_mid_map,
+            [images[2], images[1]],
+            name="tracksr",
+        )
 
 
 if __name__ == "__main__":

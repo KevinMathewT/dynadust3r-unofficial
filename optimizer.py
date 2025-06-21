@@ -17,46 +17,39 @@ OPTIMIZERS = {
 
 class CosineWarmupScheduler(LambdaLR):
     """
-    Cosine decay scheduler with warmup.
+    cosine decay scheduler with warmup.
 
-    Args:
-        optimizer (Optimizer): Wrapped optimizer.
-        steps_per_epoch (int): Number of steps per epoch.
-        epochs (int): Total number of training epochs.
-        warmup_pct (float): Fraction of total steps used for linear warmup.
+    args:
+      optimizer: wrapped optimizer
+      total_steps: total training steps
+      warmup_pct: fraction of steps to warm up
     """
-    def __init__(self, optimizer, steps_per_epoch, epochs, warmup_pct=0.0):
-        total_steps = steps_per_epoch * epochs
+    def __init__(self, optimizer, total_steps, warmup_pct=0.0):
         warmup_steps = int(warmup_pct * total_steps)
-
         def lr_lambda(step):
+            # linear warmup
             if step < warmup_steps:
                 return step / max(1, warmup_steps)
+            # cosine decay
             p = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-            return max(0.0, 0.5 * (1 + math.cos(math.pi * p)))
-
-        super().__init__(optimizer, lr_lambda)
-
+            return 0.5 * (1 + math.cos(math.pi * p))
+        super().__init__(optimizer, lr_lambda)  # no .step() dims here
 
 class LinearWarmupScheduler(LambdaLR):
     """
-    Linear decay scheduler with warmup.
+    linear decay scheduler with warmup.
 
-    Args:
-        optimizer (Optimizer): Wrapped optimizer.
-        steps_per_epoch (int): Number of steps per epoch.
-        epochs (int): Total number of training epochs.
-        warmup_pct (float): Fraction of total steps used for linear warmup.
+    args:
+      optimizer: wrapped optimizer
+      total_steps: total training steps
+      warmup_pct: fraction of steps to warm up
     """
-    def __init__(self, optimizer, steps_per_epoch, epochs, warmup_pct=0.0):
-        total_steps = steps_per_epoch * epochs
+    def __init__(self, optimizer, total_steps, warmup_pct=0.0):
         warmup_steps = int(warmup_pct * total_steps)
-
         def lr_lambda(step):
             if step < warmup_steps:
                 return step / max(1, warmup_steps)
             return max(0.0, (total_steps - step) / max(1, total_steps - warmup_steps))
-
         super().__init__(optimizer, lr_lambda)
 
 
@@ -107,8 +100,7 @@ def get_scheduler(optimizer, config, loader):
     if name in ["cosine", "linear", "onecycle"]:
         return sched_cls(
             optimizer,
-            steps_per_epoch=len(loader),
-            epochs=config.train.epochs,
+            total_steps=config.train.iterations,
             **sched_config
         )
     return sched_cls(optimizer, **sched_config)

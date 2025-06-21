@@ -65,8 +65,16 @@ def train_one_epoch(
             loss, loss_details = model.get_loss(criterion, batch, outputs)
 
         # backward prop
-        optimizer.zero_grad()
-        accelerator.backward(loss)
+        if isinstance(loss, torch.Tensor):
+            accelerator.backward(loss)
+            optimizer.step()
+        else:
+            print(f"train_one_epoch | GOT ZERO LOSS; which means the valid mask is not valid anywhere, check mask sum below:")
+            for i in range(batch["left_image"].size(0)):
+                print(f'get_loss | {i} | instance1: {batch["left_instance"][i]} | instance2: {batch["right_instance"][i]}')
+                print(f'get_loss | {i} | mask1 sum: {batch["left_pm"][i][..., 3].sum()} | mask2 sum: {batch["right_pm"][i][..., 3].sum()} | og shape: {batch["left_pm"][i].shape}')
+
+            loss = torch.zeros(1).to(batch["left_image"].device)
 
         # grad clip
         if config.train.grad_clip > 0:
@@ -94,7 +102,7 @@ def train_one_epoch(
 
         losses.update(loss.item(), batch["batch_size"])
 
-        # logging
+        # viz logging
         if (
             batch_idx == 0
             or (batch_idx + 1) % 5 == 0
@@ -106,8 +114,14 @@ def train_one_epoch(
                 else scheduler.get_last_lr()[0]
             )
             accelerator.print(
-                f"[{epoch+1}/{config.train.epochs}][{batch_idx+1}/{len(train_loader)}] train loss: {loss.item():.10f} | lr: {lr:.10f} | grad norm: {grad_norm}"
+                f"[{epoch+1}/{config.train.epochs}][{batch_idx+1}/{len(train_loader)}] train loss: {loss.item():.10f} | lr: {lr:.10f} | grad norm: {grad_norm} |",
+                end="",
             )
+            for k, v in loss_details.items():
+                accelerator.print(f" {k}: {v:.4f}", end=" |")
+            accelerator.print("")
+            
+        if epoch % 10 == 0:
             model.save_visualizations(batch, outputs, epoch, batch_idx, HydraConfig.get().runtime.output_dir)
 
         # wandb logging
