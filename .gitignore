@@ -180,3 +180,10 @@ stereo4d_dataset/
 outputs/
 weights/
 wandb/
+.claude/
+.gemini/
+.lprof/
+.vscode/
+.python-version
+job_error_*
+job_output_*

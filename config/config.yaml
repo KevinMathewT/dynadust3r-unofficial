@@ -9,6 +9,8 @@ defaults:
 
 seed: 96
 
+debug: False
+
 train:
   validation_frequency: 1000  # Combined validation frequency (replaces both epoch_frequency and valid.interval)
   iterations: 49000  # Total number of training iterations
@@ -23,12 +25,13 @@ valid:
 
 data:
   loader: stereo4d # [stereo4d, pointodyssey]
-  len: ??? # Will be calculated in Python: iterations * batch_size
-  valid_len: 300 # Will be calculated in Python: this * batch_size  
+  len: 4 # Will be calculated in Python: iterations * batch_size | ???
+  valid_len: 2 # Will be calculated in Python: this * batch_size | 300
   size: 512 # image size | also change in model/dynadust3r.yaml
   crop: True
-  batch_size: 16
+  batch_size: 2
   num_workers: 16
+  prefetch_fact: 4
 
 logging:
   use_wandb: True

@@ -347,21 +347,55 @@ def create_pm_in_ref_frame(world_pc, validity, cam_source, cam_reference,
     pm = np.zeros((h, w, 4), dtype=np.float32)
     
     if pm_source == "3d_tracks":
-        # Sparse tracks - manually project each point
+        # Vectorized sparse tracks projection
         intrinsics = cam_source[0]
         fx, fy = intrinsics[0, 0], intrinsics[1, 1]
         cx, cy = intrinsics[0, 2], intrinsics[1, 2]
         
-        for i in range(len(cam_pc_in_source)):
-            if validity[i] > 0:
-                x, y, z = cam_pc_in_source[i]
-                if z > 0:  # Valid depth
-                    u = int(x * fx / z + cx)
-                    v = int(y * fy / z + cy)
-                    if 0 <= u < w and 0 <= v < h:
-                        # Store 3D point in reference camera coordinates
-                        pm[v, u, :3] = cam_pc_in_ref[i]
-                        pm[v, u, 3] = 1
+        # Flatten validity for easier indexing
+        validity_flat = validity.flatten() > 0
+        
+        # Extract valid points
+        valid_cam_pc_source = cam_pc_in_source[validity_flat]
+        valid_cam_pc_ref = cam_pc_in_ref[validity_flat]
+        
+        if len(valid_cam_pc_source) > 0:
+            # Extract coordinates
+            x, y, z = valid_cam_pc_source[:, 0], valid_cam_pc_source[:, 1], valid_cam_pc_source[:, 2]
+            
+            # Filter points with positive depth
+            depth_valid = z > 0
+            x = x[depth_valid]
+            y = y[depth_valid]
+            z = z[depth_valid]
+            valid_cam_pc_ref = valid_cam_pc_ref[depth_valid]
+            
+            if len(x) > 0:
+                # Project all points at once
+                u = (x * fx / z + cx).astype(np.int32)
+                v = (y * fy / z + cy).astype(np.int32)
+                
+                # Bounds check
+                in_bounds = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+                u = u[in_bounds]
+                v = v[in_bounds]
+                valid_cam_pc_ref = valid_cam_pc_ref[in_bounds]
+                
+                # Handle potential duplicate projections by keeping the closest point
+                if len(u) > 0:
+                    # Create a unique key for each pixel
+                    pixel_keys = v * w + u
+                    
+                    # Find unique pixels and their first occurrence
+                    unique_pixels, unique_indices = np.unique(pixel_keys, return_index=True)
+                    
+                    # Extract unique u, v coordinates
+                    u_unique = u[unique_indices]
+                    v_unique = v[unique_indices]
+                    
+                    # Update point map
+                    pm[v_unique, u_unique, :3] = valid_cam_pc_ref[unique_indices]
+                    pm[v_unique, u_unique, 3] = 1
                         
     else:  # Dense point map
         # First create point map in source camera coordinates to get pixel positions

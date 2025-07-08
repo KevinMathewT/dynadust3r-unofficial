@@ -27,9 +27,9 @@ class Stereo4Dv5(StereoMotionBase):
     - Vectorized operations where possible
     """
 
-    def __init__(self, config, valid: bool = False):
-        super().__init__(config, valid)  # Pass valid parameter to parent
-        print("loading cacheless stereo4d v4 dataset (optimized for 8TB+ data)...")
+    def __init__(self, config, valid: bool = False, time_debug: bool = False):
+        super().__init__(config, valid, time_debug)  # Pass time_debug to parent
+        print("loading stereo4d v5 dataset...")
 
         self.dataset_label = config.dataset.stereo4d.name
         split = (
@@ -40,6 +40,7 @@ class Stereo4Dv5(StereoMotionBase):
         self.hfov = config.dataset.stereo4d.hfov
         self.max_frame_window = config.dataset.stereo4d.max_frame_window
         self.config = config
+        self.time_debug = time_debug  # Store time_debug flag
 
         # WebDataset setup (same as original)
         wds_dir = Path(config.dataset.stereo4d.path) / "wds" / split
@@ -104,32 +105,78 @@ class Stereo4Dv5(StereoMotionBase):
 
     def _load_single_frame(self, seq: str, idx: int):
         """Load ONLY the specific frame needed - no caching, minimal memory."""
+        if self.time_debug:
+            t0 = time.perf_counter()
+        
         # Get video sample from WebDataset
+        if self.time_debug:
+            t1 = time.perf_counter()
         sample = self.idx_ds[self.key_to_idx[seq]]
+        if self.time_debug:
+            print(f"[TIME] Get sample from idx_ds: {(time.perf_counter() - t1)*1000:.2f}ms")
+        
+        if self.time_debug:
+            t1 = time.perf_counter()
         video_data = sample[".video.mp4"]
+        if self.time_debug:
+            print(f"[TIME] Access video data: {(time.perf_counter() - t1)*1000:.2f}ms")
         
         # Create video reader from bytes
+        if self.time_debug:
+            t1 = time.perf_counter()
         video_bytes = video_data.read() if hasattr(video_data, "read") else video_data
+        if self.time_debug:
+            print(f"[TIME] Read video bytes: {(time.perf_counter() - t1)*1000:.2f}ms")
+            
+        if self.time_debug:
+            t1 = time.perf_counter()
         vr = VideoReader(io.BytesIO(video_bytes), ctx=cpu(0))
+        if self.time_debug:
+            print(f"[TIME] Create VideoReader: {(time.perf_counter() - t1)*1000:.2f}ms")
         
         # Load ONLY the specific frame - VideoReader handles seeking efficiently
+        if self.time_debug:
+            t1 = time.perf_counter()
         frame = vr[idx].asnumpy()
+        if self.time_debug:
+            print(f"[TIME] Load frame {idx}: {(time.perf_counter() - t1)*1000:.2f}ms")
         
         # Convert color space once
+        if self.time_debug:
+            t1 = time.perf_counter()
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if self.time_debug:
+            print(f"[TIME] Convert BGR to RGB: {(time.perf_counter() - t1)*1000:.2f}ms")
         
         # Immediately release video reader memory
         del vr
+        
+        if self.time_debug:
+            print(f"[TIME] Total _load_single_frame: {(time.perf_counter() - t0)*1000:.2f}ms")
         
         return frame_rgb
 
     def _load_single_frame_annotations(self, seq: str, idx: int):
         """Load and process annotations using original logic, return specific frame."""
+        if self.time_debug:
+            t0 = time.perf_counter()
+            
         # Get annotation sample  
+        if self.time_debug:
+            t1 = time.perf_counter()
         sample = self.idx_ds[self.key_to_idx[seq]]
+        if self.time_debug:
+            print(f"[TIME] Get sample for annotations: {(time.perf_counter() - t1)*1000:.2f}ms")
+            
+        if self.time_debug:
+            t1 = time.perf_counter()
         ann_data = np.load(sample[".ann.npz"], allow_pickle=True)
+        if self.time_debug:
+            print(f"[TIME] Load ann.npz: {(time.perf_counter() - t1)*1000:.2f}ms")
         
         # Use original annotation processing logic
+        if self.time_debug:
+            t1 = time.perf_counter()
         lengths = ann_data['track_lengths']
         
         # Get number of frames from sequence (we don't have frames loaded, so infer from data)
@@ -146,21 +193,46 @@ class Stereo4Dv5(StereoMotionBase):
         
         valid = (~np.isnan(tracks[..., 0])).astype(np.float32)[..., None]
         pcs = np.concatenate([tracks, valid], axis=-1).astype(np.float32)
+        if self.time_debug:
+            print(f"[TIME] Process annotations: {(time.perf_counter() - t1)*1000:.2f}ms")
         
         # Return only the specific frame we need: pcs is (num_tracks, num_frames, 4)
-        return pcs[:, idx, :]  # (num_tracks, 4)
+        result = pcs[:, idx, :]  # (num_tracks, 4)
+        
+        if self.time_debug:
+            print(f"[TIME] Total _load_single_frame_annotations: {(time.perf_counter() - t0)*1000:.2f}ms")
+            
+        return result
 
     def _load_camera_data(self, seq: str, idx: int):
         """Load camera intrinsics and extrinsics for specific frame."""
+        if self.time_debug:
+            t0 = time.perf_counter()
+            
+        if self.time_debug:
+            t1 = time.perf_counter()
         sample = self.idx_ds[self.key_to_idx[seq]]
+        if self.time_debug:
+            print(f"[TIME] Get sample for camera: {(time.perf_counter() - t1)*1000:.2f}ms")
         
         # Load intrinsics (same for all frames in sequence)
+        if self.time_debug:
+            t1 = time.perf_counter()
         intrinsics = np.load(sample[".intr.npy"], allow_pickle=True)
+        if self.time_debug:
+            print(f"[TIME] Load intrinsics: {(time.perf_counter() - t1)*1000:.2f}ms")
         
         # Load only the specific frame's extrinsics
+        if self.time_debug:
+            t1 = time.perf_counter()
         ann_data = np.load(sample[".ann.npz"], allow_pickle=True)
         extrinsics = geom.inv(ann_data['camera2world'][idx])
+        if self.time_debug:
+            print(f"[TIME] Load and invert extrinsics: {(time.perf_counter() - t1)*1000:.2f}ms")
         
+        if self.time_debug:
+            print(f"[TIME] Total _load_camera_data: {(time.perf_counter() - t0)*1000:.2f}ms")
+            
         return intrinsics, extrinsics
 
     def get_frame_info(self, seq: str, idx: int):
@@ -177,6 +249,10 @@ class Stereo4Dv5(StereoMotionBase):
         Returns:
             dict with image, world_pc_valid, cam, dm, instance
         """
+        if self.time_debug:
+            total_start = time.perf_counter()
+            print(f"\n[TIME] get_frame_info({seq}, {idx})")
+            
         # Load only the specific frame 
         img = self._load_single_frame(seq, idx)
         
@@ -187,6 +263,9 @@ class Stereo4Dv5(StereoMotionBase):
         intrinsics, extrinsics = self._load_camera_data(seq, idx)
         cam = (intrinsics, extrinsics)
         
+        if self.time_debug:
+            print(f"[TIME] TOTAL get_frame_info: {(time.perf_counter() - total_start)*1000:.2f}ms")
+        
         return dict(
             image=img,
             world_pc_valid=world_pc,
@@ -194,6 +273,182 @@ class Stereo4Dv5(StereoMotionBase):
             dm=None,
             instance=f"{seq}_{idx:05d}",
         )
+
+    def get_frame_infos(self, seq: str, idxs: list):
+        """
+        Optimized batch loading of multiple frames from the same sequence.
+        Opens files only once and loads all requested frames efficiently.
+        
+        Args:
+            seq (str): sequence identifier
+            idxs (list): list of frame indices to load
+            
+        Returns:
+            list of dicts with image, world_pc_valid, cam, dm, instance for each frame
+        """
+        if self.time_debug:
+            total_start = time.perf_counter()
+            print(f"\n[TIME] get_frame_infos({seq}, {idxs})")
+        
+        # Get the sample once for all frames
+        if self.time_debug:
+            t0 = time.perf_counter()
+        sample = self.idx_ds[self.key_to_idx[seq]]
+        if self.time_debug:
+            print(f"[TIME] Get sample: {(time.perf_counter() - t0)*1000:.2f}ms")
+        
+        # Load video data and create VideoReader ONCE
+        if self.time_debug:
+            t0 = time.perf_counter()
+        video_data = sample[".video.mp4"]
+        video_bytes = video_data.read() if hasattr(video_data, "read") else video_data
+        if self.time_debug:
+            print(f"[TIME] Read video bytes: {(time.perf_counter() - t0)*1000:.2f}ms")
+            
+        if self.time_debug:
+            t0 = time.perf_counter()
+        vr = VideoReader(io.BytesIO(video_bytes), ctx=cpu(0))
+        if self.time_debug:
+            print(f"[TIME] Create VideoReader: {(time.perf_counter() - t0)*1000:.2f}ms")
+        
+        # Load all frames from the video
+        if self.time_debug:
+            t0 = time.perf_counter()
+        frames = []
+        for idx in idxs:
+            if self.time_debug:
+                t1 = time.perf_counter()
+            frame = vr[idx].asnumpy()
+            if self.time_debug:
+                print(f"[TIME]   Load frame {idx}: {(time.perf_counter() - t1)*1000:.2f}ms")
+            # frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame)
+        if self.time_debug:
+            print(f"[TIME] Load all {len(idxs)} frames: {(time.perf_counter() - t0)*1000:.2f}ms")
+        
+        # Release video reader
+        del vr
+        
+        # Load annotation data once
+        if self.time_debug:
+            t0 = time.perf_counter()
+        ann_data = np.load(sample[".ann.npz"], allow_pickle=True)
+        if self.time_debug:
+            print(f"[TIME] Load ann.npz: {(time.perf_counter() - t0)*1000:.2f}ms")
+        
+        # Load intrinsics once (same for all frames in sequence)
+        if self.time_debug:
+            t0 = time.perf_counter()
+        intrinsics = np.load(sample[".intr.npy"], allow_pickle=True)
+        if self.time_debug:
+            print(f"[TIME] Load intrinsics: {(time.perf_counter() - t0)*1000:.2f}ms")
+        
+        # Process annotations once
+        if self.time_debug:
+            t0 = time.perf_counter()
+            print("[TIME] ── Process annotations ──")
+        lengths = ann_data['track_lengths']
+        
+        if self.time_debug:
+            t1 = time.perf_counter()
+        frame_idxs = np.asarray(idxs)
+        if self.time_debug:
+            print(f"[TIME]     build frame_idxs: {(time.perf_counter()-t1)*1000:.2f}ms")
+        
+        if self.time_debug:
+            t1 = time.perf_counter()
+        col_of_frame = {f: j for j, f in enumerate(frame_idxs)}
+        if self.time_debug:
+            print(f"[TIME]     dict frame→col:  {(time.perf_counter()-t1)*1000:.2f}ms")
+        
+        if self.time_debug:
+            t1 = time.perf_counter()
+        col_idx_full = ann_data['track_indices']
+        keep = np.isin(col_idx_full, frame_idxs)
+        if self.time_debug:
+            print(f"[TIME]     mask np.isin:     {(time.perf_counter()-t1)*1000:.2f}ms "
+                  f"({keep.sum()} / {keep.size} rows kept)")
+        
+        # fast track-id lookup without np.repeat
+        if keep.any():
+            if self.time_debug:
+                t1 = time.perf_counter()
+            obs_idx = np.flatnonzero(keep)
+            if self.time_debug:
+                print(f"[TIME]       np.flatnonzero: {(time.perf_counter()-t1)*1000:.2f}ms")
+            
+            if self.time_debug:
+                t1 = time.perf_counter()
+            track_ends = lengths.cumsum()          # exclusive ends
+            row_s = np.searchsorted(track_ends, obs_idx, side='right')
+            if self.time_debug:
+                print(f"[TIME]       searchsorted:  {(time.perf_counter()-t1)*1000:.2f}ms")
+            
+            if self.time_debug:
+                t1 = time.perf_counter()
+            frames_kept = col_idx_full[keep]
+            # vectorised mapping frame id -> column
+            max_frame = int(col_idx_full.max())
+            frame2col = np.full(max_frame + 1, -1, dtype=np.int32)
+            frame2col[frame_idxs] = np.arange(len(frame_idxs), dtype=np.int32)
+            col_s = frame2col[frames_kept]
+            coord_s = ann_data['track_coordinates'][keep]
+            if self.time_debug:
+                print(f"[TIME]       build col/coords: {(time.perf_counter()-t1)*1000:.2f}ms")
+        else:
+            row_s = col_s = coord_s = np.empty((0,), dtype=np.int32)
+        
+        if self.time_debug:
+            t1 = time.perf_counter()
+        shape_sel = (len(lengths), len(frame_idxs), 3)
+        tracks = np.full(shape_sel, np.nan, dtype=np.float32)
+        if self.time_debug:
+            print(f"[TIME]     allocate tracks: {(time.perf_counter()-t1)*1000:.2f}ms "
+                  f"(shape={shape_sel})")
+        
+        if len(row_s):
+            if self.time_debug:
+                t1 = time.perf_counter()
+            tracks[row_s, col_s] = coord_s
+            if self.time_debug:
+                print(f"[TIME]     scatter coords: {(time.perf_counter()-t1)*1000:.2f}ms")
+        
+        if self.time_debug:
+            t1 = time.perf_counter()
+        valid = (~np.isnan(tracks[..., 0])).astype(np.float32)[..., None]
+        pcs = np.concatenate([tracks, valid], axis=-1).astype(np.float32)
+        if self.time_debug:
+            print(f"[TIME]     build mask+pcs: {(time.perf_counter()-t1)*1000:.2f}ms")
+        
+        if self.time_debug:
+            print(f"[TIME] ── Process annotations total: {(time.perf_counter()-t0)*1000:.2f}ms")
+        
+        # Get all extrinsics we need
+        if self.time_debug:
+            t0 = time.perf_counter()
+        extrinsics_list = [geom.inv(ann_data['camera2world'][idx]) for idx in idxs]
+        if self.time_debug:
+            print(f"[TIME] Compute extrinsics: {(time.perf_counter() - t0)*1000:.2f}ms")
+        
+        # Build results
+        if self.time_debug:
+            t0 = time.perf_counter()
+        results = []
+        for i, idx in enumerate(idxs):
+            results.append(dict(
+                image=frames[i],
+                world_pc_valid=pcs[:, col_of_frame[idx], :],  # (num_tracks, 4) for this frame
+                cam=(intrinsics, extrinsics_list[i]),
+                dm=None,
+                instance=f"{seq}_{idx:05d}",
+            ))
+        if self.time_debug:
+            print(f"[TIME] Build results: {(time.perf_counter() - t0)*1000:.2f}ms")
+        
+        if self.time_debug:
+            print(f"[TIME] TOTAL get_frame_infos: {(time.perf_counter() - total_start)*1000:.2f}ms")
+        
+        return results
 
 
 import time, os
@@ -224,8 +479,11 @@ def main(config: DictConfig):
         config.data.len = config.train.iterations * config.data.batch_size
         config.data.valid_len = config.data.valid_len * config.data.batch_size
 
+    # Enable time_debug for detailed timing
+    time_debug = True
+    
     # dataset + dataloader (identical settings to training loop)
-    dataset = Stereo4Dv5(config, valid=False)
+    dataset = Stereo4Dv5(config, valid=False, time_debug=time_debug)
     dist = torch.distributed.is_initialized()
     world = torch.distributed.get_world_size() if dist else 1
     sampler = DistributedSampler(dataset) if dist else None
@@ -254,3 +512,47 @@ def main(config: DictConfig):
 
 if __name__ == "__main__":
     main()
+
+
+'''
+
+implementations:
+
+def naive_pcs(lengths, track_indices, track_coordinates, idxs):
+    num_f = track_indices.max() + 1
+    n_tracks = len(lengths)
+    row_idx = np.repeat(np.arange(n_tracks), lengths)
+    tracks = np.full((n_tracks, num_f, 3), np.nan, np.float32)
+    tracks[row_idx, track_indices] = track_coordinates
+    valid = (~np.isnan(tracks[..., 0]))[..., None].astype(np.float32)
+    pcs = np.concatenate([tracks, valid], axis=-1)
+    # slice the columns we care about
+    sel = np.stack([pcs[:, idx, :] for idx in idxs], axis=1)
+    return sel
+
+def optimized_pcs(lengths, track_indices, track_coordinates, idxs):
+    frame_idxs = np.asarray(idxs)
+    col_idx_full = track_indices
+    keep = np.isin(col_idx_full, frame_idxs)
+
+    if keep.any():
+        obs_idx = np.flatnonzero(keep)
+        row_s = np.searchsorted(lengths.cumsum(), obs_idx, side='right')
+
+        frames_kept = col_idx_full[keep]
+        max_frame = int(col_idx_full.max())
+        frame2col = np.full(max_frame + 1, -1, dtype=np.int32)
+        frame2col[frame_idxs] = np.arange(len(frame_idxs), dtype=np.int32)
+        col_s = frame2col[frames_kept]
+
+        coord_s = track_coordinates[keep]
+    else:
+        row_s = col_s = coord_s = np.empty((0,), dtype=np.int32)
+
+    tracks = np.full((len(lengths), len(frame_idxs), 3), np.nan, np.float32)
+    if len(row_s):
+        tracks[row_s, col_s] = coord_s
+    valid = (~np.isnan(tracks[..., 0]))[..., None].astype(np.float32)
+    return np.concatenate([tracks, valid], axis=-1)
+
+'''

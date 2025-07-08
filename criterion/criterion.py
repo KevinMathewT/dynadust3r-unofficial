@@ -230,6 +230,12 @@ class ConfLoss (MultiLoss):
         if loss2.numel() == 0:
             print('NO VALID POINTS in img2')
 
+        # # debug: print tensor shapes and mem usage
+        # print(f"loss1.shape = {loss1.shape}, numel = {loss1.numel()}")
+        # conf1 = pred1['conf'][msk1]
+        # print(f"conf1.shape = {conf1.shape}, numel = {conf1.numel()}")
+        # import torch; print(torch.cuda.memory_summary())
+
         # weight by confidence
         conf1, log_conf1 = self.get_conf_log(pred1['conf'][msk1])
         conf2, log_conf2 = self.get_conf_log(pred2['conf'][msk2])

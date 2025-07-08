@@ -4,28 +4,32 @@
 # --------------------------------------------------------
 # DynaDUSt3R model class - extends DUSt3R with motion prediction
 # --------------------------------------------------------
-from copy import deepcopy
-import torch
-import os
-import numpy as np
-import matplotlib.cm as cm
-from packaging import version
-import huggingface_hub
-
-import torch
-import numpy as np
-import wandb
-from matplotlib import cm
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from matplotlib.colors import Normalize
+# standard library
+import gc
 import io
-from PIL import Image
-import cv2
+import os
+from copy import deepcopy
 from time import time
 
-from utils.geometry import normalize_pointcloud
+# third-party
+import cv2
+import numpy as np
+import torch
+import wandb
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import Normalize
+from packaging import version
+import huggingface_hub
+from PIL import Image
 
+# local
+from utils.geometry import normalize_pointcloud
+import loaders.utils.geometry as geom
+from loaders.utils.viz import visualize_image, visualize_pm, visualize_sequence_from_pms
+from models.croco.croco import CroCoNet  # noqa: F401
+from models.dust3r.utils.heads import head_factory, motion_head_factory
 from models.dust3r.utils.misc import (
     fill_default_args,
     freeze_all_params,
@@ -33,14 +37,8 @@ from models.dust3r.utils.misc import (
     interleave,
     transpose_to_landscape,
 )
-from models.dust3r.utils.heads import head_factory, motion_head_factory
 from models.dust3r.utils.patch_embed import get_patch_embed
 
-import loaders.utils.geometry as geom
-from loaders.utils.viz import visualize_image, visualize_pm, visualize_sequence_from_pms
-
-# import dust3r.utils.path_to_croco  # noqa: F401
-from models.croco.croco import CroCoNet  # noqa
 
 inf = float("inf")
 
@@ -78,12 +76,15 @@ class DynaDUSt3R(
         landscape_only=True,
         patch_embed_cls="PatchEmbedDust3R",  # PatchEmbedDust3R or ManyAR_PatchEmbed
         time_pos_emb_dim=128,
-        teacher_forcing=True,  # Whether to use ground truth (True) or predicted (False) point clouds for motion
+        teacher_forcing=False,  
+        # Whether to use ground truth (True) or predicted (False) point clouds for motion
+        # currently only False is supported - TODO: normalize/scale the gt point clouds correctly to match prediction space before adding predicted motion
         **croco_kwargs,
     ):
         self.patch_embed_cls = patch_embed_cls
         self.time_pos_emb_dim = time_pos_emb_dim
         self.teacher_forcing = teacher_forcing
+        print(f"[DynaDUSt3R] teacher_forcing = {teacher_forcing}")
         self.croco_args = fill_default_args(croco_kwargs, super().__init__)
         super().__init__(**croco_kwargs)
 
@@ -205,10 +206,6 @@ class DynaDUSt3R(
 
     def _encode_image(self, image, true_shape):
         # embed the image into patches  (x has size B x Npatches x C)
-        # print(f"image shape: {image.shape}")
-        # print(f"image type: {image.dtype}")
-        # print(f"true_shape: {true_shape}")
-        # print(f"true_shape type: {true_shape.dtype}")
         x, pos = self.patch_embed(image, true_shape=true_shape)
 
         # add positional embedding without cls token
@@ -284,7 +281,6 @@ class DynaDUSt3R(
 
     def _downstream_head(self, head_num, decout, img_shape):
         B, S, D = decout[-1].shape
-        # img_shape = tuple(map(int, img_shape))
         head = getattr(self, f"head{head_num}")
         return head(decout, img_shape)
 
@@ -293,15 +289,70 @@ class DynaDUSt3R(
         head = getattr(self, f"mhead{head_num}")
         return head(decout, img_shape, query_time)
 
+    def _motion_head_multi(self, head_num, decout, img_shape, query_times):
+        """
+        Process multiple query times in parallel for efficient motion prediction.
+        
+        Args:
+            head_num: Which motion head to use (1 or 2)
+            decout: Decoder output features
+            img_shape: Image shape information
+            query_times: Tensor of shape (B, T) where T is number of query times
+            
+        Returns:
+            dict: Motion predictions for all query times with shape (B, T, H, W, 3)
+        """
+        B = decout[-1].shape[0]
+        T = query_times.shape[1]
+        
+        # Prepare decoder outputs for batch processing
+        # Replicate decoder outputs T times and flatten batch dimension
+        decout_expanded = []
+        for feat in decout:
+            # feat shape: (B, S, D)
+            feat_expanded = feat.unsqueeze(1).expand(-1, T, -1, -1)  # (B, T, S, D)
+            feat_expanded = feat_expanded.reshape(B * T, *feat.shape[1:])  # (B*T, S, D)
+            decout_expanded.append(feat_expanded)
+        
+        # Expand image shape for all time queries
+        if isinstance(img_shape, torch.Tensor):
+            img_shape_expanded = img_shape.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)  # (B*T, 2)
+        else:
+            # If img_shape is a tuple, repeat it
+            img_shape_expanded = img_shape
+        
+        # Flatten query times for batch processing
+        query_times_flat = query_times.reshape(B * T)  # (B*T,)
+        
+        # Get motion head and process all queries at once
+        head = getattr(self, f"mhead{head_num}")
+        motion_out = head(decout_expanded, img_shape_expanded, query_times_flat)
+        # motion_out["map_pred"] shape: (B*T, H, W, 3)
+        
+        # Reshape outputs back to separate batch and time dimensions
+        H, W = motion_out["map_pred"].shape[1:3]
+        motion_pred = motion_out["map_pred"].reshape(B, T, H, W, 3)  # (B, T, H, W, 3)
+        
+        result = {"map_pred": motion_pred}
+        
+        if "map_pred_conf" in motion_out:
+            motion_conf = motion_out["map_pred_conf"].reshape(B, T, H, W, 1)  # (B, T, H, W, 1)
+            result["map_pred_conf"] = motion_conf
+            
+        return result
+
     def forward(self, batch):
         """
-        Forward pass for the DynaDUSt3R model.
+        Forward pass for the DynaDUSt3R model with general multi-query time support.
 
         Parameters:
-            batch: Dictionary containing at least 'left_image' and 'right_image' and optionally 'mid_tq'
+            batch: Dictionary containing:
+                - 'left_image': (B, C, H, W)
+                - 'right_image': (B, C, H, W)
+                - 'query_times': (B, T) or (T,) - arbitrary number of query times
 
         Returns:
-            dict: Combined dictionary with results from both views
+            dict: Combined dictionary with results from both views including motion predictions
         """
         # extract views from batch
         left_view = {
@@ -309,95 +360,107 @@ class DynaDUSt3R(
             "true_shape": torch.tensor(batch["left_image"].shape[-2:])[None].repeat(
                 batch["left_image"].size(0), 1
             ),  # (B, 2)
-            "instance": batch["left_instance"],  # [B x string]
+            "instance": batch.get("left_instance", None),  # [B x string] or None
         }
         right_view = {
             "img": batch["right_image"],  # (B, C, H, W)
             "true_shape": torch.tensor(batch["right_image"].shape[-2:])[None].repeat(
                 batch["right_image"].size(0), 1
             ),  # (B, 2)
-            "instance": batch["right_instance"],  # [B x string]
+            "instance": batch.get("right_instance", None),  # [B x string] or None
         }
 
-        # get time query if available
-        query_time = batch.get("mid_tq", None)  # (B,) if present
-
+        # get query times
+        query_times = batch.get("query_times", None)  # (B, T) or (T,)
+        
         # encode images
         (shape_left, shape_right), (feat_left, feat_right), (pos_left, pos_right) = (
             self._encode_symmetrized(left_view, right_view)
         )
-        # shape_left, shape_right: each (B, 2) - image shape information
-        # feat_left, feat_right: each (B, S, D) - tokenized features
-        # pos_left, pos_right: each (B, S, D) - positional encodings
 
         # decode features
         dec_left, dec_right = self._decoder(feat_left, pos_left, feat_right, pos_right)
-        # dec_left, dec_right: lists of tensors, each tensor (B, S, D) - features from multiple decoder layers
 
         with torch.amp.autocast(device_type=self.device_type, enabled=False):
             # get 3d points for both views
             res_left = self._downstream_head(
                 1, [tok.float() for tok in dec_left], shape_left
             )
-            # res_left: dict with 'map_pred': (B, H, W, 3), 'map_pred_conf': optional (B, H, W, 1)
-
             res_right = self._downstream_head(
                 2, [tok.float() for tok in dec_right], shape_right
             )
-            # res_right: dict with 'map_pred': (B, H, W, 3), 'map_pred_conf': optional (B, H, W, 1)
 
-            # predict motion if time query provided
-            if query_time is not None:
-                motion_left = self._motion_head(
-                    1, [tok.float() for tok in dec_left], shape_left, query_time
+            # predict motion if time queries provided
+            if query_times is not None:
+                # Handle different query_times formats
+                if not isinstance(query_times, torch.Tensor):
+                    query_times = torch.tensor(query_times, device=batch["left_image"].device)
+                
+                # Ensure query_times has batch dimension
+                if query_times.dim() == 1:
+                    # If shape is (T,), expand to (B, T)
+                    query_times = query_times.unsqueeze(0).expand(batch["left_image"].size(0), -1)
+                
+                # query_times shape: (B, T)
+                B, T = query_times.shape
+                
+                # Process all query times in parallel for both views
+                motion_left_all = self._motion_head_multi(
+                    1, [tok.float() for tok in dec_left], shape_left, query_times
                 )
-                # motion_left: dict with 'map_pred': (B, H, W, 3), 'map_pred_conf': optional (B, H, W, 1)
-
-                motion_right = self._motion_head(
-                    2, [tok.float() for tok in dec_right], shape_right, query_time
+                motion_right_all = self._motion_head_multi(
+                    2, [tok.float() for tok in dec_right], shape_right, query_times
                 )
-                # motion_right: dict with 'map_pred': (B, H, W, 3), 'map_pred_conf': optional (B, H, W, 1)
+                
+                # Organize motion predictions with dynamic keys
+                motion_pred = {}
+                
+                for t_idx in range(T):
+                    # Get the actual time value for this index
+                    t_val = query_times[0, t_idx].item()  # Assuming all batches have same query times
+                    
+                    # Left view predicts motion to all times except 0
+                    if abs(t_val - 0.0) > 1e-6:  # Not at t=0
+                        key = f"l_to_{t_val:.3g}"  # Format nicely (e.g., 0.35 instead of 0.350)
+                        motion_pred[key] = motion_left_all["map_pred"][:, t_idx]  # (B, H, W, 3)
+                        if "map_pred_conf" in motion_left_all:
+                            motion_pred[f"{key}_conf"] = motion_left_all["map_pred_conf"][:, t_idx]  # (B, H, W, 1)
+                    
+                    # Right view predicts motion to all times except 1
+                    if abs(t_val - 1.0) > 1e-6:  # Not at t=1
+                        key = f"r_to_{t_val:.3g}"
+                        motion_pred[key] = motion_right_all["map_pred"][:, t_idx]  # (B, H, W, 3)
+                        if "map_pred_conf" in motion_right_all:
+                            motion_pred[f"{key}_conf"] = motion_right_all["map_pred_conf"][:, t_idx]  # (B, H, W, 1)
 
-                # add motion to results with renamed keys to distinguish from point maps
-                res_left["motion_map_pred"] = motion_left["map_pred"]  # (B, H, W, 3)
-                res_right["motion_map_pred"] = motion_right["map_pred"]  # (B, H, W, 3)
+        # Rename right's 3D points to indicate they're in left's frame
+        res_right["map_pred_in_left_frame"] = res_right.pop("map_pred")
 
-                if "map_pred_conf" in motion_left:
-                    res_left["motion_map_pred_conf"] = motion_left[
-                        "map_pred_conf"
-                    ]  # (B, H, W, 1)
-                    res_right["motion_map_pred_conf"] = motion_right[
-                        "map_pred_conf"
-                    ]  # (B, H, W, 1)
-
-        res_right["map_pred_in_left_frame"] = res_right.pop(
-            "map_pred"
-        )  # (B, H, W, 3) - right's pts3d in left's frame
-
-        # combine results into single dictionary
+        # Combine results into single dictionary
         combined_results = {}
 
-        # add left view results
+        # Add left view 3D points
         for k, v in res_left.items():
             combined_results[f"left_{k}"] = v
 
-        # add right view results
+        # Add right view 3D points
         for k, v in res_right.items():
             combined_results[f"right_{k}"] = v
 
-        # add batch size for metrics calculation
+        # Add motion predictions if computed
+        if query_times is not None:
+            combined_results["motion_pred"] = motion_pred
+
+        # Add batch size for metrics calculation
         combined_results["batch_size"] = batch["left_image"].size(0)
 
         return combined_results
-        # single dict with keys:
+        # Output dictionary contains:
         # 'left_map_pred': (B, H, W, 3) - 3D points from left view
         # 'left_map_pred_conf': optional (B, H, W, 1) - confidence for left view points
-        # 'left_motion_map_pred': (B, H, W, 3) - motion vectors from left view, if query_time provided
-        # 'left_motion_map_pred_conf': optional (B, H, W, 1) - confidence for left view motion
         # 'right_map_pred_in_left_frame': (B, H, W, 3) - 3D points from right view in left frame
         # 'right_map_pred_conf': optional (B, H, W, 1) - confidence for right view points
-        # 'right_motion_map_pred': (B, H, W, 3) - motion vectors from right view, if query_time provided
-        # 'right_motion_map_pred_conf': optional (B, H, W, 1) - confidence for right view motion
+        # 'motion_pred': dict with dynamic keys like "l_to_0.2", "r_to_0.35" etc - motion predictions
         # 'batch_size': integer - batch size for metrics calculation
 
     def compute_static_loss(self, criterion, batch, outputs, device):
@@ -437,229 +500,346 @@ class DynaDUSt3R(
         if "right_map_pred_conf" in outputs:
             pred_right["conf"] = outputs["right_map_pred_conf"]
 
+
+        # ################# debug outputs #################
+        # print(f"shape | gt_left['pts3d']: {gt_left['pts3d'].shape}, ")
+        # print(f"shape | gt_right['pts3d']: {gt_right['pts3d'].shape}, ")
+        # print(f"shape | pred_left['pts3d']: {pred_left['pts3d'].shape}, ")
+        # print(f"shape | pred_right['pts3d_in_other_view']: {pred_right['pts3d_in_other_view'].shape}, ")
+        # if "conf" in pred_left:
+        #     print(f"shape | pred_left['conf']: {pred_left['conf'].shape}, ")
+        # if "conf" in pred_right:
+        #     print(f"shape | pred_right['conf']: {pred_right['conf'].shape}, ")
+        # ##################################################
+
         return criterion(gt_left, gt_right, pred_left, pred_right)
 
-    def get_motion_predictions(self, outputs, batch, device):
+    # ---------------------------------------------------------------------
+    #  NEW: helper – pick the source 3-D points depending on teacher forcing
+    # ---------------------------------------------------------------------
+    def _get_src_pts(self, view: str, batch, outputs):
         """
-        Add predicted motion to point maps and attach mid-frame validity.
-
         Args:
-            outputs (dict):
-                'left_map_pred': Tensor(B, H, W, 3),
-                'left_motion_map_pred': Tensor(B, H, W, 3),
-                'right_map_pred_in_left_frame': Tensor(B, H, W, 3),
-                'right_motion_map_pred': Tensor(B, H, W, 3)
-            batch (dict):
-                'mid_pm': Tensor(B, H, W, 4),
-                'left_pm': Tensor(B, H, W, 4),
-                'right_pm': Tensor(B, H, W, 4)
-            device (torch.device)
+            view (str): 'left' or 'right'
         Returns:
-            pred_L (Tensor): (B, H, W, 4)
-            pred_R (Tensor): (B, H, W, 4)
+            pts (Tensor)  # (B, H, W, 3)
         """
         if self.teacher_forcing:
-            # Use ground truth point clouds + predicted motion
-            left_pts = batch["left_pm"][..., :3] + outputs["left_motion_map_pred"]  # (B, H, W, 3)
-            right_pts = batch["right_pm"][..., :3] + outputs["right_motion_map_pred"]  # (B, H, W, 3)
-            valid_L = batch["left_pm"][..., 3:].to(device)  # (B, H, W, 1)
-            valid_R = batch["right_pm"][..., 3:].to(device)  # (B, H, W, 1)
+            if view == "left":
+                return batch["left_pm"][..., :3]         # (B,H,W,3)
+            else:  # 'right'
+                return batch["right_pm"][..., :3]        # (B,H,W,3)
         else:
-            # Use predicted point clouds + predicted motion
-            left_pts = outputs["left_map_pred"] + outputs["left_motion_map_pred"]  # (B, H, W, 3)
-            right_pts = outputs["right_map_pred_in_left_frame"] + outputs["right_motion_map_pred"]  # (B, H, W, 3)
-            # For validity, we need to compute based on predicted point clouds
-            # Use predicted point cloud validity (assume valid where predictions exist)
-            valid_L = torch.ones_like(outputs["left_map_pred"][..., :1]).to(device)  # (B, H, W, 1)
-            valid_R = torch.ones_like(outputs["right_map_pred_in_left_frame"][..., :1]).to(device)  # (B, H, W, 1)
-            
-            # # If confidence maps are available, use them as validity
-            # if "left_map_pred_conf" in outputs:
-            #     valid_L = (outputs["left_map_pred_conf"] > 0.5).float()
-            # if "right_map_pred_conf" in outputs:
-            #     valid_R = (outputs["right_map_pred_conf"] > 0.5).float()
-        
-        pred_L = torch.cat([left_pts, valid_L], dim=-1)  # (B, H, W, 4)
-        pred_R = torch.cat([right_pts, valid_R], dim=-1)  # (B, H, W, 4)
-        return pred_L, pred_R
+            if view == "left":
+                return outputs["left_map_pred"]          # (B,H,W,3)
+            else:  # 'right'
+                return outputs["right_map_pred_in_left_frame"]  # (B,H,W,3)
 
+    # ---------------------------------------------------------------------
+    #  UPDATED: compute_motion_loss – now handles l2m, r2m, l2r, r2l
+    # ---------------------------------------------------------------------
     def compute_motion_loss(self, criterion, batch, outputs, device):
         """
-        Compute loss between motion-compensated preds and gt mid point map.
-
-        Args:
-            criterion (callable): fn(gt_L, gt_R, pred_L, pred_R) → scalar loss
-            batch (dict): must contain 'mid_pm'
-            outputs (dict): must contain motion preds
-            device (torch.device)
-        Returns:
-            loss (Tensor) or (0.0, {}) on early exit
+        Sum motion losses for the four required directions:
+          left→mid, right→mid, left→right, right→left
         """
-        if (
-            "left_motion_map_pred" not in outputs
-            or "right_motion_map_pred" not in outputs
-            or "mid_pm" not in batch
-        ):
-            raise ValueError(
-                "Motion loss requires 'left_motion_map_pred', 'right_motion_map_pred', and 'mid_pm' in batch."
-            )
+        # sanity-checks ----------------------------------------------------
+        if "motion_gt" not in batch:
+            raise KeyError("batch must contain 'motion_gt' with keys l2m/r2m/l2r/r2l")
+        if "motion_pred" not in outputs:
+            raise KeyError("outputs must contain 'motion_pred' dict")
 
-        pred_L, pred_R = self.get_motion_predictions(
-            outputs, batch, device
-        )  # (B, H, W, 4), (B, H, W, 4)
-        B = batch["mid_pm"].shape[0]  # ()
-        eye = torch.eye(4, device=device).unsqueeze(0).repeat(B, 1, 1)  # (B, 4, 4)
+        motion_gt   = batch["motion_gt"]        # Dict[str, Tensor]
+        motion_pred = outputs["motion_pred"]    # Dict[str, Tensor]
 
-        gt_L = {
-            "pts3d": batch["left_pm"][..., :3]
-            + batch["left_to_mid_motion"][..., :3],  # (B, H, W, 3)
-            "valid_mask": batch["left_to_mid_motion"][..., 3] > 0,  # (B, H, W)
-            "camera_pose": eye,  # (B, 4, 4)
-        }
-        gt_R = {
-            "pts3d": batch["right_pm"][..., :3]
-            + batch["right_to_mid_motion"][..., :3],  # (B, H, W, 3)
-            "valid_mask": batch["right_to_mid_motion"][..., 3] > 0,  # (B, H, W)
-            "camera_pose": eye,  # (B, 4, 4)
+        # figure out the mid-frame tq so we can find the prediction keys ---
+        tq_mid = (batch["query_times"][0, 0] if batch["query_times"].dim() == 2
+                  else batch["query_times"][0]).item()
+        # keys exactly as produced in model.forward
+        pred_key = {
+            "l2m": f"l_to_{tq_mid:.3g}",
+            "r2m": f"r_to_{tq_mid:.3g}",
+            "l2r": "l_to_1",
+            "r2l": "r_to_0",
         }
 
-        pred_L_dict = {
-            "pts3d": pred_L[..., :3],
-            "valid_mask": pred_L[..., 3] > 0,
-            "camera_pose": eye,
-        }  # pts3d: (B, H, W, 3), valid_mask: (B, H, W), camera_pose: (B, 4, 4)
-        pred_R_dict = {
-            "pts3d": pred_R[..., :3],
-            "valid_mask": pred_R[..., 3] > 0,
-            "camera_pose": eye,
-        }  # pts3d: (B, H, W, 3), valid_mask: (B, H, W), camera_pose: (B, 4, 4)
+        # make sure all predictions are present ---------------------------
+        missing = [k for k, p in pred_key.items() if p not in motion_pred]
+        if missing:
+            raise KeyError(f"missing motion_pred keys for {missing}")
 
-        if "left_motion_map_pred_conf" in outputs:
-            pred_L_dict["conf"] = outputs["left_motion_map_pred_conf"]  # (B, H, W, 1)
-        if "right_motion_map_pred_conf" in outputs:
-            pred_R_dict["conf"] = outputs["right_motion_map_pred_conf"]  # (B, H, W, 1)
-        loss = criterion(gt_L, gt_R, pred_L_dict, pred_R_dict)  # scalar
-        return loss
+        # reusable identity pose ------------------------------------------
+        B = batch["left_pm"].size(0)
+        eye = torch.eye(4, device=device).unsqueeze(0).repeat(B, 1, 1)  # (B,4,4)
 
+        # helper to build gt / pred dicts for criterion -------------------
+        def build_dict(pts3d, valid):
+            return {
+                "pts3d":     pts3d,            # (B,H,W,3)
+                "valid_mask": valid,           # (B,H,W)
+                "camera_pose": eye,            # (B,4,4)
+            }
+
+        total_motion_loss = torch.zeros((), device=device)     # scalar tensor
+        loss_breakdown = {}
+
+        # ------------------------------------------------------------------
+        # Process motion losses: l2m+r2m paired (same timestep), l2r+r2l separate
+        # ------------------------------------------------------------------
+        
+        # 1. Process l2m+r2m pair (both predict to same mid timestep - correct pairing)
+        d1, v1 = "l2m", "left"
+        d2, v2 = "r2m", "right"
+        
+        # Construct targets as base + GT motion (all motions are in left frame)
+        base1 = batch["left_pm"][..., :3]   # l2m: left base
+        base2 = batch["right_pm"][..., :3]  # r2m: right base  
+        tgt1 = base1 + motion_gt[d1][..., :3]  # left + l2m motion
+        tgt2 = base2 + motion_gt[d2][..., :3]  # right + r2m motion
+        
+        # Ground-truth dicts with intersection validity
+        base_valid1 = (batch["left_pm"][..., 3] > 0)
+        base_valid2 = (batch["right_pm"][..., 3] > 0)
+        motion_valid1 = (motion_gt[d1][..., 3] > 0)
+        motion_valid2 = (motion_gt[d2][..., 3] > 0)
+        valid1 = base_valid1 & motion_valid1
+        valid2 = base_valid2 & motion_valid2
+        gt1 = build_dict(tgt1, valid1)
+        gt2 = build_dict(tgt2, valid2)
+        
+        # Predictions
+        src1 = self._get_src_pts(v1, batch, outputs)
+        src2 = self._get_src_pts(v2, batch, outputs)
+        delta1 = motion_pred[pred_key[d1]][..., :3]
+        delta2 = motion_pred[pred_key[d2]][..., :3]
+        pr1 = build_dict(src1 + delta1, valid1)
+        pr2 = build_dict(src2 + delta2, valid2)
+        
+        # Optional confidence maps
+        for d, pr in ((d1, pr1), (d2, pr2)):
+            ck = f"{pred_key[d]}_conf"
+            if ck in motion_pred:
+                pr["conf"] = motion_pred[ck].squeeze(-1)
+        
+        # Compute paired loss for l2m+r2m
+        loss_val, det = criterion(gt1, gt2, pr1, pr2)
+        total_motion_loss += loss_val
+        loss_breakdown[f"motion_pair_{d1}_{d2}"] = loss_val.detach()
+        for k, v in det.items():
+            loss_breakdown[f"{d1}_{d2}_{k}"] = v
+        
+        # Cleanup
+        del gt1, gt2, pr1, pr2, src1, src2, delta1, delta2, valid1, valid2
+        
+        # 2. Process l2r individually (predicts to different timestep t=1)
+        d1, v1 = "l2r", "left"
+        
+        # Construct target as base + GT motion
+        base1 = batch["left_pm"][..., :3]   # l2r: left base
+        tgt1 = base1 + motion_gt[d1][..., :3]  # left + l2r motion
+        
+        # Ground-truth dict with intersection validity (use dummy gt2 with same data for criterion compatibility)
+        base_valid1 = (batch["left_pm"][..., 3] > 0)
+        motion_valid1 = (motion_gt[d1][..., 3] > 0)
+        valid1 = base_valid1 & motion_valid1
+        gt1 = build_dict(tgt1, valid1)
+        gt2 = build_dict(tgt1, valid1)  # Dummy - criterion expects two inputs
+        
+        # Predictions
+        src1 = self._get_src_pts(v1, batch, outputs)
+        delta1 = motion_pred[pred_key[d1]][..., :3]
+        pr1 = build_dict(src1 + delta1, valid1)
+        pr2 = build_dict(src1 + delta1, valid1)  # Dummy - same as pr1
+        
+        # Optional confidence map
+        ck = f"{pred_key[d1]}_conf"
+        if ck in motion_pred:
+            pr1["conf"] = motion_pred[ck].squeeze(-1)
+            pr2["conf"] = motion_pred[ck].squeeze(-1)  # Dummy
+        
+        # Compute individual loss for l2r (take only first component)
+        loss_val, det = criterion(gt1, gt2, pr1, pr2)
+        # Only use the first component since gt1==gt2 and pr1==pr2
+        individual_loss = loss_val / 2.0  # Divide by 2 since criterion sums both components
+        total_motion_loss += individual_loss
+        loss_breakdown[f"motion_individual_{d1}"] = individual_loss.detach()
+        # Extract only first component from details
+        for k, v in det.items():
+            if k.endswith('_1'):  # Only take the first component
+                loss_breakdown[f"{d1}_{k}"] = v
+        
+        # Cleanup
+        del gt1, gt2, pr1, pr2, src1, delta1, valid1
+        
+        # 3. Process r2l individually (predicts to different timestep t=0)
+        d1, v1 = "r2l", "right"
+        
+        # Construct target as base + GT motion
+        base1 = batch["right_pm"][..., :3]  # r2l: right base
+        tgt1 = base1 + motion_gt[d1][..., :3]  # right + r2l motion
+        
+        # Ground-truth dict with intersection validity (use dummy gt2 with same data for criterion compatibility)
+        base_valid1 = (batch["right_pm"][..., 3] > 0)
+        motion_valid1 = (motion_gt[d1][..., 3] > 0)
+        valid1 = base_valid1 & motion_valid1
+        gt1 = build_dict(tgt1, valid1)
+        gt2 = build_dict(tgt1, valid1)  # Dummy - criterion expects two inputs
+        
+        # Predictions
+        src1 = self._get_src_pts(v1, batch, outputs)
+        delta1 = motion_pred[pred_key[d1]][..., :3]
+        pr1 = build_dict(src1 + delta1, valid1)
+        pr2 = build_dict(src1 + delta1, valid1)  # Dummy - same as pr1
+        
+        # Optional confidence map
+        ck = f"{pred_key[d1]}_conf"
+        if ck in motion_pred:
+            pr1["conf"] = motion_pred[ck].squeeze(-1)
+            pr2["conf"] = motion_pred[ck].squeeze(-1)  # Dummy
+        
+        # Compute individual loss for r2l (take only first component)
+        loss_val, det = criterion(gt1, gt2, pr1, pr2)
+        # Only use the first component since gt1==gt2 and pr1==pr2
+        individual_loss = loss_val / 2.0  # Divide by 2 since criterion sums both components
+        total_motion_loss += individual_loss
+        loss_breakdown[f"motion_individual_{d1}"] = individual_loss.detach()
+        # Extract only first component from details
+        for k, v in det.items():
+            if k.endswith('_1'):  # Only take the first component
+                loss_breakdown[f"{d1}_{k}"] = v
+        
+        # Cleanup
+        del gt1, gt2, pr1, pr2, src1, delta1, valid1
+        # ------------------------------------------------------------------
+
+        return total_motion_loss, loss_breakdown
+
+    # ---------------------------------------------------------------------
+    #  UPDATED: get_loss – sums static + *all four* motion losses
+    # ---------------------------------------------------------------------
     def get_loss(self, criterion, batch, outputs):
-        """
-        Compute total loss combining static reconstruction and motion prediction.
-
-        Args:
-            criterion: Loss criterion
-            batch (dict): Batch data containing ground truth
-            outputs (dict): Model outputs containing predictions
-
-        Returns:
-            tuple: (total_loss, loss_details)
-        """
         device = batch["left_pm"].device
 
-        # print out the sum of the valid masks for each i in the batch
-        # for i in range(batch["left_image"].size(0)):
-        #     print(f'get_loss | {i} | og mask1: {batch["left_pm"][i][..., 3].sum()} | og mask2: {batch["right_pm"][i][..., 3].sum()} | og shape: {batch["left_pm"][i].shape}')
-        #     print(f'get_loss | {i} | instance1: {batch["left_instance"][i]} | instance2: {batch["right_instance"][i]}')
+        static_loss, static_det = self.compute_static_loss(criterion,
+                                                           batch, outputs, device)
 
-        static_loss, static_details = self.compute_static_loss(
-            criterion, batch, outputs, device
-        )
-        motion_loss, motion_details = self.compute_motion_loss(
-            criterion, batch, outputs, device
-        )
+        motion_loss, motion_det = self.compute_motion_loss(criterion,
+                                                           batch, outputs, device)
 
-        # Combine losses - with motion loss scaling factor if needed
-        motion_weight = 1.0  # Adjust this value as needed (0.5, 0.1, etc.)
-        total_loss = static_loss + motion_weight * motion_loss
+        total_loss = static_loss + motion_loss  # 1 : 1 weighting; tweak if needed
 
-        motion_details = {"motion_" + k: v for k, v in motion_details.items()}
-        loss_details = {**static_details, **motion_details}
-        loss_details["static_loss"] = (
-            static_loss.item() if isinstance(static_loss, torch.Tensor) else static_loss
-        )
-        loss_details["motion_loss"] = (
-            motion_loss.item() if isinstance(motion_loss, torch.Tensor) else motion_loss
-        )
+        # flatten details --------------------------------------------------
+        details = {**static_det, **motion_det,
+                   "static_loss": static_loss.item(),
+                   "motion_loss": motion_loss.item()}
 
-        return total_loss, loss_details
+        return total_loss, details
 
+
+    # ---------------------------------------------------------------------
+    #  UPDATED: compute_metrics – static error + *point-cloud* motion error
+    # ---------------------------------------------------------------------
     def compute_metrics(self, batch, outputs):
         """
-        Compute evaluation metrics for model outputs.
-
-        Parameters:
-            batch: Dictionary with ground truth data
-            outputs: Dictionary with model predictions
-
         Returns:
-            dict: Dictionary of metrics
+            dict: {metric_name: float}
         """
         metrics = {}
 
-        # 3d point error for left view
+        # ================================================================
+        #  1. static 3-D point-cloud errors
+        # ================================================================
         if "left_map_pred" in outputs and batch["left_pm"][..., 3].sum() > 0:
             mask = batch["left_pm"][..., 3] > 0
-            pred_pts = outputs["left_map_pred"][mask]
-            gt_pts = batch["left_pm"][..., :3][mask]
+            metrics["left_3d_error"] = torch.norm(
+                outputs["left_map_pred"][mask] - batch["left_pm"][..., :3][mask],
+                dim=-1,
+            ).mean().item()
 
-            dist = torch.norm(pred_pts - gt_pts, dim=-1)
-            metrics["left_3d_error"] = dist.mean().item()
-
-        # 3d point error for right view
-        if (
-            "right_map_pred_in_left_frame" in outputs
-            and batch["right_pm"][..., 3].sum() > 0
-        ):
+        if "right_map_pred_in_left_frame" in outputs and batch["right_pm"][..., 3].sum() > 0:
             mask = batch["right_pm"][..., 3] > 0
-            pred_pts = outputs["right_map_pred_in_left_frame"][mask]
-            gt_pts = batch["right_pm"][..., :3][mask]
+            metrics["right_3d_error"] = torch.norm(
+                outputs["right_map_pred_in_left_frame"][mask]
+                - batch["right_pm"][..., :3][mask],
+                dim=-1,
+            ).mean().item()
 
-            dist = torch.norm(pred_pts - gt_pts, dim=-1)
-            metrics["right_3d_error"] = dist.mean().item()
-
-        # average 3d error
         if "left_3d_error" in metrics and "right_3d_error" in metrics:
             metrics["avg_3d_error"] = (
                 metrics["left_3d_error"] + metrics["right_3d_error"]
-            ) / 2
+            ) / 2.0
 
-        # motion error for left view
-        if (
-            "left_motion_map_pred" in outputs
-            and "left_to_mid_motion" in batch
-            and batch["left_to_mid_motion"][..., 3].sum() > 0
-        ):
-            mask = batch["left_to_mid_motion"][..., 3] > 0
-            pred_motion = outputs["left_motion_map_pred"][mask]
-            gt_motion = batch["left_to_mid_motion"][..., :3][mask]
+        # ================================================================
+        #  2. motion errors – compare *translated* point-clouds
+        # ================================================================
+        if "motion_pred" not in outputs or "motion_gt" not in batch:
+            return metrics  # nothing to add
 
-            dist = torch.norm(pred_motion - gt_motion, dim=-1)
-            metrics["left_motion_error"] = dist.mean().item()
+        tq_mid = (
+            batch["query_times"][0, 0]  # (B,T)
+            if batch["query_times"].dim() == 2
+            else batch["query_times"][0]  # (T,)
+        ).item()
 
-        # motion error for right view
-        if (
-            "right_motion_map_pred" in outputs
-            and "right_to_mid_motion" in batch
-            and batch["right_to_mid_motion"][..., 3].sum() > 0
-        ):
-            mask = batch["right_to_mid_motion"][..., 3] > 0
-            pred_motion = outputs["right_motion_map_pred"][mask]
-            gt_motion = batch["right_to_mid_motion"][..., :3][mask]
+        # Construct targets as base + GT motion (same as in loss computation)
+        dir_cfg = {
+            "l2m": {
+                "pred_key": f"l_to_{tq_mid:.3g}",
+                "src_pts": outputs["left_map_pred"],                          # (B,H,W,3)
+                "tgt_pts": batch["left_pm"][..., :3] + batch["motion_gt"]["l2m"][..., :3],  # left base + l2m motion
+                "base_valid": batch["left_pm"][..., 3] > 0,
+                "motion_valid": batch["motion_gt"]["l2m"][..., 3] > 0,
+            },
+            "r2m": {
+                "pred_key": f"r_to_{tq_mid:.3g}",
+                "src_pts": outputs["right_map_pred_in_left_frame"],
+                "tgt_pts": batch["right_pm"][..., :3] + batch["motion_gt"]["r2m"][..., :3],  # right base + r2m motion
+                "base_valid": batch["right_pm"][..., 3] > 0,
+                "motion_valid": batch["motion_gt"]["r2m"][..., 3] > 0,
+            },
+            "l2r": {
+                "pred_key": "l_to_1",
+                "src_pts": outputs["left_map_pred"],
+                "tgt_pts": batch["left_pm"][..., :3] + batch["motion_gt"]["l2r"][..., :3],  # left base + l2r motion
+                "base_valid": batch["left_pm"][..., 3] > 0,
+                "motion_valid": batch["motion_gt"]["l2r"][..., 3] > 0,
+            },
+            "r2l": {
+                "pred_key": "r_to_0",
+                "src_pts": outputs["right_map_pred_in_left_frame"],
+                "tgt_pts": batch["right_pm"][..., :3] + batch["motion_gt"]["r2l"][..., :3],  # right base + r2l motion
+                "base_valid": batch["right_pm"][..., 3] > 0,
+                "motion_valid": batch["motion_gt"]["r2l"][..., 3] > 0,
+            },
+        }
 
-            dist = torch.norm(pred_motion - gt_motion, dim=-1)
-            metrics["right_motion_error"] = dist.mean().item()
+        motion_errs = []
+        for name, cfg in dir_cfg.items():
+            if cfg["pred_key"] not in outputs["motion_pred"]:
+                continue  # prediction absent
 
-        # average motion error
-        if "left_motion_error" in metrics and "right_motion_error" in metrics:
-            metrics["avg_motion_error"] = (
-                metrics["left_motion_error"] + metrics["right_motion_error"]
-            ) / 2
+            pred_disp = outputs["motion_pred"][cfg["pred_key"]]          # (B,H,W,3)
+            pts_pred  = cfg["src_pts"] + pred_disp                       # translated cloud
+            valid     = cfg["base_valid"] & cfg["motion_valid"]         # intersection validity
 
-        # add batch size (already included in forward method)
+            if valid.sum() == 0:
+                continue  # no valid GT for this direction
+
+            err = torch.norm(
+                pts_pred[valid] - cfg["tgt_pts"][valid], dim=-1
+            ).mean().item()
+
+            metrics[f"{name}_motion_pc_error"] = err
+            motion_errs.append(err)
+
+        if motion_errs:
+            metrics["avg_motion_pc_error"] = sum(motion_errs) / len(motion_errs)
 
         return metrics
 
 
-    def save_visualizations(self, batch, outputs, epoch, batch_idx, i=0, *args, **kwargs):
+
+    def save_visualizations(self, batch, outputs, base_name, i=0, *args, **kwargs):
         # -----------------------------------------------------------
         # small helpers
         # -----------------------------------------------------------
@@ -679,16 +859,26 @@ class DynaDUSt3R(
             img = (img * 0.5 + 0.5) * 255.0
             return np.clip(img, 0, 255).astype(np.uint8)
 
-        def depth_to_heatmap(z):                  # (H,W) → (H,W,3) uint8
+        def depth_to_heatmap(z, z_min, z_max, cmap=cm.prism):                  # (H,W) → (H,W,3) uint8
             valid = z > 0
-            if not np.any(valid):                 # all invalid → black
+            if not np.any(valid):
                 return np.zeros((*z.shape, 3), np.uint8)
-            zv      = np.where(valid, z, np.nan)
-            lo, hi  = np.nanmin(zv), np.nanmax(zv)
-            norm    = (zv - lo) / (hi - lo + 1e-6)
-            hm_rgb  = cm.turbo(norm)[:, :, :3]   # drop alpha, using turbo colormap
+            zv     = np.where(valid, z, np.nan)
+            norm   = (zv - z_min) / (z_max - z_min + 1e-6)   # shared min/max
+            hm_rgb = cmap(norm)[:, :, :3]                # prism colormap
             hm_rgb[~valid] = 0
             return (hm_rgb * 255).astype(np.uint8)
+        
+        def disparity_to_heatmap(d, d_min, d_max, cmap=cm.turbo):
+            valid = d > 0
+            if not np.any(valid):
+                return np.zeros((*d.shape, 3), np.uint8)
+            dv     = np.where(valid, d, np.nan)
+            norm   = (dv - d_min) / (d_max - d_min + 1e-6)   # shared min/max
+            hm_rgb = cmap(norm)[:, :, :3]                    # turbo colormap
+            hm_rgb[~valid] = 0
+            return (hm_rgb * 255).astype(np.uint8)
+
 
         def conf_to_grayscale(conf):              # (H,W) → (H,W,3) uint8
             """Convert confidence map (1 to inf) to grayscale image.
@@ -1123,39 +1313,6 @@ class DynaDUSt3R(
         z_r_gt_left   = batch["right_pm"][i, :, :, 2].cpu().numpy()
         z_r_pred_left = outputs["right_map_pred_in_left_frame"][i, :, :, 2].detach().cpu().numpy()
 
-        def left_z_to_right_z(z_left):
-            """Convert a per-pixel z map in left-cam coords → right-cam depths."""
-            H, W            = z_left.shape
-            ys, xs          = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
-            fx, fy          = K_L[0, 0], K_L[1, 1]
-            cx, cy          = K_L[0, 2], K_L[1, 2]
-
-            # 3-D pts in left camera frame
-            X = (xs - cx) * z_left / fx
-            Y = (ys - cy) * z_left / fy
-            Z = z_left
-            ptsL = np.stack([X, Y, Z, np.ones_like(Z)], axis=-1).reshape(-1, 4) # (HW,4)
-
-            # world → right-cam
-            world = ptsL @ np.linalg.inv(E_L).T            # (HW,4)
-            ptsR  = world @ E_R.T                           # (HW,4)
-            Zr    = ptsR[:, 2].reshape(H, W)
-
-            # keep invalid pixels at 0
-            Zr[z_left <= 0] = 0
-            return Zr
-
-        z_right_gt   = left_z_to_right_z(z_r_gt_left)
-        z_right_pred = left_z_to_right_z(z_r_pred_left)
-
-        # -----------------------------------------------------------
-        # color-map depths
-        # -----------------------------------------------------------
-        hm_left_gt    = depth_to_heatmap(z_left_gt)
-        hm_left_pred  = depth_to_heatmap(z_left_pred)
-        hm_right_gt   = depth_to_heatmap(z_right_gt)
-        hm_right_pred = depth_to_heatmap(z_right_pred)
-
         # -----------------------------------------------------------
         # confidence maps (predictions only)
         # -----------------------------------------------------------
@@ -1214,72 +1371,197 @@ class DynaDUSt3R(
         right_pm_gt = transform_pointmap_to_right_frame(right_pm_gt_left, E_L, E_R)
         right_pm_pred = transform_pointmap_to_right_frame(right_pm_pred_left, E_L, E_R)
 
-        # -----------------------------------------------------------
-        # motion maps (GT and predictions)
-        # -----------------------------------------------------------
-        # Extract GT motion vectors and validity
-        left_motion_gt = batch["left_to_mid_motion"][i, :, :, :3].cpu().numpy() # (H,W,3)
-        left_motion_validity = batch["left_to_mid_motion"][i, :, :, 3].cpu().numpy() # (H,W)
-        
-        right_motion_gt = batch["right_to_mid_motion"][i, :, :, :3].cpu().numpy() # (H,W,3)
-        right_motion_validity = batch["right_to_mid_motion"][i, :, :, 3].cpu().numpy() # (H,W)
-        
-        # Extract predicted motion vectors
-        left_motion_pred = outputs["left_motion_map_pred"][i, :, :, :].detach().cpu().numpy() # (H,W,3)
-        right_motion_pred = outputs["right_motion_map_pred"][i, :, :, :].detach().cpu().numpy() # (H,W,3)
 
-        # Scale motion predictions
-        left_motion_pred = left_motion_pred * scale
-        right_motion_pred = right_motion_pred * scale
-        
-        # Convert to grayscale magnitude visualizations
-        gray_motion_left_gt = motion_magnitude_to_grayscale(left_motion_gt, left_motion_validity)
-        gray_motion_right_gt = motion_magnitude_to_grayscale(right_motion_gt, right_motion_validity)
+        def left_z_to_right_z(z_left):
+            """Convert a per-pixel z map in left-cam coords → right-cam depths."""
+            H, W            = z_left.shape
+            ys, xs          = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+            fx, fy          = K_L[0, 0], K_L[1, 1]
+            cx, cy          = K_L[0, 2], K_L[1, 2]
+
+            # 3-D pts in left camera frame
+            X = (xs - cx) * z_left / fx
+            Y = (ys - cy) * z_left / fy
+            Z = z_left
+            ptsL = np.stack([X, Y, Z, np.ones_like(Z)], axis=-1).reshape(-1, 4) # (HW,4)
+
+            # world → right-cam
+            world = ptsL @ np.linalg.inv(E_L).T            # (HW,4)
+            ptsR  = world @ E_R.T                           # (HW,4)
+            Zr    = ptsR[:, 2].reshape(H, W)
+
+            # keep invalid pixels at 0
+            Zr[z_left <= 0] = 0
+            return Zr
+
+        z_right_gt   = left_z_to_right_z(z_r_gt_left)
+        z_right_pred = left_z_to_right_z(z_r_pred_left)
+
+        # -----------------------------------------------------------
+        # depth & disparity heat-maps  (robust min/max, ignore z==0)
+        # -----------------------------------------------------------
+        P_ZMAX = 99                    # percentile for clipping far depths
+
+        # scale predicted depths so GT & pred share the same metric scale
+        z_left_pred  *= scale
+        z_right_pred *= scale
+
+        # ---------- collect *valid* depths (>0) ----------
+        valid_depths = [
+            z_left_gt [z_left_gt  > 0],
+            z_left_pred[z_left_pred > 0],
+            z_right_gt[z_right_gt > 0],
+            z_right_pred[z_right_pred > 0],
+        ]
+        z_stack = np.concatenate(valid_depths)
+        z_min   = float(z_stack.min())
+        z_max   = float(np.percentile(z_stack, P_ZMAX))
+
+        # ---------- prism-coloured depth maps ----------
+        hm_left_gt    = depth_to_heatmap(z_left_gt,  z_min, z_max)
+        hm_left_pred  = depth_to_heatmap(z_left_pred, z_min, z_max)
+        hm_right_gt   = depth_to_heatmap(z_right_gt, z_min, z_max)
+        hm_right_pred = depth_to_heatmap(z_right_pred, z_min, z_max)
+
+        # -----------------------------------------------------------
+        # disparity (turbo) – uses the scaled depths above
+        # -----------------------------------------------------------
+        fx        = K_L[0, 0]
+        baseline  = np.linalg.norm(E_L[:3, 3] - E_R[:3, 3])      # metres
+        def z_to_disp(z):
+            disp = np.zeros_like(z, dtype=np.float32)
+            mask = z > 0
+            disp[mask] = fx * baseline / z[mask]
+            return disp, mask
+
+        disp_left_gt,   mask_l_gt  = z_to_disp(z_left_gt)
+        disp_left_pred, mask_l_pr  = z_to_disp(z_left_pred)
+        disp_right_gt,  mask_r_gt  = z_to_disp(z_right_gt)
+        disp_right_pred,mask_r_pr  = z_to_disp(z_right_pred)
+
+        # robust min/max over valid disparities only
+        valid_disps = np.concatenate([
+            disp_left_gt [mask_l_gt],
+            disp_left_pred[mask_l_pr],
+            disp_right_gt[mask_r_gt],
+            disp_right_pred[mask_r_pr],
+        ])
+        d_min = float(valid_disps.min())
+        d_max = float(valid_disps.max())
+
+        # ---------- turbo-coloured disparity maps ----------
+        hm_disp_left_gt    = disparity_to_heatmap(disp_left_gt,  d_min, d_max)
+        hm_disp_left_pred  = disparity_to_heatmap(disp_left_pred, d_min, d_max)
+        hm_disp_right_gt   = disparity_to_heatmap(disp_right_gt, d_min, d_max)
+        hm_disp_right_pred = disparity_to_heatmap(disp_right_pred, d_min, d_max)
+
+
+        # -----------------------------------------------------------
+        # motion maps (GT & pred)  — handles l2m, r2m, l2r, r2l
+        # -----------------------------------------------------------
+        motion_gt   = batch["motion_gt"]           # dict[str → (H,W,4)]
+        motion_pred = outputs["motion_pred"]       # dict[str → (B,H,W,3)]
+
+        # ---- keys produced by forward() ---------------------------------
+        tq_mid = ( batch["query_times"][0, 0]
+                    if batch["query_times"].dim() == 2
+                    else batch["query_times"][0] ).item()
+        k_l2m = f"l_to_{tq_mid:.3g}"           # left → mid
+        k_r2m = f"r_to_{tq_mid:.3g}"           # right→ mid
+        k_l2r = "l_to_1"                       # left → right
+        k_r2l = "r_to_0"                       # right→ left
+
+        # ---- helper to split xyz / validity ------------------------------
+        def split_xyz_val(arr4):               # (H,W,4) → xyz(…3), val(…)
+            return arr4[..., :3], arr4[..., 3]
+
+        # ---- ground-truth motions ----------------------------------------
+        left_motion_gt,  left_motion_val  = split_xyz_val(motion_gt["l2m"][i].cpu().numpy())
+        right_motion_gt, right_motion_val = split_xyz_val(motion_gt["r2m"][i].cpu().numpy())
+        l2r_motion_gt,   l2r_motion_val   = split_xyz_val(motion_gt["l2r"][i].cpu().numpy())
+        r2l_motion_gt,   r2l_motion_val   = split_xyz_val(motion_gt["r2l"][i].cpu().numpy())
+
+        # ---- predicted displacements -------------------------------------
+        left_motion_pred  = motion_pred[k_l2m][i].detach().cpu().numpy()     # (H,W,3)
+        right_motion_pred = motion_pred[k_r2m][i].detach().cpu().numpy()
+        l2r_motion_pred   = motion_pred[k_l2r][i].detach().cpu().numpy()
+        r2l_motion_pred   = motion_pred[k_r2l][i].detach().cpu().numpy()
+
+        # ---- scale predictions to match depth normalisation --------------
+        left_motion_pred  *= scale
+        right_motion_pred *= scale
+        l2r_motion_pred   *= scale
+        r2l_motion_pred   *= scale
+
+        # ---- grayscale magnitude images ----------------------------------
+        gray_motion_left_gt   = motion_magnitude_to_grayscale(left_motion_gt,  left_motion_val)
         gray_motion_left_pred = motion_magnitude_to_grayscale(left_motion_pred)
-        gray_motion_right_pred = motion_magnitude_to_grayscale(right_motion_pred)
+        gray_motion_right_gt  = motion_magnitude_to_grayscale(right_motion_gt, right_motion_val)
+        gray_motion_right_pred= motion_magnitude_to_grayscale(right_motion_pred)
+
+        gray_motion_l2r_gt    = motion_magnitude_to_grayscale(l2r_motion_gt,  l2r_motion_val)
+        gray_motion_l2r_pred  = motion_magnitude_to_grayscale(l2r_motion_pred)
+        gray_motion_r2l_gt    = motion_magnitude_to_grayscale(r2l_motion_gt,  r2l_motion_val)
+        gray_motion_r2l_pred  = motion_magnitude_to_grayscale(r2l_motion_pred)
 
         # -----------------------------------------------------------
-        # 3D motion field visualizations – four separate images
+        # 3-D scene-flow visualisations  (l2m, r2m, l2r, r2l)
         # -----------------------------------------------------------
         viz_left_gt = visualize_3d_motion_field(
-            left_pm_gt, left_motion_gt, left_rgb, left_motion_validity,
+            left_pm_gt, left_motion_gt, left_rgb, left_motion_val,
             subsample_factor=30, view_angles=(20, -45)
         )
-
         viz_left_pred = visualize_3d_motion_field(
             left_pm_gt, left_motion_pred, left_rgb, None,
             subsample_factor=30, view_angles=(20, -45)
         )
 
         viz_right_gt = visualize_3d_motion_field(
-            right_pm_gt, right_motion_gt, right_rgb, right_motion_validity,
+            right_pm_gt, right_motion_gt, right_rgb, right_motion_val,
             subsample_factor=30, view_angles=(20, -135)
         )
-
         viz_right_pred = visualize_3d_motion_field(
             right_pm_gt, right_motion_pred, right_rgb, None,
             subsample_factor=30, view_angles=(20, -135)
         )
-        # motion_3d_summary = create_motion_summary_figure(
-        #     left_motion_gt, left_motion_pred,
-        #     right_motion_gt, right_motion_pred,
-        #     left_pm_gt, right_pm_gt,
-        #     left_rgb, right_rgb,
-        #     left_motion_validity, right_motion_validity
-        # )
+
+        viz_l2r_gt = visualize_3d_motion_field(
+            left_pm_gt, l2r_motion_gt, left_rgb, l2r_motion_val,
+            subsample_factor=30, view_angles=(20, -45)
+        )
+        viz_l2r_pred = visualize_3d_motion_field(
+            left_pm_gt, l2r_motion_pred, left_rgb, None,
+            subsample_factor=30, view_angles=(20, -45)
+        )
+        viz_r2l_gt = visualize_3d_motion_field(
+            right_pm_gt, r2l_motion_gt, right_rgb, r2l_motion_val,
+            subsample_factor=30, view_angles=(20, -135)
+        )
+        viz_r2l_pred = visualize_3d_motion_field(
+            right_pm_gt, r2l_motion_pred, right_rgb, None,
+            subsample_factor=30, view_angles=(20, -135)
+        )
 
         # -----------------------------------------------------------
         # motion confidence maps (predictions only)
         # -----------------------------------------------------------
-        conf_motion_left_pred = None
-        conf_motion_right_pred = None
-        if "left_motion_map_pred_conf" in outputs:
-            conf_motion_left_pred = outputs["left_motion_map_pred_conf"][i, :, :].detach().cpu().numpy()
-        if "right_motion_map_pred_conf" in outputs:
-            conf_motion_right_pred = outputs["right_motion_map_pred_conf"][i, :, :].detach().cpu().numpy()
+        conf_motion_left_pred = motion_pred.get(f"{k_l2m}_conf", None)
+        conf_motion_right_pred= motion_pred.get(f"{k_r2m}_conf", None)
+        conf_motion_l2r_pred  = motion_pred.get(f"{k_l2r}_conf", None)
+        conf_motion_r2l_pred  = motion_pred.get(f"{k_r2l}_conf", None)
         
-        hm_motion_conf_left = conf_to_grayscale(conf_motion_left_pred) if conf_motion_left_pred is not None else None
-        hm_motion_conf_right = conf_to_grayscale(conf_motion_right_pred) if conf_motion_right_pred is not None else None
+        # motion confidence maps (predictions only)  ← keep this comment
+        conf_motion_left_pred  = None if conf_motion_left_pred  is None else conf_motion_left_pred[i].detach().cpu().numpy()
+        conf_motion_right_pred = None if conf_motion_right_pred is None else conf_motion_right_pred[i].detach().cpu().numpy()
+        conf_motion_l2r_pred   = None if conf_motion_l2r_pred   is None else conf_motion_l2r_pred[i].detach().cpu().numpy()
+        conf_motion_r2l_pred   = None if conf_motion_r2l_pred   is None else conf_motion_r2l_pred[i].detach().cpu().numpy()
+
+
+        hm_motion_conf_left  = conf_to_grayscale(conf_motion_left_pred)   if conf_motion_left_pred  is not None else None
+        hm_motion_conf_right = conf_to_grayscale(conf_motion_right_pred)  if conf_motion_right_pred is not None else None
+        hm_motion_conf_l2r   = conf_to_grayscale(conf_motion_l2r_pred)    if conf_motion_l2r_pred   is not None else None
+        hm_motion_conf_r2l   = conf_to_grayscale(conf_motion_r2l_pred)    if conf_motion_r2l_pred   is not None else None
+        # -----------------------------------------------------------
 
         # Convert to colored point clouds for wandb
         # Left point clouds use left image for colors
@@ -1303,154 +1585,82 @@ class DynaDUSt3R(
         # -----------------------------------------------------------
         # 2-D vector overlays on the images
         # -----------------------------------------------------------
-        def create_overlay(img_rgb, pm_xyz, motion_xyz, K, subsample=25,
+        def create_overlay(img_rgb, pm_xyz, motion_xyz, K,
+                        do_subsample=True, subsample_factor=25,
                         cmap=cm.turbo):
-            """returns copy of img_rgb with color-gradient lines."""
-            H, W = img_rgb.shape[:2]
+            """
+            returns copy of img_rgb with color-gradient lines.
+
+            Args:
+                img_rgb:     ndarray of shape (H, W, 3)
+                pm_xyz:      ndarray of shape (H, W, 3), point map
+                motion_xyz:  ndarray of shape (H, W, 3), motion map
+                K:           camera intrinsics matrix (3×3)
+                do_subsample:    bool, whether to subsample the points
+                subsample_factor: int, grid size for subsampling
+                cmap:        matplotlib colormap
+            """
+            h, w = img_rgb.shape[:2]
             overlay = img_rgb.copy()
 
             valid = (pm_xyz[:, :, 2] > 0) & (motion_xyz[:, :, 2] != 0)
             ys, xs = np.where(valid)
 
             if len(xs) == 0:
-                return overlay
+                return overlay  # (H, W, 3)
 
-            # sparse sampling for clarity
-            step = max(1, len(xs) // (H * W // (subsample ** 2)))
-            xs, ys = xs[::step], ys[::step]
+            # optionally subsample for clarity
+            if do_subsample:
+                grid_sz = subsample_factor ** 2
+                step = max(1, len(xs) // (h * w // grid_sz))
+                xs, ys = xs[::step], ys[::step]
 
-            # start & end xyz (cam frame of pm_xyz)
-            start_xyz = pm_xyz[ys, xs]                                   # (N,3)
-            end_xyz   = start_xyz + motion_xyz[ys, xs]                   # (N,3)
+            # start & end in cam coords
+            start_xyz = pm_xyz[ys, xs]                  # (N, 3)
+            end_xyz   = start_xyz + motion_xyz[ys, xs]  # (N, 3)
 
             # project → pixel coords
-            start_uv = project_cam_pts(K, start_xyz)                     # (N,2)
-            end_uv   = project_cam_pts(K, end_xyz)                       # (N,2)
+            start_uv = project_cam_pts(K, start_xyz)    # (N, 2)
+            end_uv   = project_cam_pts(K, end_xyz)      # (N, 2)
 
+            # keep only those fully inside image
             in_img = (
-                (start_uv[:, 0] >= 0) & (start_uv[:, 0] < W) &
-                (start_uv[:, 1] >= 0) & (start_uv[:, 1] < H) &
-                (end_uv[:,   0] >= 0) & (end_uv[:,   0] < W) &
-                (end_uv[:,   1] >= 0) & (end_uv[:,   1] < H)
+                (start_uv[:, 0] >= 0) & (start_uv[:, 0] < w) &
+                (start_uv[:, 1] >= 0) & (start_uv[:, 1] < h) &
+                (end_uv[:,   0] >= 0) & (end_uv[:,   0] < w) &
+                (end_uv[:,   1] >= 0) & (end_uv[:,   1] < h)
             )
+
             for p0, p1 in zip(start_uv[in_img], end_uv[in_img]):
                 draw_gradient_line(overlay, p0, p1, cmap=cmap, thick=1)
 
-            return overlay                                             # (H,W,3)
-
-        # ---- left-camera overlays ----
-        ov_left_gt   = create_overlay(left_rgb,  left_pm_gt,  left_motion_gt,
-                                    K_L, cmap=cm.turbo)
-        ov_left_pred = create_overlay(left_rgb,  left_pm_gt,  left_motion_pred,
-                                    K_L, cmap=cm.turbo)
-
-        # ---- right-camera overlays ----
-        #   need xyz in right-cam coords for projection
-        right_pm_gt_camR   = geom.world_pc_to_cam_pc(
-                                geom.cam_pc_to_world_pc(right_pm_gt.reshape(-1, 3), (K_R, E_R)),
-                                (K_R, E_R)).reshape(*right_pm_gt.shape)   # (H,W,3)
-
-        # but easier: reuse transform_pointmap_to_right_frame result
-        ov_right_gt = create_overlay(right_rgb, right_pm_gt,
-                                    right_motion_gt, K_R, cmap=cm.turbo)
-        ov_right_pred = create_overlay(right_rgb, right_pm_gt,
-                                    right_motion_pred, K_R, cmap=cm.turbo)
-
-        # -----------------------------------------------------------
-        # 3-D Object3D scene-flow overlays
-        # -----------------------------------------------------------
-        # -----------------------------------------------------------
-        # 3-D Object3D scene-flow overlays (simple version)
-        # -----------------------------------------------------------
-        def build_scene_flow_object(pm,              # (H,W,4) or (H,W,3)
-                                    motion,          # (H,W,3)
-                                    motion_valid,    # (H,W) 1/0  or None
-                                    rgb_img, K,
-                                    max_points=300_000,
-                                    n_seg=8, cmap=cm.turbo):
-            """
-            • point cloud: every GT-valid point (down-sampled only by max_points)
-            • vectors   : only where pm-valid & motion-valid & motion ≠ 0
-            """
-            H, W = pm.shape[:2]
-
-            # -------- point cloud --------------------------------------------------
-            pc = pointmap_to_colored_pointcloud(pm, rgb_img, K, max_points)  # (N,6)
-            if pc.size == 0:
-                return {"type": "lidar/beta",
-                        "points": pc.astype(np.float32),
-                        "vectors": np.empty((0,), dtype=object)}
-
-            # we need pixel coords corresponding to the pc rows
-            # rebuild ys,xs the same way pointmap_to_colored_pointcloud scans
-            valid_pm = pm[..., 2] > 0
-            if pm.shape[-1] == 4:
-                valid_pm &= pm[..., 3] > 0
-            ys, xs = np.where(valid_pm)
-            if len(ys) > max_points:
-                idx = np.random.choice(len(ys), max_points, replace=False)
-                ys, xs = ys[idx], xs[idx]
-
-            # -------- vector start/end --------------------------------------------
-            # motion validity mask
-            mv = np.ones_like(motion[..., 0], bool) if motion_valid is None else (motion_valid > 0)
-            vec_mask = valid_pm & mv & (np.linalg.norm(motion, axis=-1) > 0)
-
-            ys_vec, xs_vec = np.where(vec_mask)
-            if len(ys_vec) > max_points:
-                idx = np.random.choice(len(ys_vec), max_points, replace=False)
-                ys_vec, xs_vec = ys_vec[idx], xs_vec[idx]
-
-            start_xyz = pm[ys_vec, xs_vec, :3]                      # (M,3)
-            end_xyz   = start_xyz + motion[ys_vec, xs_vec]          # (M,3)
-
-            # -------- vectors ---------------------------------------------------------
-            vecs = []
-            neon_green = [0, 255, 0]                     # B, G, R for W&B viewer
-            for s, e in zip(start_xyz, end_xyz):
-                if np.allclose(s, e):                    # skip zero motion
-                    continue
-                vecs.append({
-                    "start": s.tolist(),
-                    "end"  : e.tolist(),
-                    "color": neon_green
-                })
+            return overlay  # (H, W, 3)
 
 
-            return {
-                "type": "lidar/beta",
-                "points": pc.astype(np.float32),
-                # "vectors": np.asarray(vecs, dtype=object)
-            }
+        # ---- left-camera overlays (left frame is reference) ------------
+        ov_left_gt   = create_overlay(left_rgb,  left_pm_gt,  left_motion_gt,  K_L, cmap=cm.turbo)
+        ov_left_pred = create_overlay(left_rgb,  left_pm_gt,  left_motion_pred, K_L, cmap=cm.turbo)
 
+        # ---- right-camera overlays (right frame is reference) ----------
+        #   need xyz in right-cam coords for projection; easiest: use pm already in R
+        ov_right_gt  = create_overlay(right_rgb, right_pm_gt, right_motion_gt,  K_R, cmap=cm.turbo)
+        ov_right_pred= create_overlay(right_rgb, right_pm_gt, right_motion_pred, K_R, cmap=cm.turbo)
 
-        # build four scenes (same sampling as 2-D overlay)
-        scene_left_gt   = build_scene_flow_object(batch["left_pm"][i].cpu().numpy(),
-                                                left_motion_gt,
-                                                left_motion_validity,
-                                                left_rgb, K_L)
+        # ---- NEW overlays for left→right and right→left motions --------
+        ov_l2r_gt   = create_overlay(left_rgb,  left_pm_gt,  l2r_motion_gt,  K_L, cmap=cm.turbo)
+        ov_l2r_pred = create_overlay(left_rgb,  left_pm_gt,  l2r_motion_pred, K_L, cmap=cm.turbo)
 
-        scene_left_pred = build_scene_flow_object(batch["left_pm"][i].cpu().numpy(),
-                                                left_motion_pred,
-                                                None,                  # no validity channel
-                                                left_rgb, K_L)
-
-        scene_right_gt  = build_scene_flow_object(right_pm_gt,
-                                                right_motion_gt,
-                                                right_motion_validity,
-                                                right_rgb, K_R)
-
-        scene_right_pred= build_scene_flow_object(right_pm_gt,
-                                                right_motion_pred,
-                                                None,
-                                                right_rgb, K_R)
+        ov_r2l_gt   = create_overlay(right_rgb, right_pm_gt, r2l_motion_gt,  K_R, cmap=cm.turbo)
+        ov_r2l_pred = create_overlay(right_rgb, right_pm_gt, r2l_motion_pred, K_R, cmap=cm.turbo)
 
         # -----------------------------------------------------------
         # log to wandb
         # -----------------------------------------------------------
         # hierarchical logging keys with confidence
         # base = f"e{epoch}_b{batch_idx}_{i}
-        base = f"e{epoch}_b{batch_idx}_i{i}"
+        
+        base = f"{base_name}_i{i}"
+        # global k; base += f"_k{k}"; k+=1; print(base);
 
         log_dict = {
             # input images
@@ -1459,35 +1669,58 @@ class DynaDUSt3R(
             f"{base}/input/right"  : wandb.Image(right_rgb, caption="right input"),
 
             # depth maps
-            f"{base}/static-dm/left_gt"   : wandb.Image(hm_left_gt,   caption="left depth gt"),
-            f"{base}/static-dm/left_pred" : wandb.Image(hm_left_pred, caption="left depth pred"),
-            f"{base}/static-dm/right_gt"  : wandb.Image(hm_right_gt,  caption="right depth gt"),
-            f"{base}/static-dm/right_pred": wandb.Image(hm_right_pred,caption="right depth pred"),
+            f"{base}/static/dm/left_gt"   : wandb.Image(hm_left_gt,   caption="left depth gt"),
+            f"{base}/static/dm/left_pred" : wandb.Image(hm_left_pred, caption="left depth pred"),
+            f"{base}/static/dm/right_gt"  : wandb.Image(hm_right_gt,  caption="right depth gt"),
+            f"{base}/static/dm/right_pred": wandb.Image(hm_right_pred,caption="right depth pred"),
 
-            # motion magnitude
-            f"{base}/motion/left_gt"   : wandb.Image(gray_motion_left_gt,   caption="left motion gt (magnitude)"),
-            f"{base}/motion/left_pred" : wandb.Image(gray_motion_left_pred, caption="left motion pred (magnitude)"),
-            f"{base}/motion/right_gt"  : wandb.Image(gray_motion_right_gt,  caption="right motion gt (magnitude)"),
-            f"{base}/motion/right_pred": wandb.Image(gray_motion_right_pred,caption="right motion pred (magnitude)"),
-
-            # 3d scene-flow visualizations
-            f"{base}/scene-flow/3d_left_gt"   : wandb.Image(viz_left_gt,   caption="3d scene flow left gt"),
-            f"{base}/scene-flow/3d_left_pred" : wandb.Image(viz_left_pred, caption="3d scene flow left pred"),
-            f"{base}/scene-flow/3d_right_gt"  : wandb.Image(viz_right_gt,  caption="3d scene flow right gt"),
-            f"{base}/scene-flow/3d_right_pred": wandb.Image(viz_right_pred, caption="3d scene flow right pred"),
-            # f"{base}/motion/3d_summary": wandb.Image(motion_3d_summary, caption="3D scene flow visualization"),
+            # disparity maps
+            f"{base}/static/disp/left_gt"   : wandb.Image(hm_disp_left_gt,   caption="left disparity gt"),
+            f"{base}/static/disp/left_pred" : wandb.Image(hm_disp_left_pred, caption="left disparity pred"),
+            f"{base}/static/disp/right_gt"  : wandb.Image(hm_disp_right_gt,  caption="right disparity gt"),
+            f"{base}/static/disp/right_pred": wandb.Image(hm_disp_right_pred,caption="right disparity pred"),
 
             # 3d point clouds
-            f"{base}/static-pc/left_gt"   : wandb.Object3D(pc_left_gt),
-            f"{base}/static-pc/left_pred" : wandb.Object3D(pc_left_pred),
-            f"{base}/static-pc/right_gt"  : wandb.Object3D(pc_right_gt),
-            f"{base}/static-pc/right_pred": wandb.Object3D(pc_right_pred),
+            # f"{base}/static/pc/left_gt"   : wandb.Object3D(pc_left_gt),
+            # f"{base}/static/pc/left_pred" : wandb.Object3D(pc_left_pred),
+            # f"{base}/static/pc/right_gt"  : wandb.Object3D(pc_right_gt),
+            # f"{base}/static/pc/right_pred": wandb.Object3D(pc_right_pred),
+
+            # motion magnitude
+            f"{base}/motion/magn/l2m_gt"   : wandb.Image(gray_motion_left_gt,   caption="left motion gt (magnitude)"),
+            f"{base}/motion/magn/l2m_pred" : wandb.Image(gray_motion_left_pred, caption="left motion pred (magnitude)"),
+            f"{base}/motion/magn/r2m_gt"   : wandb.Image(gray_motion_right_gt,  caption="right motion gt (magnitude)"),
+            f"{base}/motion/magn/r2m_pred" : wandb.Image(gray_motion_right_pred,caption="right motion pred (magnitude)"),
+
+            # motion magnitude (new directions)
+            f"{base}/motion/magn/l2r_gt"  : wandb.Image(gray_motion_l2r_gt,  caption="left→right motion gt (mag)"),
+            f"{base}/motion/magn/l2r_pred": wandb.Image(gray_motion_l2r_pred,caption="left→right motion pred (mag)"),
+            f"{base}/motion/magn/r2l_gt"  : wandb.Image(gray_motion_r2l_gt,  caption="right→left motion gt (mag)"),
+            f"{base}/motion/magn/r2l_pred": wandb.Image(gray_motion_r2l_pred,caption="right→left motion pred (mag)"),
+
+            # 3d scene-flow visualizations
+            f"{base}/motion/3d/l2m_gt"   : wandb.Image(viz_left_gt,   caption="3d scene flow left gt"),
+            f"{base}/motion/3d/l2m_pred" : wandb.Image(viz_left_pred, caption="3d scene flow left pred"),
+            f"{base}/motion/3d/r2m_gt"   : wandb.Image(viz_right_gt,  caption="3d scene flow right gt"),
+            f"{base}/motion/3d/r2m_pred" : wandb.Image(viz_right_pred, caption="3d scene flow right pred"),
+            # f"{base}/motion/3d_summary": wandb.Image(motion_3d_summary, caption="3D scene flow visualization"),
+
+            # 3-D scene-flow images (new directions)
+            f"{base}/motion/3d/l2r_gt"   : wandb.Image(viz_l2r_gt,  caption="3d scene flow left→right gt"),
+            f"{base}/motion/3d/l2r_pred" : wandb.Image(viz_l2r_pred, caption="3d scene flow left→right pred"),
+            f"{base}/motion/3d/r2l_gt"   : wandb.Image(viz_r2l_gt,  caption="3d scene flow right→left gt"),
+            f"{base}/motion/3d/r2l_pred" : wandb.Image(viz_r2l_pred, caption="3d scene flow right→left pred"),
 
             # 2-d vector overlays
-            f"{base}/motion/2d_left_gt"   : wandb.Image(ov_left_gt, caption="2-d flow left gt"),
-            f"{base}/motion/2d_left_pred" : wandb.Image(ov_left_pred, caption="2-d flow left pred"),
-            f"{base}/motion/2d_right_gt"  : wandb.Image(ov_right_gt, caption="2-d flow right gt"),
-            f"{base}/motion/2d_right_pred": wandb.Image(ov_right_pred, caption="2-d flow right pred"),
+            f"{base}/motion/2d/left_gt"   : wandb.Image(ov_left_gt, caption="2d flow left gt"),
+            f"{base}/motion/2d/left_pred" : wandb.Image(ov_left_pred, caption="2d flow left pred"),
+            f"{base}/motion/2d/right_gt"  : wandb.Image(ov_right_gt, caption="2d flow right gt"),
+            f"{base}/motion/2d/right_pred": wandb.Image(ov_right_pred, caption="2d flow right pred"),
+            f"{base}/motion/2d/l2r_gt"    : wandb.Image(ov_l2r_gt,  caption="2d flow left→right gt"),
+            f"{base}/motion/2d/l2r_pred"  : wandb.Image(ov_l2r_pred, caption="2d flow left→right pred"),
+            f"{base}/motion/2d/r2l_gt"    : wandb.Image(ov_r2l_gt,  caption="2d flow right→left gt"),
+            f"{base}/motion/2d/r2l_pred"  : wandb.Image(ov_r2l_pred, caption="2d flow right→left pred"),
+
 
             # 3-d scene-flow visualizations
             # f"{base}/scene-flow/3d_left_gt"   : wandb.Object3D(scene_left_gt),
@@ -1507,15 +1740,19 @@ class DynaDUSt3R(
 
         # add confidence maps if available
         if gray_conf_left is not None:
-            log_dict[f"{base}/static-conf/left_pred"] = wandb.Image(gray_conf_left, caption="left conf pred (1=black, inf=white)")
+            log_dict[f"{base}/static/conf/left_pred"] = wandb.Image(gray_conf_left, caption="left conf pred (1=black, inf=white)")
         if gray_conf_right is not None:
-            log_dict[f"{base}/static-conf/right_pred"] = wandb.Image(gray_conf_right, caption="right conf pred (1=black, inf=white)")
+            log_dict[f"{base}/static/conf/right_pred"] = wandb.Image(gray_conf_right, caption="right conf pred (1=black, inf=white)")
 
         # add motion confidence maps if available
         if hm_motion_conf_left is not None:
-            log_dict[f"{base}/motion-conf/left_pred"] = wandb.Image(hm_motion_conf_left, caption="left motion conf pred (1=black, inf=white)")
+            log_dict[f"{base}/motion/conf/left_pred"] = wandb.Image(hm_motion_conf_left, caption="left motion conf pred (1=black, inf=white)")
         if hm_motion_conf_right is not None:
-            log_dict[f"{base}/motion-conf/right_pred"] = wandb.Image(hm_motion_conf_right, caption="right motion conf pred (1=black, inf=white)")
+            log_dict[f"{base}/motion/conf/right_pred"] = wandb.Image(hm_motion_conf_right, caption="right motion conf pred (1=black, inf=white)")
+        if hm_motion_conf_l2r is not None:
+            log_dict[f"{base}/motion/conf/l2r_pred"] = wandb.Image(hm_motion_conf_l2r, caption="left→right motion conf pred (1=black, inf=white)")
+        if hm_motion_conf_r2l is not None:
+            log_dict[f"{base}/motion/conf/r2l_pred"] = wandb.Image(hm_motion_conf_r2l, caption="right→left motion conf pred (1=black, inf=white)")
 
         wandb.log(log_dict, commit=True)
 
