@@ -1,7 +1,7 @@
 defaults:
   - model: dynadust3r
   - optim: adam
-  - sched: cosine
+  - sched: None
   - criterion: conf  # or regr3d, regr3d_shiftinv, etc.
   - dataset/pointodyssey@dataset.pointodyssey
   - dataset/stereo4d@dataset.stereo4d
@@ -12,9 +12,9 @@ seed: 96
 debug: False
 
 train:
-  validation_frequency: 1000  # Combined validation frequency (replaces both epoch_frequency and valid.interval)
+  validation_frequency: 10  # Combined validation frequency (replaces both epoch_frequency and valid.interval)
   iterations: 49000  # Total number of training iterations
-  grad_clip: 10
+  grad_clip: 1
 
 valid:
   save: 
@@ -25,8 +25,8 @@ valid:
 
 data:
   loader: stereo4d # [stereo4d, pointodyssey]
-  len: 4 # Will be calculated in Python: iterations * batch_size | ???
-  valid_len: 2 # Will be calculated in Python: this * batch_size | 300
+  len: ??? # Will be calculated in Python: iterations * batch_size | ???
+  valid_len: 300 # Will be calculated in Python: this * batch_size | 300
   size: 512 # image size | also change in model/dynadust3r.yaml
   crop: True
   batch_size: 2

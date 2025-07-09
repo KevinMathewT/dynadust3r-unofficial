@@ -87,7 +87,11 @@ def main(config: DictConfig):
 
     # tiny debug dataset
     config.data.len        = 4
-    config.data.valid_len  = config.data.valid_len * config.data.batch_size
+    config.data.valid_len  = 2
+
+    # actual dataset
+    # config.data.len        = config.train.iterations * config.data.batch_size
+    # config.data.valid_len  = config.data.valid_len * config.data.batch_size
 
     # seed & distributed
     setup_distributed(config.seed)

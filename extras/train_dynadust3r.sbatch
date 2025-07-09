@@ -3,7 +3,7 @@
 #SBATCH --account=pr_96_general
 #SBATCH --time=6:00:00
 #SBATCH --mem=200G
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a100:4
 #SBATCH --cpus-per-task=32
 #SBATCH --requeue
 #SBATCH --output=job_output_%j.txt
