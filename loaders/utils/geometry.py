@@ -385,16 +385,23 @@ def create_pm_in_ref_frame(world_pc, validity, cam_source, cam_reference,
                 if len(u) > 0:
                     # Create a unique key for each pixel
                     pixel_keys = v * w + u
+
+                    # sort first by pixel id, then by depth z (ascending → nearest first)
+                    order = np.lexsort((z, pixel_keys))         # stable, O(N log N)
+                    pixel_keys_sorted      = pixel_keys[order]
+                    u_sorted, v_sorted     = u[order], v[order]
+                    ref_points_sorted      = valid_cam_pc_ref[order]
                     
                     # Find unique pixels and their first occurrence
-                    unique_pixels, unique_indices = np.unique(pixel_keys, return_index=True)
+                    unique_pixels, unique_indices = np.unique(pixel_keys_sorted, return_index=True)
                     
                     # Extract unique u, v coordinates
                     u_unique = u[unique_indices]
                     v_unique = v[unique_indices]
+                    pts_unique = ref_points_sorted[unique_indices]
                     
                     # Update point map
-                    pm[v_unique, u_unique, :3] = valid_cam_pc_ref[unique_indices]
+                    pm[v_unique, u_unique, :3] = pts_unique
                     pm[v_unique, u_unique, 3] = 1
                         
     else:  # Dense point map

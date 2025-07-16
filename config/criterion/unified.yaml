@@ -1,0 +1,5 @@
+name: unified
+alpha: 1.0
+norm_mode: avg_dis
+gt_scale: false
+reduction: mean

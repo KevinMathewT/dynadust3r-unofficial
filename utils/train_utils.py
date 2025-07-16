@@ -24,7 +24,7 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = False # disables autotuner that selects fastest algo; needed for deterministic behavior
 
 
-def setup_distributed(seed=42):
+def setup_distributed(seed=97):
     is_ddp = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     if is_ddp and not is_initialized():
         init_process_group(backend="nccl", init_method="env://")

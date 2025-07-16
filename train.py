@@ -42,7 +42,7 @@ import utils.wandb_utils as wandb_logger
 
 
 # ──────────────────────────────────────────────────────────────
-# ### ── mem / prof additions ─────────────────────────────────
+# ### ──────────────── mem / prof additions ──────────────── ###
 # ──────────────────────────────────────────────────────────────
 # memlab - import is optional
 try:
@@ -75,6 +75,53 @@ def get_cycled_batches(dataloader, accelerator, total_iterations):
         accelerator.wait_for_everyone()
         # accelerator.print(f"Cycling dataset at iteration {iteration}")
 
+def install_nan_hook(net):
+    def has_non_finite(x):
+        if torch.is_tensor(x):
+            return (~torch.isfinite(x)).any()
+        elif isinstance(x, (list, tuple)):
+            return any(has_non_finite(t) for t in x)
+        elif isinstance(x, dict):
+            return any(has_non_finite(t) for t in x.values())
+        else:
+            return False           # ignore scalars/None/other types
+
+    def _hook(mod, inp, out):
+        if has_non_finite(inp) or has_non_finite(out):
+            raise RuntimeError(f"🛑 NaN/Inf detected in {mod.__class__.__name__}")
+
+    for m in net.modules():
+        m.register_forward_hook(_hook)
+
+
+def install_nan_hook_verbose(net):
+    def stats(t):
+        return dict(
+            min=float(t.min()), max=float(t.max()),
+            mean=float(t.mean()), std=float(t.std()),
+            n_nan=int((~torch.isfinite(t)).sum()),
+        )
+
+    def _hook(mod, inp, out):
+        # Flatten possible tuple / list structures
+        xs = [*inp]
+        if not isinstance(out, (tuple, list)):
+            xs.append(out)
+        else:
+            xs.extend(out)
+
+        # Collect stats
+        finites = [x for x in xs if torch.is_tensor(x)]
+        any_bad = any((~torch.isfinite(x)).any() for x in finites)
+        if any_bad:
+            print(f"\n🛑  NaN/Inf inside: {mod.__class__.__name__}")
+            for i, x in enumerate(finites):
+                print(f"   tensor {i}: {stats(x)}")
+            raise RuntimeError("stopping on first non-finite value")
+
+    for m in net.modules():
+        m.register_forward_hook(_hook)
+
 
 # ═════════════════════════════════════════════════════════════
 #                     H Y D R A   M A I N
@@ -86,8 +133,8 @@ def main(config: DictConfig):
     USE_PROFILER = USE_PROFILER and config.debug # enable profiler only in debug mode
 
     # tiny debug dataset
-    config.data.len        = 4
-    config.data.valid_len  = 2
+    config.data.len        = 1
+    config.data.valid_len  = 1
 
     # actual dataset
     # config.data.len        = config.train.iterations * config.data.batch_size
@@ -110,8 +157,9 @@ def main(config: DictConfig):
         print("Output directory:", output_dir)
 
     # accelerator
-    ddp_kwargs   = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator  = Accelerator(kwargs_handlers=[ddp_kwargs])
+    # ddp_kwargs   = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator  = Accelerator() # kwargs_handlers=[ddp_kwargs])
+    print(">>> Accelerate mixed_precision =", accelerator.mixed_precision)
 
     pid = os.getpid()
     rank = accelerator.process_index  # 0, 1, 2, … for each process
@@ -130,6 +178,14 @@ def main(config: DictConfig):
     criterion                  = get_criterion(config)
     optimizer                  = get_optimizer(model.parameters(), config)
 
+    # install_nan_hook(model)        # <<<<<<<<<<<<<<
+
+    # Check for non-finite weights in model parameters
+    for n, p in model.named_parameters():
+        if torch.isnan(p).any() or torch.isinf(p).any():
+            raise RuntimeError(f"non-finite weight {n}")
+
+
     accelerator.print(f"----- Model -----")
     accelerator.print(model)
     accelerator.print(f"-----------------")
@@ -143,6 +199,12 @@ def main(config: DictConfig):
     model, optimizer, criterion, train_loader, valid_loader = accelerator.prepare(
         model, optimizer, criterion, train_loader, valid_loader
     )
+
+    install_nan_hook_verbose(model)
+    for n, p in model.named_parameters():
+        if not torch.isfinite(p).all():
+            raise RuntimeError(f"NaN/Inf in weight {n} AFTER prepare")
+
     
     # one-shot report of parameters & buffers
     if HAS_MEMLAB and accelerator.is_local_main_process:
@@ -256,10 +318,28 @@ def main(config: DictConfig):
         # Calculate current "epoch" for logging purposes
         current_epoch = iteration // validation_frequency
         dataset_position = (iteration % batches_per_epoch) + 1
-        
-        # Forward prop - using accelerator context manager for mixed precision
-        with accelerator.autocast():
-            outputs = model(batch)
+
+        # if not torch.isfinite(batch["left_image"]).all():
+        #     bad = (~torch.isfinite(batch["left_image"])).flatten().nonzero()[:5]
+        #     raise RuntimeError(f"Non-finite pixels in left_image at {bad}")
+        # if not torch.isfinite(batch["right_image"]).all():
+        #     bad = (~torch.isfinite(batch["right_image"])).flatten().nonzero()[:5]
+        #     raise RuntimeError(f"Non-finite pixels in right_image at {bad}")
+
+        # for side in ("left_image", "right_image"):
+        #     img = batch[side]
+        #     assert img.min() >= -1.1 and img.max() <= 1.1, f"{side} range {img.min()}..{img.max()}"
+
+        # # just before model(batch)
+        # w = model.patch_embed.proj.weight.data
+        # print("patch_embed weight stats:",
+        #     w.min().item(), w.max().item(), w.mean().item(), w.std().item())
+
+        # x = batch["left_image"]
+        # print("left_image stats:", x.min().item(), x.max().item())
+
+        # with torch.autograd.detect_anomaly():
+        outputs = model(batch)
         
         # Loss computation in FP32 to prevent NaN with ConfLoss
         unwrapped_model = accelerator.unwrap_model(model)
@@ -267,6 +347,7 @@ def main(config: DictConfig):
 
         # Handle loss properly
         if loss is None or not isinstance(loss, torch.Tensor):
+            print(f"[Warning] Got None or non-tensor loss at iteration {iteration} | Loss: {loss}")
             # Create a proper zero loss that requires grad
             loss = torch.zeros(1, requires_grad=True, device=accelerator.device)
             
@@ -346,7 +427,7 @@ def main(config: DictConfig):
 
         
         # Save training visualizations - only on main process
-        if iteration % 250 == 0 and accelerator.is_local_main_process:
+        if iteration % 10 == 0 and accelerator.is_local_main_process:
             unwrapped_model = accelerator.unwrap_model(model)
             base_name = f"t_e_{current_epoch}_b_{iteration}"
             unwrapped_model.save_visualizations(batch, outputs, base_name)
@@ -383,8 +464,7 @@ def main(config: DictConfig):
             with torch.no_grad():
                 for val_batch_idx, val_batch in enumerate(valid_loader):
                     # forward prop
-                    with accelerator.autocast():
-                        val_outputs = model(val_batch)
+                    val_outputs = model(val_batch)
                     
                     # Loss computation in FP32 to prevent NaN with ConfLoss  
                     unwrapped_model = accelerator.unwrap_model(model)

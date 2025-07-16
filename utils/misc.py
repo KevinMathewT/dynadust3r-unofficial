@@ -1,31 +1,10 @@
+# Copyright (C) 2024-present Naver Corporation. All rights reserved.
+# Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
+#
 # --------------------------------------------------------
 # utilitary functions for DUSt3R
 # --------------------------------------------------------
 import torch
-import cv2
-import numpy as np
-from PIL import Image
-
-def get_stride_distribution(strides, dist_type='uniform'):
-
-    # input strides sorted by descreasing order by default
-    
-    if dist_type == 'uniform':
-        dist = np.ones(len(strides)) / len(strides)
-    elif dist_type == 'exponential':
-        lambda_param = 1.0
-        dist = np.exp(-lambda_param * np.arange(len(strides)))
-    elif dist_type.startswith('linear'): # e.g., linear_1_2
-        try:
-            start, end = map(float, dist_type.split('_')[1:])
-            dist = np.linspace(start, end, len(strides))
-        except ValueError:
-            raise ValueError(f'Invalid linear distribution format: {dist_type}')
-    else:
-        raise ValueError('Unknown distribution type %s' % dist_type)
-
-    # normalize to sum to 1
-    return dist / np.sum(dist)
 
 
 def fill_default_args(kwargs, func):
@@ -140,60 +119,3 @@ def invalid_to_zeros(arr, valid_mask, ndim=999):
     if arr.ndim > ndim:
         arr = arr.flatten(-2 - (arr.ndim - ndim), -2)
     return arr, nnz
-
-# def save_tum_poses(traj, path):
-#     # traj = self.get_tum_poses()
-#     save_trajectory_tum_format(traj, path)
-#     return traj[0] # return the poses
-
-def save_focals(focals, path):
-    # convert focal to txt
-    # focals = self.get_focals()
-    np.savetxt(path, focals.detach().cpu().numpy(), fmt='%.6f')
-    return focals
-
-def save_intrinsics(K_raw, path):
-    # K_raw = self.get_intrinsics()
-    K = K_raw.reshape(-1, 9)
-    np.savetxt(path, K.detach().cpu().numpy(), fmt='%.6f')
-    return K_raw
-
-def save_conf_maps(conf, path):
-    # conf = self.get_conf()
-    for i, c in enumerate(conf):
-        np.save(f'{path}/conf_{i}.npy', c.detach().cpu().numpy())
-    return conf
-
-def save_rgb_imgs(imgs, path):
-    # imgs = self.imgs
-    for i, img in enumerate(imgs):
-        # convert from rgb to bgr
-        img = img[..., ::-1]
-        cv2.imwrite(f'{path}/frame_{i:04d}.png', img*255)
-    return imgs
-
-def save_dynamic_masks(dynamic_masks, path):
-    # dynamic_masks = self.dynamic_masks
-    for i, dynamic_mask in enumerate(dynamic_masks):
-        cv2.imwrite(f'{path}/dynamic_mask_{i}.png', (dynamic_mask * 255).detach().cpu().numpy().astype(np.uint8))
-    return dynamic_masks
-
-def save_depth_maps(depth_maps, path):
-    images = []
-    for i, depth_map in enumerate(depth_maps):
-        depth_map_colored = cv2.applyColorMap((depth_map * 255).detach().cpu().numpy().astype(np.uint8), cv2.COLORMAP_JET)
-        img_path = f'{path}/frame_{(i):04d}.png'
-        cv2.imwrite(img_path, depth_map_colored)
-        images.append(Image.open(img_path))
-        # Save npy file
-        np.save(f'{path}/frame_{(i):04d}.npy', depth_map.detach().cpu().numpy())
-    
-    # Save gif using Pillow
-    images[0].save(f'{path}/_depth_maps.gif', save_all=True, append_images=images[1:], duration=100, loop=0)
-    return depth_maps
-
-def to_cpu(x):
-    if isinstance(x, torch.Tensor):
-        return x.detach().cpu()
-    if isinstance(x, list):
-        return [to_cpu(xx) for xx in x]

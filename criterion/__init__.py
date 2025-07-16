@@ -9,6 +9,7 @@ from criterion.criterion import (
     Regr3D_ScaleShiftInv,
     L21Loss,
 )
+from criterion.criterion_new import UnifiedCriterion
 
 
 def _get_criterion(criterion):
@@ -31,6 +32,12 @@ def _get_criterion(criterion):
         return Regr3D_ScaleInv(loss, **kw)
     elif name == "regr3d_scaleshiftinv":
         return Regr3D_ScaleShiftInv(loss, **kw)
+    elif name == "unified":
+        return UnifiedCriterion(
+            alpha=criterion.get('alpha', 1.0),
+            norm_mode=criterion.get('norm_mode', 'avg_dis'),
+            gt_scale=criterion.get('gt_scale', False)
+        )
 
     raise ValueError(f"Unsupported criterion: {name}")
 

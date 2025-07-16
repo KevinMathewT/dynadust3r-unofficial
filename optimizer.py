@@ -89,8 +89,12 @@ def get_scheduler(optimizer, config, loader):
         loader (Iterable): Training data loader (used to get steps per epoch).
 
     Returns:
-        _LRScheduler: Configured learning rate scheduler.
+        _LRScheduler or None: Configured learning rate scheduler, or None if no scheduler.
     """
+    # Handle case where scheduler is disabled (None)
+    if config.sched is None:
+        return None
+    
     sched_config = OmegaConf.to_container(config.sched, resolve=True)
     name = sched_config.pop("name")
     sched_cls = SCHEDULERS.get(name)

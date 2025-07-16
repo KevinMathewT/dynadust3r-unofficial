@@ -194,12 +194,10 @@ def depthmap_to_camera_coordinates(depthmap, camera_intrinsics, pseudo_focal=Non
 
     # Mask for valid coordinates
     valid_mask = (depthmap > 0.0)
-    # Invalid any depth > 80m
-    valid_mask = valid_mask
     return X_cam, valid_mask
 
 
-def depthmap_to_absolute_camera_coordinates(depthmap, camera_intrinsics, camera_pose, z_far=0, **kw):
+def depthmap_to_absolute_camera_coordinates(depthmap, camera_intrinsics, camera_pose, **kw):
     """
     Args:
         - depthmap (HxW array):
@@ -208,8 +206,6 @@ def depthmap_to_absolute_camera_coordinates(depthmap, camera_intrinsics, camera_
     Returns:
         pointmap of absolute coordinates (HxWx3 array), and a mask specifying valid pixels."""
     X_cam, valid_mask = depthmap_to_camera_coordinates(depthmap, camera_intrinsics)
-    if z_far > 0:
-        valid_mask = valid_mask & (depthmap < z_far)
 
     X_world = X_cam # default
     if camera_pose is not None:
