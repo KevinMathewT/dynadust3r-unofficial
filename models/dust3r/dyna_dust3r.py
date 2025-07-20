@@ -550,7 +550,7 @@ class DynaDUSt3R(
             loss_details[f"{name}_l2"] = l2_loss.item()
             loss_details[f"{name}_conf"] = conf_loss.item()
             
-            return l2_loss + conf_loss
+            return conf_loss
         
         # Base PC losses
         conf_left = outputs.get("left_map_pred_conf", None)
@@ -599,7 +599,7 @@ class DynaDUSt3R(
         while norm_factor.ndim < pc1.ndim:
             norm_factor = norm_factor.unsqueeze(-1)
         
-        breakpoint()
+        # breakpoint()
 
         return norm_factor
 

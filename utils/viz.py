@@ -5,6 +5,7 @@ import cv2
 import wandb
 
 from loaders.utils.geometry import cam_pc_to_world_pc, world_pc_to_cam_pc
+import loaders.utils.viz as viz_utils
 
 def _normalize_pc_pair_np(pc1, pc2, valid1, valid2):
     """
@@ -358,3 +359,60 @@ def save_visualizations(batch, outputs, base_name, i=0, *args, **kwargs):
         log_dict[f"{base}/conf/{key}"] = wandb.Image(img, caption=f"Conf {key.upper()}")
 
     wandb.log(log_dict, commit=True)
+
+    # Extract GT motions to numpy
+    gt_l2m_motion_np = batch["motion_gt"]["l2m"][i].detach().cpu().numpy()
+    gt_r2m_motion_np = batch["motion_gt"]["r2m"][i].detach().cpu().numpy()
+    gt_l2r_motion_np = batch["motion_gt"]["l2r"][i].detach().cpu().numpy()
+    gt_r2l_motion_np = batch["motion_gt"]["r2l"][i].detach().cpu().numpy()
+
+    # Zero motion template (H, W, 4) with validity=0
+    zero_motion = np.zeros_like(gt_l2m_motion_np)
+    
+    # GT visualization sequence
+    pms_gt = [
+        gt_left_norm_np, gt_l2m_norm_np,
+        gt_right_norm_np, gt_r2m_norm_np,
+        gt_left_norm_np, gt_l2r_norm_np,
+        gt_right_norm_np, gt_r2l_norm_np
+    ]
+    motion_map_gt = np.stack([
+        gt_l2m_motion_np,
+        zero_motion,
+        gt_r2m_motion_np,
+        zero_motion,
+        gt_l2r_motion_np,
+        zero_motion,
+        gt_r2l_motion_np
+    ], axis=0)
+    image_seq_gt = [
+        left_img_unnorm, mid_img_unnorm,
+        right_img_unnorm, mid_img_unnorm,
+        left_img_unnorm, right_img_unnorm,
+        right_img_unnorm, left_img_unnorm
+    ]
+    viz_utils.visualize_sequence_from_pms(pms_gt, motion_map_gt, image_seq_gt, name=f"{base}/gt_motions", save=False)
+    
+    # Pred visualization sequence (add GT validity to pred motions since pred motions are :3)
+    pred_l2m_motion_np = np.concatenate((outputs["motion_pred"][k_l2m][i].detach().cpu().numpy(), gt_l2m_motion_np[..., 3:]), axis=-1)
+    pred_r2m_motion_np = np.concatenate((outputs["motion_pred"][k_r2m][i].detach().cpu().numpy(), gt_r2m_motion_np[..., 3:]), axis=-1)
+    pred_l2r_motion_np = np.concatenate((outputs["motion_pred"]["l_to_1"][i].detach().cpu().numpy(), gt_l2r_motion_np[..., 3:]), axis=-1)
+    pred_r2l_motion_np = np.concatenate((outputs["motion_pred"]["r_to_0"][i].detach().cpu().numpy(), gt_r2l_motion_np[..., 3:]), axis=-1)
+    
+    pms_pred = [
+        pred_left_norm_np, pred_l2m_norm_np,
+        pred_right_norm_np, pred_r2m_norm_np,
+        pred_left_norm_np, pred_l2r_norm_np,
+        pred_right_norm_np, pred_r2l_norm_np
+    ]
+    motion_map_pred = np.stack([
+        pred_l2m_motion_np,
+        zero_motion,
+        pred_r2m_motion_np,
+        zero_motion,
+        pred_l2r_motion_np,
+        zero_motion,
+        pred_r2l_motion_np
+    ], axis=0)
+    image_seq_pred = image_seq_gt  # Same images for coloring
+    viz_utils.visualize_sequence_from_pms(pms_pred, motion_map_pred, image_seq_pred, name=f"{base}/pred_motions", save=False)

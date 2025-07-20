@@ -7,7 +7,7 @@ defaults:
   - dataset/stereo4d@dataset.stereo4d
   - _self_
 
-seed: 96
+seed: 2
 
 debug: False
 
