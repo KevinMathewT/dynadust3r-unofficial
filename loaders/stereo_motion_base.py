@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import Dataset
 
 import loaders.utils.geometry as geo
+import loaders.utils.geometry_motion as geo_motion
 
 
 class StereoMotionBase(Dataset):
@@ -282,61 +283,23 @@ class StereoMotionBase(Dataset):
                 # Compute motion maps for all required pairs
                 # Format: motion_gt["i_j"] where i is source view index, j is query time
                 # IMPORTANT: All motions must be expressed in the left camera (reference) frame
-                motion_gt = {}
                 
-                # For query 0 (mid_tq): both views to mid position
-                # l2m: left to mid (left camera is already reference)
+                # Use cleaner motion computation
                 if self.time_debug:
                     t0 = time.perf_counter()
-                motion_maps_0 = geo.get_motion_map_from_world_pc(
-                    [left_info["world_pc_valid"], mid_info["world_pc_valid"]],
-                    [left_info["cam"], mid_info["cam"]],
-                    left_info["image"].shape[:2],
+                    
+                motion_gt = geo_motion.compute_all_motion_maps(
+                    left_info["world_pc_valid"],
+                    mid_info["world_pc_valid"],
+                    right_info["world_pc_valid"],
+                    left_info["cam"],
+                    mid_info["cam"],
+                    right_info["cam"],
+                    left_info["image"].shape[:2]
                 )
-                motion_gt["l2m"] = motion_maps_0[0]  # left to mid, in left frame
-                if self.time_debug:
-                    print(f"[TIME] Compute l2m motion: {(time.perf_counter() - t0)*1000:.2f}ms")
                 
-                # r2m: right to mid (ensure left camera is reference by putting it first)
-                # We need a dummy left entry to maintain left as reference
                 if self.time_debug:
-                    t0 = time.perf_counter()
-                motion_maps_1 = geo.get_motion_map_from_world_pc(
-                    [left_info["world_pc_valid"], right_info["world_pc_valid"], mid_info["world_pc_valid"]],
-                    [left_info["cam"], right_info["cam"], mid_info["cam"]],
-                    right_info["image"].shape[:2],
-                )
-                motion_gt["r2m"] = motion_maps_1[1]  # right to mid (index 1), in left frame
-                if self.time_debug:
-                    print(f"[TIME] Compute r2m motion: {(time.perf_counter() - t0)*1000:.2f}ms")
-                
-                # For query 1 (1.0): view 0 to position 1 (left to right)
-                # l2r: left to right (left camera is already reference)
-                if self.time_debug:
-                    t0 = time.perf_counter()
-                motion_maps_2 = geo.get_motion_map_from_world_pc(
-                    [left_info["world_pc_valid"], right_info["world_pc_valid"]],
-                    [left_info["cam"], right_info["cam"]],
-                    left_info["image"].shape[:2],
-                )
-                motion_gt["l2r"] = motion_maps_2[0]  # left to right, in left frame
-                if self.time_debug:
-                    print(f"[TIME] Compute l2r motion: {(time.perf_counter() - t0)*1000:.2f}ms")
-                
-                # For query 2 (0.0): view 1 to position 0 (right to left)
-                # r2l: right to left (ensure left camera is reference)
-                # We include left as dummy first entry to maintain it as reference
-                if self.time_debug:
-                    t0 = time.perf_counter()
-                motion_maps_3 = geo.get_motion_map_from_world_pc(
-                    [left_info["world_pc_valid"], right_info["world_pc_valid"], left_info["world_pc_valid"]],
-                    [left_info["cam"], right_info["cam"], left_info["cam"]],
-                    right_info["image"].shape[:2],
-                )
-                # Motion from right (index 1) to left (last frame)
-                motion_gt["r2l"] = motion_maps_3[1]  # right to left, in left frame
-                if self.time_debug:
-                    print(f"[TIME] Compute r2l motion: {(time.perf_counter() - t0)*1000:.2f}ms")
+                    print(f"[TIME] Compute all motions: {(time.perf_counter() - t0)*1000:.2f}ms")
 
                 # Assert that motion maps have valid motion vectors
                 if self.time_debug:

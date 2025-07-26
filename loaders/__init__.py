@@ -48,14 +48,14 @@ def get_loaders(config, num_workers_multiplier=0.75, time_debug=False, loader_kw
     valid_dataset = LOADERS[config.data.loader](config, valid=True, time_debug=time_debug)
 
     # Calculate num_workers based on multiplier
-    num_workers = int(num_workers_multiplier * os.cpu_count() / 3)
+    num_workers = int(num_workers_multiplier * len(os.sched_getaffinity(0)))
 
     # ensure dict so that .get works even if None passed
     loader_kwargs = loader_kwargs or {}
 
     # derive final values (dict overrides the auto‑defaults when supplied)
     persistent_workers_val = loader_kwargs.get('persistent_workers', True if num_workers > 0 else False)
-    prefetch_factor_val    = loader_kwargs.get('prefetch_factor', 8 if num_workers > 0 else None)
+    prefetch_factor_val    = loader_kwargs.get('prefetch_factor', 2 if num_workers > 0 else None)
 
     # Create dataloaders with FULL batch size
     # Accelerate will automatically handle splitting across GPUs
@@ -67,7 +67,7 @@ def get_loaders(config, num_workers_multiplier=0.75, time_debug=False, loader_kw
         collate_fn=add_batch_size_wrapper,
         pin_memory=True,  # Recommended for GPU training
         persistent_workers=persistent_workers_val,  # Keeps workers alive between epochs
-        prefetch_factor=prefetch_factor_val,  # Prefetch batches for better performance
+        # prefetch_factor=prefetch_factor_val,  # Prefetch batches for better performance
     )
 
     valid_loader = DataLoader(
@@ -78,7 +78,7 @@ def get_loaders(config, num_workers_multiplier=0.75, time_debug=False, loader_kw
         collate_fn=add_batch_size_wrapper,
         pin_memory=True,
         persistent_workers=persistent_workers_val,
-        prefetch_factor=prefetch_factor_val,  # Prefetch batches for better performance
+        # prefetch_factor=prefetch_factor_val,  # Prefetch batches for better performance
     )
 
     # Only print info if we're on the main process
@@ -91,7 +91,7 @@ def get_loaders(config, num_workers_multiplier=0.75, time_debug=False, loader_kw
         print(f"Train dataloader batches: {len(train_loader)}")
         print(f"Validation dataloader batches: {len(valid_loader)}")
         print(f"Batch size (before distribution): {config.data.batch_size}")
-        print(f"num_workers: {num_workers} ({num_workers_multiplier} * {os.cpu_count() / 3})")
+        print(f"num_workers: {num_workers} ({num_workers_multiplier} * {len(os.sched_getaffinity(0))})")
         print(f"persistent_workers: {persistent_workers_val} | prefetch_factor: {prefetch_factor_val}")
         print(f"time_debug: {time_debug}")
         print(f"Note: Accelerate will automatically distribute batches across GPUs")

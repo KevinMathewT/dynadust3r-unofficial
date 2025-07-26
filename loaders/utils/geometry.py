@@ -395,9 +395,9 @@ def create_pm_in_ref_frame(world_pc, validity, cam_source, cam_reference,
                     # Find unique pixels and their first occurrence
                     unique_pixels, unique_indices = np.unique(pixel_keys_sorted, return_index=True)
                     
-                    # Extract unique u, v coordinates
-                    u_unique = u[unique_indices]
-                    v_unique = v[unique_indices]
+                    # Extract unique u, v coordinates (FIX: use sorted arrays)
+                    u_unique = u_sorted[unique_indices]
+                    v_unique = v_sorted[unique_indices]
                     pts_unique = ref_points_sorted[unique_indices]
                     
                     # Update point map

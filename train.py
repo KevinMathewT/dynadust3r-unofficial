@@ -133,12 +133,12 @@ def main(config: DictConfig):
     USE_PROFILER = USE_PROFILER and config.debug # enable profiler only in debug mode
 
     # tiny debug dataset
-    config.data.len        = 1
-    config.data.valid_len  = 1
+    # config.data.len        = 1
+    # config.data.valid_len  = 1
 
     # actual dataset
-    # config.data.len        = config.train.iterations * config.data.batch_size
-    # config.data.valid_len  = config.data.valid_len * config.data.batch_size
+    config.data.len        = config.train.iterations * config.data.batch_size
+    config.data.valid_len  = config.data.valid_len * config.data.batch_size
 
     # seed & distributed
     setup_distributed(config.seed)
@@ -237,7 +237,7 @@ def main(config: DictConfig):
     
     # Check actual batch sizes after prepare()
     accelerator.print(f"\n========== Batch Size Information ==========")
-    accelerator.print(f"Config batch size (global): {config.data.batch_size}")
+    accelerator.print(f"Config batch size: {config.data.batch_size}")
     
     # Get a sample batch to check local batch size
     sample_train_iter = iter(train_loader)
@@ -427,7 +427,7 @@ def main(config: DictConfig):
 
         
         # Save training visualizations - only on main process
-        if iteration % 10 == 0 and accelerator.is_local_main_process:
+        if iteration % 200 == 0 and accelerator.is_local_main_process:
             unwrapped_model = accelerator.unwrap_model(model)
             base_name = f"t_e_{current_epoch}_b_{iteration}"
             unwrapped_model.save_visualizations(batch, outputs, base_name)

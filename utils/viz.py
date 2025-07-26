@@ -139,6 +139,15 @@ def draw_motion_on_image(image: np.ndarray, pc: np.ndarray, npc: np.ndarray, val
     p = pc[v_idx, u_idx]  # (N, 3)
     n = npc[v_idx, u_idx]  # (N, 3)
     # print(f"DEBUG: draw_motion_on_image - p shape: {p.shape}, n shape: {n.shape}")
+    
+    # Debug: Check motion magnitudes
+    motion = n - p
+    motion_magnitudes = np.linalg.norm(motion, axis=-1)
+    if len(motion_magnitudes) > 0:
+        large_motions = motion_magnitudes > 10.0  # Flag motions larger than 10 units
+        if large_motions.any():
+            print(f"WARNING: Large motions detected! Count: {large_motions.sum()}/{len(motion_magnitudes)}")
+            print(f"Motion stats - Min: {motion_magnitudes.min():.3f}, Max: {motion_magnitudes.max():.3f}, Mean: {motion_magnitudes.mean():.3f}")
 
     uv_p = project_3d_to_2d_vec(p, source_cam, proj_cam)  # (N, 2)
     uv_n = project_3d_to_2d_vec(n, source_cam, proj_cam)  # (N, 2)
@@ -198,6 +207,13 @@ def save_visualizations(batch, outputs, base_name, i=0, *args, **kwargs):
     valid_left_np = (batch["left_pm"][i, ..., 3] > 0).detach().cpu().numpy()
     valid_right_np = (batch["right_pm"][i, ..., 3] > 0).detach().cpu().numpy()
     # print(f"DEBUG: save_visualizations - gt_left_pc_np shape: {gt_left_pc_np.shape}, valid_left_np shape: {valid_left_np.shape}")
+    
+    # Debug: Check for points at origin
+    left_at_origin = np.all(gt_left_pc_np == 0, axis=-1) & valid_left_np
+    right_at_origin = np.all(gt_right_pc_np == 0, axis=-1) & valid_right_np
+    if left_at_origin.any() or right_at_origin.any():
+        print(f"WARNING: Found valid GT points at origin - Left: {left_at_origin.sum()}, Right: {right_at_origin.sum()}")
+        print(f"Total valid points - Left: {valid_left_np.sum()}, Right: {valid_right_np.sum()}")
     
     pred_left_pc_np = outputs["left_map_pred"][i].detach().cpu().numpy()
     pred_right_pc_np = outputs["right_map_pred_in_left_frame"][i].detach().cpu().numpy()
@@ -391,7 +407,7 @@ def save_visualizations(batch, outputs, base_name, i=0, *args, **kwargs):
         left_img_unnorm, right_img_unnorm,
         right_img_unnorm, left_img_unnorm
     ]
-    viz_utils.visualize_sequence_from_pms(pms_gt, motion_map_gt, image_seq_gt, name=f"{base}/gt_motions", save=False)
+    # viz_utils.visualize_sequence_from_pms(pms_gt, motion_map_gt, image_seq_gt, name=f"{base}/gt_motions", save=False)
     
     # Pred visualization sequence (add GT validity to pred motions since pred motions are :3)
     pred_l2m_motion_np = np.concatenate((outputs["motion_pred"][k_l2m][i].detach().cpu().numpy(), gt_l2m_motion_np[..., 3:]), axis=-1)
@@ -415,4 +431,4 @@ def save_visualizations(batch, outputs, base_name, i=0, *args, **kwargs):
         pred_r2l_motion_np
     ], axis=0)
     image_seq_pred = image_seq_gt  # Same images for coloring
-    viz_utils.visualize_sequence_from_pms(pms_pred, motion_map_pred, image_seq_pred, name=f"{base}/pred_motions", save=False)
+    # viz_utils.visualize_sequence_from_pms(pms_pred, motion_map_pred, image_seq_pred, name=f"{base}/pred_motions", save=False)

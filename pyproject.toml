@@ -56,6 +56,9 @@ pytorch-memlab = "^0.3.0"
 psutil = "^7.0.0"
 pynvml = "^12.0.0"
 austin-dist = "^3.7.0"
+modulegraph = "^0.19.6"
+vulture = "^2.14"
+pydeps = "^3.0.1"
 
 [build-system]
 requires = ["poetry-core"]
