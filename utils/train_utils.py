@@ -10,9 +10,9 @@ from torch.distributed import init_process_group, is_initialized
 
 
 def seed_everything(seed):
-    # determine rank (default to 0 for non-DDP scripts)
+    # determine rank (default to 0 for non-ddp scripts)
     rank = int(os.environ.get("RANK", 0)) if "RANK" in os.environ else 0
-    global_seed = seed + rank  # adjust seed per process for DDP
+    global_seed = seed + rank  # adjust seed per process for ddp
     
     os.environ["PYTHONHASHSEED"] = str(global_seed)
     random.seed(global_seed)
@@ -20,8 +20,8 @@ def seed_everything(seed):
     torch.manual_seed(global_seed)
     torch.cuda.manual_seed(global_seed)
     torch.cuda.manual_seed_all(global_seed)
-    torch.backends.cudnn.deterministic = True # forces cuDNN to use deterministic algorithms
-    torch.backends.cudnn.benchmark = False # disables autotuner that selects fastest algo; needed for deterministic behavior
+    torch.backends.cudnn.deterministic = True  # forces cudnn to use deterministic algorithms
+    torch.backends.cudnn.benchmark = False     # disables autotuner for determinism
 
 
 def setup_distributed(seed=97):
@@ -48,67 +48,91 @@ def init_wandb(config):
 
 from hydra.core.hydra_config import HydraConfig
 
+# ----- modified: keep top-k and encode tracked metric in filename -----
+import re
+from omegaconf import OmegaConf
+
+_METRIC_NAME_RE = re.compile(
+    r"best_(?P<metric>[A-Za-z0-9_\-]+)_(?P<val>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)_iter_(?P<it>\d+)_epoch_(?P<ep>\d+)\.pth"
+)
+
+def _parse_metric_from_name(path):
+    m = _METRIC_NAME_RE.search(os.path.basename(path))
+    if not m:
+        return None, None
+    try:
+        return m.group("metric"), float(m.group("val"))
+    except Exception:
+        return None, None
+
+def _list_checkpoints(dirpath):
+    return sorted(glob.glob(os.path.join(dirpath, "best_*.pth")))
+
 def save_best_model(accelerator, model, optimizer, scheduler, iteration, current_epoch, 
                    best_metric_value, metric_name, val_loss, config, output_dir):
     """
-    Save the best model with validation loss in filename and delete prior weights.
-    
-    Args:
-        accelerator: HuggingFace Accelerator instance
-        model: The model to save
-        optimizer: Optimizer state to save
-        scheduler: Scheduler state to save (can be None)
-        iteration: Current iteration number
-        current_epoch: Current epoch number
-        best_metric_value: Best metric value achieved
-        metric_name: Name of the metric being tracked
-        val_loss: Current validation loss
-        config: Configuration object
-        output_dir: Directory where to save the checkpoints
-    
-    Returns:
-        str: Path to saved checkpoint file
+    save checkpoint and keep only top-k by the tracked metric.
+    - filename encodes the tracked metric and its value.
+    - keeps top-k checkpoints according to lower_is_better.
     """
     if not accelerator.is_local_main_process:
         return None
     
-    # Create checkpoints directory
     checkpoints_dir = os.path.join(output_dir, "checkpoints")
     os.makedirs(checkpoints_dir, exist_ok=True)
-    
-    # Delete all existing checkpoint files
-    existing_checkpoints = glob.glob(os.path.join(checkpoints_dir, "best_model_*.pth"))
-    for checkpoint_path in existing_checkpoints:
-        try:
-            os.remove(checkpoint_path)
-            print(f"Deleted previous checkpoint: {checkpoint_path}")
-        except OSError as e:
-            print(f"Warning: Could not delete {checkpoint_path}: {e}")
-    
-    # Create filename with validation loss
-    filename = f"best_model_iter_{iteration+1}_epoch_{current_epoch+1}_val_loss_{val_loss:.6f}.pth"
+
+    keep_top_k = int(getattr(config.valid.save, "keep_top_k", 1))
+    lower_is_better = bool(getattr(config.valid.save, "lower_is_better", True))
+
+    # filename includes the tracked metric (not always val_loss)
+    filename = f"best_{metric_name}_{best_metric_value:.6f}_iter_{iteration+1}_epoch_{current_epoch+1}.pth"
     checkpoint_path = os.path.join(checkpoints_dir, filename)
     
-    # Prepare checkpoint dictionary
+    # prepare checkpoint dictionary (save config as plain dict)
     checkpoint = {
         "iteration": iteration + 1,
         "epoch": current_epoch + 1,
         "state_dict": accelerator.unwrap_model(model).state_dict(),
-        "best_metric": best_metric_value,
+        "best_metric": float(best_metric_value),
         "metric_name": metric_name,
-        "val_loss": val_loss,
+        "val_loss": float(val_loss),
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
-        "config": config,
+        "config": OmegaConf.to_container(config, resolve=True),
     }
     
-    # Save checkpoint
     torch.save(checkpoint, checkpoint_path)
-    
-    print(f"Saved best model at: {checkpoint_path}")
+    print(f"Saved checkpoint: {checkpoint_path}")
     print(f"Metrics - iteration: {iteration+1} | epoch: {current_epoch+1} | val_loss: {val_loss:.6f} | {metric_name}: {best_metric_value:.6f}")
+
+    # enforce top-k retention
+    if keep_top_k > 0:
+        entries = []
+        for p in _list_checkpoints(checkpoints_dir):
+            mname, mval = _parse_metric_from_name(p)
+            if mname == metric_name and mval is not None:
+                entries.append((p, mval))
+            else:
+                # fallback: read from file if not parseable
+                try:
+                    meta = torch.load(p, map_location="cpu")
+                    if meta.get("metric_name") == metric_name:
+                        entries.append((p, float(meta.get("best_metric", float("inf")))))
+                except Exception:
+                    # if unreadable, deprioritize it
+                    entries.append((p, float("inf") if lower_is_better else float("-inf")))
+        # sort by comparator
+        entries.sort(key=lambda x: x[1], reverse=not lower_is_better)
+        # delete extras
+        for p, _ in entries[keep_top_k:]:
+            try:
+                os.remove(p)
+                print(f"Pruned checkpoint: {p}")
+            except OSError as e:
+                print(f"Warning: Could not delete {p}: {e}")
     
     return checkpoint_path
+# ----- end modified block -----
 
 
 import os
@@ -129,27 +153,27 @@ def create_symlink_for_wids_cache():
 
 
 class AverageMeter(object):
-    """Computes and stores the average and current value of metrics."""
+    """computes and stores the average and current value of metrics."""
     def __init__(self, name, fmt=":f"):
         self.name = name
         self.fmt = fmt
         self.reset()
 
     def reset(self):
-        """Reset all counters to zero."""
+        """reset all counters to zero."""
         self.val = 0
         self.avg = 0
         self.sum = 0
         self.count = 0
 
     def update(self, val, n=1):
-        """Update the meter with new value."""
+        """update the meter with new value."""
         self.val = val
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
 
     def __str__(self):
-        """String representation of the meter."""
+        """string representation of the meter."""
         fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
         return fmtstr.format(**self.__dict__)

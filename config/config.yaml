@@ -38,7 +38,7 @@ data:
   valid_len: 300 # Will be calculated in Python: this * batch_size | 300
   size: 512 # image size | also change in model/dynadust3r.yaml
   crop: True
-  batch_size: 1
+  batch_size: 4
   num_workers: 16
   prefetch_fact: 1
 
