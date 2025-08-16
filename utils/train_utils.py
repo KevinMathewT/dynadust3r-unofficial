@@ -13,15 +13,15 @@ def seed_everything(seed):
     # determine rank (default to 0 for non-ddp scripts)
     rank = int(os.environ.get("RANK", 0)) if "RANK" in os.environ else 0
     global_seed = seed + rank  # adjust seed per process for ddp
-    
+
     os.environ["PYTHONHASHSEED"] = str(global_seed)
     random.seed(global_seed)
     np.random.seed(global_seed)
     torch.manual_seed(global_seed)
     torch.cuda.manual_seed(global_seed)
     torch.cuda.manual_seed_all(global_seed)
-    torch.backends.cudnn.deterministic = True  # forces cudnn to use deterministic algorithms
-    torch.backends.cudnn.benchmark = False     # disables autotuner for determinism
+    torch.backends.cudnn.deterministic = True  # deterministic kernels
+    torch.backends.cudnn.benchmark = False     # disable autotuner
 
 
 def setup_distributed(seed=97):
@@ -48,7 +48,7 @@ def init_wandb(config):
 
 from hydra.core.hydra_config import HydraConfig
 
-# ----- modified: keep top-k and encode tracked metric in filename -----
+# ----- keep top-k and encode tracked metric in filename -----
 import re
 from omegaconf import OmegaConf
 
@@ -72,8 +72,7 @@ def save_best_model(accelerator, model, optimizer, scheduler, iteration, current
                    best_metric_value, metric_name, val_loss, config, output_dir):
     """
     save checkpoint and keep only top-k by the tracked metric.
-    - filename encodes the tracked metric and its value.
-    - keeps top-k checkpoints according to lower_is_better.
+    filename encodes the tracked metric and its value.
     """
     if not accelerator.is_local_main_process:
         return None
@@ -84,11 +83,11 @@ def save_best_model(accelerator, model, optimizer, scheduler, iteration, current
     keep_top_k = int(getattr(config.valid.save, "keep_top_k", 1))
     lower_is_better = bool(getattr(config.valid.save, "lower_is_better", True))
 
-    # filename includes the tracked metric (not always val_loss)
+    # encode the tracked metric
     filename = f"best_{metric_name}_{best_metric_value:.6f}_iter_{iteration+1}_epoch_{current_epoch+1}.pth"
     checkpoint_path = os.path.join(checkpoints_dir, filename)
     
-    # prepare checkpoint dictionary (save config as plain dict)
+    # pack state
     checkpoint = {
         "iteration": iteration + 1,
         "epoch": current_epoch + 1,
@@ -110,20 +109,21 @@ def save_best_model(accelerator, model, optimizer, scheduler, iteration, current
         entries = []
         for p in _list_checkpoints(checkpoints_dir):
             mname, mval = _parse_metric_from_name(p)
-            if mname == metric_name and mval is not None:
+            if mname == metric_name and mval is not None and np.isfinite(mval):
                 entries.append((p, mval))
             else:
-                # fallback: read from file if not parseable
+                # fallback to metadata if needed
                 try:
                     meta = torch.load(p, map_location="cpu")
                     if meta.get("metric_name") == metric_name:
-                        entries.append((p, float(meta.get("best_metric", float("inf")))))
+                        mv = float(meta.get("best_metric", float("inf")))
+                        entries.append((p, mv))
                 except Exception:
-                    # if unreadable, deprioritize it
+                    # if unreadable, deprioritize
                     entries.append((p, float("inf") if lower_is_better else float("-inf")))
-        # sort by comparator
+
+        # sort and prune
         entries.sort(key=lambda x: x[1], reverse=not lower_is_better)
-        # delete extras
         for p, _ in entries[keep_top_k:]:
             try:
                 os.remove(p)
@@ -132,10 +132,8 @@ def save_best_model(accelerator, model, optimizer, scheduler, iteration, current
                 print(f"Warning: Could not delete {p}: {e}")
     
     return checkpoint_path
-# ----- end modified block -----
 
 
-import os
 import shutil
 
 def create_symlink_for_wids_cache():
@@ -160,20 +158,17 @@ class AverageMeter(object):
         self.reset()
 
     def reset(self):
-        """reset all counters to zero."""
         self.val = 0
         self.avg = 0
         self.sum = 0
         self.count = 0
 
     def update(self, val, n=1):
-        """update the meter with new value."""
         self.val = val
         self.sum += val * n
         self.count += n
-        self.avg = self.sum / self.count
+        self.avg = self.sum / max(self.count, 1)
 
     def __str__(self):
-        """string representation of the meter."""
         fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
         return fmtstr.format(**self.__dict__)

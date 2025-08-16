@@ -21,7 +21,7 @@ debug: False
 sched: null
 
 train:
-  validation_frequency: 10  # Combined validation frequency (replaces both epoch_frequency and valid.interval)
+  validation_frequency: 1000  # Combined validation frequency (replaces both epoch_frequency and valid.interval)
   iterations: 49000  # Total number of training iterations
   grad_clip: 0
 
@@ -30,15 +30,16 @@ valid:
     save_best: True
     best_metric: loss
     lower_is_better: True
+    keep_top_k: 20          # retain top-20 checkpoints
     output_dir: weights/
 
 data:
   loader: stereo4d # [stereo4d, pointodyssey]
   len: ??? # Will be calculated in Python: iterations * batch_size | ???
-  valid_len: 300 # Will be calculated in Python: this * batch_size | 300
+  valid_len: 1000 # Will be calculated in Python: this * batch_size | 300
   size: 512 # image size | also change in model/dynadust3r.yaml
   crop: True
-  batch_size: 2
+  batch_size: 4
   num_workers: 16
   prefetch_fact: 1
 

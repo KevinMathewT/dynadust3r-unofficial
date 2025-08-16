@@ -7,10 +7,11 @@ import os
 import time
 import torch, torch.nn.functional as F
 import wandb, numpy as np
-from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from hydra.core.hydra_config import HydraConfig
+from datetime import timedelta
 
 from models import get_model
 from loaders import get_loaders
@@ -32,7 +33,7 @@ def get_cycled_batches(dataloader, accelerator, total_iterations):
             iteration += 1
             if iteration >= total_iterations:
                 return
-        accelerator.wait_for_everyone()
+        accelerator.wait_for_everyone()  # keep epochs aligned across ranks
 
 
 # ═════════════════════════════════════════════════════════════
@@ -55,9 +56,10 @@ def main(config: DictConfig):
 
     output_dir = HydraConfig.get().runtime.output_dir
 
-    # important: allow parameters that may be skipped in some forwards
+    # allow params skipped in some forwards
     ddp_kwargs   = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator  = Accelerator(kwargs_handlers=[ddp_kwargs])
+    init_kwargs  = InitProcessGroupKwargs(timeout=timedelta(minutes=60))
+    accelerator  = Accelerator(kwargs_handlers=[ddp_kwargs, init_kwargs])
 
     # wandb
     if config.logging.use_wandb and accelerator.is_local_main_process:
@@ -91,7 +93,7 @@ def main(config: DictConfig):
     iteration       = 0
 
     start_time = time.time()  # wall-clock timer
-    
+
     # main training loop
     for batch in batch_iter:
         current_epoch     = iteration // validation_frequency
@@ -117,7 +119,7 @@ def main(config: DictConfig):
 
         optimizer.step()
         optimizer.zero_grad()
-        
+
         if accelerator.sync_gradients and scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step()
 
@@ -163,6 +165,8 @@ def main(config: DictConfig):
             unwrapped_model = accelerator.unwrap_model(model)
             base_name = f"t_e_{current_epoch}_b_{iteration}"
             unwrapped_model.save_visualizations(batch, outputs, base_name)  # imgs/grids  # (B,H,W,3)
+        if iteration % 250 == 0:
+            accelerator.wait_for_everyone()  # barrier after rank-0 training viz
 
         # validation
         if (iteration + 1) % validation_frequency == 0 or iteration == total_iterations - 1:
@@ -211,7 +215,7 @@ def main(config: DictConfig):
 
                     if val_batch_idx % config.logging.wandb_interval == 0 and accelerator.is_local_main_process:
                         wandb_logger.log_validation_batch(
-                            iteration, current_epoch, val_batch_idx, val_loss.item(), 
+                            iteration, current_epoch, val_batch_idx, val_loss.item(),
                             val_loss_details, val_batch_metrics, config, accelerator
                         )
 
@@ -226,6 +230,7 @@ def main(config: DictConfig):
                     unwrapped_model = accelerator.unwrap_model(model)
                     base_name = f"v_e_{current_epoch}_b_{iteration}"
                     unwrapped_model.save_visualizations(val_batch, val_outputs, base_name)  # (B,H,W,3)
+                accelerator.wait_for_everyone()  # barrier after rank-0 validation viz
 
             if accelerator.is_local_main_process:
                 wandb_logger.log_validation_epoch(iteration, current_epoch, val_losses, val_metrics, config, accelerator)
@@ -238,9 +243,10 @@ def main(config: DictConfig):
             if val_metrics_str:
                 accelerator.print(f"[{current_epoch+1}] val{val_metrics_str}")
 
-            if config.valid.save.save_best and accelerator.is_local_main_process:
-                is_best = False
+            # best-checkpoint save; keep_top_k>1 => save every val, prune in saver
+            if config.valid.save.save_best:
                 metric_name = config.valid.save.best_metric
+                keep_top_k = int(getattr(config.valid.save, "keep_top_k", 1))
 
                 if metric_name == "loss":
                     metric_val = val_losses.avg
@@ -252,21 +258,26 @@ def main(config: DictConfig):
                     accelerator.print(f"warning: best_metric '{metric_name}' not found in metrics.")
                     metric_val = None
 
-                if metric_val is not None:
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    if not hasattr(unwrapped_model, "best_metric"):
-                        unwrapped_model.best_metric = float("inf") if better(0, 1) else float("-inf")
-                        is_best = True
-                    elif better(metric_val, unwrapped_model.best_metric):
-                        is_best = True
-                        unwrapped_model.best_metric = metric_val
+                if metric_val is not None and accelerator.is_local_main_process:
+                    should_save = False
+                    if keep_top_k > 1:
+                        should_save = True  # saver will prune to top-k
+                    else:
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        if not hasattr(unwrapped_model, "best_metric"):
+                            unwrapped_model.best_metric = float("inf") if better(0, 1) else float("-inf")
+                            should_save = True
+                        elif better(metric_val, unwrapped_model.best_metric):
+                            unwrapped_model.best_metric = metric_val
+                            should_save = True
 
-                    if is_best:
-                        accelerator.wait_for_everyone()
+                    if should_save:
                         save_best_model(
                             accelerator, model, optimizer, scheduler, iteration, current_epoch,
-                            unwrapped_model.best_metric, metric_name, val_losses.avg, config, output_dir
+                            float(metric_val), metric_name, val_losses.avg, config, output_dir
                         )
+
+                accelerator.wait_for_everyone()  # keep ranks in sync leaving validation
 
             train_losses.reset()
             for k, meter in train_metrics.items():
