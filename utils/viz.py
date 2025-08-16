@@ -4,8 +4,8 @@ import matplotlib.cm as cm
 import cv2
 import wandb
 
-from loaders.utils.geometry import cam_pc_to_world_pc, world_pc_to_cam_pc
-import loaders.utils.viz as viz_utils
+from utils.geometry import cam_pc_to_world_pc, world_pc_to_cam_pc
+import utils.rerun_viz as rerun_viz  # rerun-based visualizations (moved from loaders/utils/viz.py)
 
 def _normalize_pc_pair_np(pc1, pc2, valid1, valid2):
     """
@@ -407,7 +407,8 @@ def save_visualizations(batch, outputs, base_name, i=0, *args, **kwargs):
         left_img_unnorm, right_img_unnorm,
         right_img_unnorm, left_img_unnorm
     ]
-    # viz_utils.visualize_sequence_from_pms(pms_gt, motion_map_gt, image_seq_gt, name=f"{base}/gt_motions", save=False)
+    # If you want rerun-based sequence viz, use utils.rerun_viz:
+    # rerun_viz.visualize_sequence_from_pms(pms_gt, motion_map_gt, image_seq_gt, name=f"{base}/gt_motions", save=False)
     
     # Pred visualization sequence (add GT validity to pred motions since pred motions are :3)
     pred_l2m_motion_np = np.concatenate((outputs["motion_pred"][k_l2m][i].detach().cpu().numpy(), gt_l2m_motion_np[..., 3:]), axis=-1)
@@ -431,4 +432,4 @@ def save_visualizations(batch, outputs, base_name, i=0, *args, **kwargs):
         pred_r2l_motion_np
     ], axis=0)
     image_seq_pred = image_seq_gt  # Same images for coloring
-    # viz_utils.visualize_sequence_from_pms(pms_pred, motion_map_pred, image_seq_pred, name=f"{base}/pred_motions", save=False)
+    # rerun_viz.visualize_sequence_from_pms(pms_pred, motion_map_pred, image_seq_pred, name=f"{base}/pred_motions", save=False)

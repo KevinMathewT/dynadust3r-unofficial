@@ -42,24 +42,6 @@ def log_training_batch(
     _log(log_dict)
 
 
-def log_interim_validation(
-    iteration, current_epoch, val_losses, val_metrics, config, accelerator
-):
-    """optional mid-epoch val logging"""
-    if not (accelerator.is_local_main_process and config.logging.use_wandb):
-        return
-
-    log_dict = {
-        "iteration": iteration,
-        "epoch": current_epoch,
-        "val_interim_loss": val_losses.avg,
-    }
-
-    for k, meter in val_metrics.items():
-        log_dict[f"val_interim_{k}"] = meter.avg
-
-    _log(log_dict)
-
 
 def log_training_epoch(
     iteration,
@@ -86,24 +68,6 @@ def log_training_epoch(
 
     _log(log_dict)
 
-
-def log_validation_epoch(
-    iteration, current_epoch, val_losses, val_metrics, config, accelerator
-):
-    """log aggregated validation stats once per epoch window"""
-    if not (accelerator.is_local_main_process and config.logging.use_wandb):
-        return
-
-    log_dict = {
-        "iteration": iteration,
-        "epoch": current_epoch,
-        "val_epoch_loss": val_losses.avg,
-    }
-
-    for k, meter in val_metrics.items():
-        log_dict[f"val_epoch_{k}"] = meter.avg
-
-    _log(log_dict)
 
 
 def log_validation_batch(

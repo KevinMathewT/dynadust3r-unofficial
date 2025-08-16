@@ -22,7 +22,7 @@ import argparse
 from pathlib import Path
 
 # Import the geometry utilities
-import loaders.utils.geometry as geo
+import utils.geometry as geo
 
 
 class DataloaderValidator:

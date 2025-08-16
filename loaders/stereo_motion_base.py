@@ -5,8 +5,8 @@ import time
 import torch
 from torch.utils.data import Dataset
 
-import loaders.utils.geometry as geo
-import loaders.utils.geometry_motion as geo_motion
+import utils.geometry as geo
+import utils.geometry as geo_motion
 
 
 class StereoMotionBase(Dataset):
@@ -384,7 +384,7 @@ class StereoMotionBase(Dataset):
         Returns:
             tuple: (cropped_image, cropped_dm, adjusted_cam)
         """
-        import loaders.utils.geometry as geo
+        import utils.geometry as geo
 
         intrinsics, extrinsics = cam  # ((3,3), (4,4))
 

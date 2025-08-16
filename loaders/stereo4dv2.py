@@ -15,7 +15,7 @@ from joblib import Parallel, delayed
 import webdataset as wds, wids  # wds≙reading, wids≙random-access
 
 from .stereo_motion_base import StereoMotionBase
-from .utils import geometry as geom  # has inv()
+import utils.geometry as geom  # has inv()
 
 # -----------------------------------------------------------------------------
 

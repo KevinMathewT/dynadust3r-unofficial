@@ -10,10 +10,8 @@ from tqdm import tqdm
 from joblib import Parallel, delayed
 
 from .stereo_motion_base import StereoMotionBase
-from .utils import (
-    stereo4d_utils as s4u,
-)  # this is stereo4d-code/utils.py (has load_dataset_npz)
-from .utils import geometry as geom
+# removed unused stereo4d_utils import
+import utils.geometry as geom
 
 
 def load_dataset_npz(path):

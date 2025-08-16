@@ -5,12 +5,12 @@ Date: 2025-03-10
 
 import rerun as rr
 import numpy as np
-import loaders.utils.geometry as geo
 from scipy.spatial.transform import Rotation
 
 from PIL import Image
 
-from loaders.utils.geometry import decompose_extrinsics
+import utils.geometry as geo
+from utils.geometry import decompose_extrinsics
 
 IDENTITY_EXTRINSIC = np.hstack((np.eye(3), np.zeros((3, 1))))
 

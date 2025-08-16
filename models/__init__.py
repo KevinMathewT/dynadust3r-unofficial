@@ -1,8 +1,6 @@
-from models.dust3r.model import AsymmetricCroCo3DStereo
 from models.dust3r.dyna_dust3r import DynaDUSt3R
 
 MODELS = {
-    "DUSt3R": AsymmetricCroCo3DStereo,
     "DynaDUSt3R": DynaDUSt3R,
 }
 

@@ -10,7 +10,7 @@ import webdataset as wds, wids
 from decord import VideoReader, cpu
 
 from .stereo_motion_base import StereoMotionBase
-from .utils import geometry as geom
+import utils.geometry as geom
 
 
 class Stereo4Dv5(StereoMotionBase):

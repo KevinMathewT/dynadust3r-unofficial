@@ -43,7 +43,6 @@ yt-dlp = "2024.11.18"
 einops = "^0.8.1"
 hydra-core = "^1.3.2"
 accelerate = "^1.5.2"
-croco = {path = "submodules/croco", develop = true}
 lmdb = "^1.6.2"
 msgpack = "^1.1.0"
 decord = "^0.6.0"

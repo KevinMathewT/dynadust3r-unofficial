@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from .stereo_motion_base import StereoMotionBase
-from .utils import geometry as geom
+import utils.geometry as geom
 
 class PointOdyssey(StereoMotionBase):
     def __init__(self, config, valid=False):

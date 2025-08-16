@@ -26,8 +26,8 @@ from PIL import Image
 
 # local
 from utils.geometry import normalize_pointcloud
-import loaders.utils.geometry as geom
-from loaders.utils.viz import visualize_image, visualize_pm, visualize_sequence_from_pms
+import utils.geometry as geom
+from utils.rerun_viz import visualize_image, visualize_pm, visualize_sequence_from_pms
 from models.croco.croco import CroCoNet  # noqa: F401
 from models.dust3r.utils.heads import head_factory, motion_head_factory
 from models.dust3r.utils.misc import (
@@ -463,7 +463,7 @@ class DynaDUSt3R(
         # 'motion_pred': dict with dynamic keys like "l_to_0.2", "r_to_0.35" etc - motion predictions
         # 'batch_size': integer - batch size for metrics calculation
 
-    def get_loss(self, criterion, batch, outputs):
+    def get_loss(self, batch, outputs):
         """
         Compute total loss with aggressive memory optimization.
         Fixed to match unoptimized version behavior exactly.

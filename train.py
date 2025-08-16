@@ -15,7 +15,6 @@ from datetime import timedelta
 
 from models import get_model
 from loaders import get_loaders
-from criterion import get_criterion
 from optimizer import get_optimizer, get_scheduler
 from utils.train_utils import (
     setup_distributed, init_wandb, save_best_model,
@@ -70,11 +69,10 @@ def main(config: DictConfig):
 
     model                      = get_model(config, accelerator.device)
     train_loader, valid_loader = get_loaders(config)
-    criterion                  = get_criterion(config)
     optimizer                  = get_optimizer(model.parameters(), config)
 
-    model, optimizer, criterion, train_loader, valid_loader = accelerator.prepare(
-        model, optimizer, criterion, train_loader, valid_loader
+    model, optimizer, train_loader, valid_loader = accelerator.prepare(
+        model, optimizer, train_loader, valid_loader
     )
 
     scheduler = get_scheduler(optimizer, config, train_loader)
@@ -103,7 +101,7 @@ def main(config: DictConfig):
 
         # loss in fp32 to avoid nans in some terms
         unwrapped_model = accelerator.unwrap_model(model)
-        loss, loss_details = unwrapped_model.get_loss(criterion, batch, outputs)  # scalar tensor  # (1,)
+        loss, loss_details = unwrapped_model.get_loss(batch, outputs)  # scalar tensor  # (1,)
 
         if loss is None or not isinstance(loss, torch.Tensor):
             loss = torch.zeros(1, requires_grad=True, device=accelerator.device)  # (1,)
@@ -199,7 +197,7 @@ def main(config: DictConfig):
                     val_outputs = model(val_batch)  # (..., ...)
 
                     unwrapped_model = accelerator.unwrap_model(model)
-                    val_loss, val_loss_details = unwrapped_model.get_loss(criterion, val_batch, val_outputs)  # (1,)
+                    val_loss, val_loss_details = unwrapped_model.get_loss(val_batch, val_outputs)  # (1,)
 
                     if val_loss is None or not isinstance(val_loss, torch.Tensor):
                         val_loss = torch.zeros(1, device=accelerator.device)  # (1,)

@@ -154,3 +154,4 @@ def create_point_maps_from_projections(points_3d, u, v, in_bounds, image_shape, 
             point_map[b, tgt_y, tgt_x, 3] = 1.0
     
     return point_map
+

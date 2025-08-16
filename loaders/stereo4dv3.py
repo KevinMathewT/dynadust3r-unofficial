@@ -17,7 +17,7 @@ import webdataset as wds, wids
 import mediapy as media
 
 from .stereo_motion_base import StereoMotionBase
-from .utils import geometry as geom
+import utils.geometry as geom
 
 
 def _load_npy(blob):
