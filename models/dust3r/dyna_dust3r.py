@@ -625,8 +625,17 @@ class DynaDUSt3R(
         Compute loss for a single PC pair matching unoptimized behavior.
         Key fix: Only return confidence loss when available, otherwise return 0.
         """
+        # Always touch prediction (and conf) so parameters participate in the graph
+        # even when no valid pixels on this rank. This avoids DDP desync.
+        zero_attach = (pred_pc[..., :1].sum() * 0.0)
+        if conf is not None:
+            try:
+                zero_attach = zero_attach + (conf[..., :1].sum() * 0.0)
+            except Exception:
+                zero_attach = zero_attach + (conf.sum() * 0.0)
+
         if not valid_mask.any():
-            return torch.zeros(1, device=device, requires_grad=True)
+            return zero_attach
         
         # Normalize full PCs first (like unoptimized)
         gt_pc_norm = gt_pc / gt_scale
@@ -646,10 +655,10 @@ class DynaDUSt3R(
             # conf_valid = conf_valid.squeeze(-1)  
             
             # Compute confidence loss (no clamping to match unoptimized exactly)
-            loss = (l2_dist_valid * conf_valid - alpha * torch.log(conf_valid)).mean()
+            loss = (l2_dist_valid * conf_valid - alpha * torch.log(conf_valid)).mean() + zero_attach
         else:
             # Return 0 when no confidence (matching unoptimized bug/feature)
-            loss = torch.zeros(1, device=device, requires_grad=True)
+            loss = zero_attach
         
         return loss
 
