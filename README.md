@@ -4,7 +4,7 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 
 **Links:** [Stereo4D paper (CVPR 2025)](https://openaccess.thecvf.com/content/CVPR2025/papers/Jin_Stereo4D_Learning_How_Things_Move_in_3D_from_Internet_Stereo_CVPR_2025_paper.pdf) · [arXiv](https://arxiv.org/abs/2412.09621) · [Project page](https://stereo4d.github.io/) · [Processing code](https://github.com/Stereo4d/stereo4d-code)
 
-**Datasets:** [Stereo4D annotations (GCS)](https://console.cloud.google.com/storage/browser/stereo4d) · [Left‑eye perspective (HF)](https://huggingface.co/datasets/KevinMathew/stereo4d-lefteye-perspective) · [Right‑eye perspective (HF)](https://huggingface.co/datasets/KevinMathew/stereo4d-righteye-perspective) *(not used in this training)*
+**Datasets:** [Stereo4D annotations (GCS)](https://console.cloud.google.com/storage/browser/stereo4d) · [Left-eye perspective (HF)](https://huggingface.co/datasets/KevinMathew/stereo4d-lefteye-perspective) · [Right-eye perspective (HF)](https://huggingface.co/datasets/KevinMathew/stereo4d-righteye-perspective) *(not used in this training)*
 
 ---
 
@@ -41,10 +41,16 @@ export TORCH_CUDA_ARCH_LIST="7.5;8.0;9.0+PTX"
 pip install -v --no-build-isolation -e models/croco/curope
 
 # prepare stereo4d shards (see section below)
-python extras/preprocess_stereo4d.py   dataset.stereo4d.path=/data/stereo4d   dataset.stereo4d.lefteye_dir=/data/stereo4d/lefteye-perspective   dataset.stereo4d.meta_dir=/data/stereo4d/meta
+python extras/preprocess_stereo4d.py \
+  dataset.stereo4d.path=/data/stereo4d \
+  dataset.stereo4d.lefteye_dir=/data/stereo4d/lefteye-perspective \
+  dataset.stereo4d.meta_dir=/data/stereo4d/meta
 
 # train (single gpu example)
-python -m train data.loader=stereo4d   dataset.stereo4d.path=/data/stereo4d   dataset.stereo4d.lefteye_dir=/data/stereo4d/lefteye-perspective   dataset.stereo4d.meta_dir=/data/stereo4d/meta
+python -m train data.loader=stereo4d \
+  dataset.stereo4d.path=/data/stereo4d \
+  dataset.stereo4d.lefteye_dir=/data/stereo4d/lefteye-perspective \
+  dataset.stereo4d.meta_dir=/data/stereo4d/meta
 ```
 
 ---
@@ -58,7 +64,7 @@ export TORCH_CUDA_ARCH_LIST="7.5;8.0;9.0+PTX"
 pip install -v --no-build-isolation -e models/croco/curope
 ```
 
-Builds `curope` against your current torch install. Make sure you have a CUDA‑enabled torch and toolkit; adjust `TORCH_CUDA_ARCH_LIST` to match your GPU (e.g., `7.5;8.0;9.0+PTX`).
+Builds `curope` against your current torch install. Make sure you have a CUDA-enabled torch and toolkit; adjust `TORCH_CUDA_ARCH_LIST` to match your GPU (e.g., `7.5;8.0;9.0+PTX`).
 
 ---
 
@@ -66,12 +72,12 @@ Builds `curope` against your current torch install. Make sure you have a CUDA‑
 
 ### stereo4d (required for default runs)
 
-**what it is.** Internet VR180 (stereoscopic) videos processed into per‑frame camera poses, 3D tracks, and rectification. We train on the **left‑eye perspective** clips (512×512 @ ~60° FoV) paired with official `.npz` annotations.
+**what it is.** Internet VR180 (stereoscopic) videos processed into per-frame camera poses, 3D tracks, and rectification. We train on the **left-eye perspective** clips (512×512 @ ~60° FoV) paired with official `.npz` annotations.
 
 #### what you download
 - **annotations (.npz)** from Google Cloud Storage: `gs://stereo4d/{train,test}/*.npz`.
-- **left‑eye perspective mp4s** from Hugging Face: `KevinMathew/stereo4d-lefteye-perspective` (tar archives of **plain mp4s**, not WebDataset). You’ll convert them to WebDataset with our script in `extras/`.
-- **right‑eye perspective mp4s** from Hugging Face: `KevinMathew/stereo4d-righteye-perspective` *(not used in this training, listed for completeness).*
+- **left-eye perspective mp4s** from Hugging Face: `KevinMathew/stereo4d-lefteye-perspective` (tar archives of **plain mp4s**, not WebDataset). You’ll convert them to WebDataset with our script in `extras/`.
+- **right-eye perspective mp4s** from Hugging Face: `KevinMathew/stereo4d-righteye-perspective` *(not used in this training, listed for completeness).*
 
 #### download: annotations (.npz) from GCS
 ```bash
@@ -85,14 +91,14 @@ tar -xf google-cloud-cli-linux-x86_64.tar.gz
 mkdir -p /data/stereo4d/train /data/stereo4d/test
 gcloud storage cp gs://stereo4d/train/CMwZrkhQ0ck_130030030.npz /data/stereo4d/train
 
-# full dataset (mirrors gs://stereo4d under /data/) — multi‑TB
+# full dataset (mirrors gs://stereo4d under /data/) — multi-TB
 gsutil -m cp -R gs://stereo4d /data/
 ```
 
-Each `.npz` contains (clip‑level):  
-`name` (e.g., `<videoid>_<timestamp>`), `video_id`, `timestamps`, `camera2world` (per‑frame), `track_lengths`, `track_indices`, `track_coordinates` (3D tracks), `rectified2rig` (rectification rotation), `fov_bounds` (VR180 intrinsics).
+Each `.npz` contains (clip-level):  
+`name` (e.g., `<videoid>_<timestamp>`), `video_id`, `timestamps`, `camera2world` (per-frame), `track_lengths`, `track_indices`, `track_coordinates` (3D tracks), `rectified2rig` (rectification rotation), `fov_bounds` (VR180 intrinsics).
 
-#### download: left‑eye perspective mp4s from HF
+#### download: left-eye perspective mp4s from HF
 ```bash
 git clone https://huggingface.co/datasets/KevinMathew/stereo4d-lefteye-perspective
 cd stereo4d-lefteye-perspective
@@ -108,7 +114,7 @@ tar -xvf test_mp4s.tar  -C /data/stereo4d/lefteye-perspective/test
 ```
 Files are named like `<videoid>_<timestamp>-left_rectified.mp4`.
 
-#### recommended on‑disk layout (before conversion)
+#### recommended on-disk layout (before conversion)
 ```
 /data/stereo4d/
   ├── train/*.npz
@@ -127,8 +133,8 @@ Files are named like `<videoid>_<timestamp>-left_rectified.mp4`.
 
 ### convert to **webdataset** shards (required for training)
 
-We merge **mp4** (left‑eye perspective) + **npz** annotations per clip into **sequence‑level** WebDataset samples with keys:
-- `video.mp4` — rectified left‑eye video bytes
+We merge **mp4** (left-eye perspective) + **npz** annotations per clip into **sequence-level** WebDataset samples with keys:
+- `video.mp4` — rectified left-eye video bytes
 - `ann.npz` — official annotations for the clip
 - `intr.npy` — 3×3 intrinsics matrix computed from frame width + `hfov` (deg)
 
@@ -147,7 +153,11 @@ Output structure:
 
 ```bash
 # base invocation with hydra overrides for paths
-python extras/preprocess_stereo4d.py   dataset.stereo4d.path=/data/stereo4d   dataset.stereo4d.lefteye_dir=/data/stereo4d/lefteye-perspective   dataset.stereo4d.meta_dir=/data/stereo4d/meta   dataset.stereo4d.hfov=60
+python extras/preprocess_stereo4d.py \
+  dataset.stereo4d.path=/data/stereo4d \
+  dataset.stereo4d.lefteye_dir=/data/stereo4d/lefteye-perspective \
+  dataset.stereo4d.meta_dir=/data/stereo4d/meta \
+  dataset.stereo4d.hfov=60
 ```
 
 **Important knobs (edit at the top of `extras/preprocess_stereo4d.py`):**
@@ -186,10 +196,16 @@ Key knobs:
 
 Override any leaf via CLI:
 ```bash
-python -m train   data.loader=stereo4d   dataset.stereo4d.path=/data/stereo4d   dataset.stereo4d.lefteye_dir=/data/stereo4d/lefteye-perspective   dataset.stereo4d.meta_dir=/data/stereo4d/meta   data.batch_size=4 train.iterations=49000 train.validation_frequency=1000   logging.use_wandb=true
+python -m train \
+  data.loader=stereo4d \
+  dataset.stereo4d.path=/data/stereo4d \
+  dataset.stereo4d.lefteye_dir=/data/stereo4d/lefteye-perspective \
+  dataset.stereo4d.meta_dir=/data/stereo4d/meta \
+  data.batch_size=4 train.iterations=49000 train.validation_frequency=1000 \
+  logging.use_wandb=true
 ```
 
-### multi‑gpu
+### multi-gpu
 ```bash
 # accelerate
 accelerate launch -m train data.loader=stereo4d ...
@@ -204,7 +220,7 @@ sbatch extras/train_dynadust3r.sbatch
 ### checkpoints, logs, viz
 - enable W&B via `logging.use_wandb=true`.
 - periodic visualizations land in the Hydra run dir (`.../valid/...`).
-- top‑K checkpoints are kept under `.../checkpoints/` with metric+value in filename.
+- top-K checkpoints are kept under `.../checkpoints/` with metric+value in filename.
 
 ---
 
@@ -225,4 +241,4 @@ sbatch extras/train_dynadust3r.sbatch
 ---
 
 ## license
-Parts of DUSt3R/CroCo are non‑commercial (CC BY‑NC‑SA 4.0). Check headers under `models/dust3r/*` and `models/croco/*`.
+Parts of DUSt3R/CroCo are non-commercial (CC BY-NC-SA 4.0). Check headers under `models/dust3r/*` and `models/croco/*`.
