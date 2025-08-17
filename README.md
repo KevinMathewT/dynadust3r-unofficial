@@ -2,7 +2,7 @@
 
 Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stereo4D paper details a DynaDUSt3R implementation but does **not** release model weights; this repo recreates that training pipeline based on the paper description and public **DUSt3R** code — for research purposes only.
 
-**Links:** [Stereo4D paper (CVPR 2025)](https://openaccess.thecvf.com/content/CVPR2025/papers/Jin_Stereo4D_Learning_How_Things_Move_in_3D_from_Internet_Stereo_CVPR_2025_paper.pdf) · [arXiv](https://arxiv.org/abs/2412.09621) · [Project page](https://stereo4d.github.io/) · [Processing code](https://github.com/Stereo4d/stereo4d-code) · [DUSt3R paper (CVPR 2024)](https://openaccess.thecvf.com/content/CVPR2024/papers/Wang_DUSt3R_Geometric_3D_Vision_Made_Easy_CVPR_2024_paper.pdf) · [DUSt3R GitHub](https://github.com/naver/dust3r)
+**Links:** [Stereo4D paper (CVPR 2025)](https://openaccess.thecvf.com/content/CVPR2025/papers/Jin_Stereo4D_Learning_How_Things_Move_in_3D_from_Internet_Stereo_CVPR_2025_paper.pdf) · [arXiv](https://arxiv.org/abs/2412.09621) · [Project page](https://stereo4d.github.io/) · [Processing code](https://github.com/Stereo4d/stereo4d-code)
 
 **Datasets:** [Stereo4D annotations (GCS)](https://console.cloud.google.com/storage/browser/stereo4d) · [Left‑eye perspective (HF)](https://huggingface.co/datasets/KevinMathew/stereo4d-lefteye-perspective) · [Right‑eye perspective (HF)](https://huggingface.co/datasets/KevinMathew/stereo4d-righteye-perspective) *(not used in this training)*
 
