@@ -1,3 +1,9 @@
+"""
+Author: Kevin Mathew T
+Date: 2025-08-17
+LinkedIn: https://www.linkedin.com/in/kevinmathewt/
+"""
+
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate

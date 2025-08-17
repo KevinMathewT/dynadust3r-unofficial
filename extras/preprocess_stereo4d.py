@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+Author: Kevin Mathew T
+Date: 2025-08-17
+LinkedIn: https://www.linkedin.com/in/kevinmathewt/
+
 preprocess_stereo4d.py
 ----------------------
 NEW LAYOUT (sequence-level samples)
@@ -9,6 +13,7 @@ The rest of the pipeline (indexing, benchmarking) is kept identical,
 except the benchmark now uses `seqs` directly instead of regenerating
 keys from the index.
 """
+
 
 from __future__ import annotations
 import os

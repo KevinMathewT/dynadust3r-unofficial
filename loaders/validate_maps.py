@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+Author: Kevin Mathew T
+Date: 2025-08-17
+LinkedIn: https://www.linkedin.com/in/kevinmathewt/
+
 Validation script for stereo motion dataloader outputs.
 Verifies that point maps and motion maps satisfy coordinate frame constraints.
 

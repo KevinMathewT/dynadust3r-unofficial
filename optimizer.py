@@ -1,3 +1,9 @@
+"""
+Author: Kevin Mathew T
+Date: 2025-08-17
+LinkedIn: https://www.linkedin.com/in/kevinmathewt/
+"""
+
 import math
 from torch.optim import Adam, AdamW, SGD, RMSprop
 from torch.optim.lr_scheduler import (

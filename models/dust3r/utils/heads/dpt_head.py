@@ -1,6 +1,12 @@
 # Copyright (C) 2024-present Naver Corporation. All rights reserved.
 # Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
 #
+"""
+Author: Kevin Mathew T
+Date: 2025-08-17
+LinkedIn: https://www.linkedin.com/in/kevinmathewt/
+"""
+
 # --------------------------------------------------------
 # dpt head implementation for DUST3R
 # Downstream heads assume inputs of size B x N x C (where N is the number of tokens) ;

@@ -1,3 +1,9 @@
+"""
+Author: Kevin Mathew T
+Date: 2025-08-17
+LinkedIn: https://www.linkedin.com/in/kevinmathewt/
+"""
+
 from models.dust3r.dyna_dust3r import DynaDUSt3R
 
 MODELS = {

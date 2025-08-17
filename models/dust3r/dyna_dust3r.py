@@ -1,6 +1,12 @@
 # Copyright (C) 2024-present Naver Corporation. All rights reserved.
 # Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
 #
+"""
+Author: Kevin Mathew T
+Date: 2025-08-17
+LinkedIn: https://www.linkedin.com/in/kevinmathewt/
+"""
+
 # --------------------------------------------------------
 # DynaDUSt3R model class - extends DUSt3R with motion prediction
 # --------------------------------------------------------

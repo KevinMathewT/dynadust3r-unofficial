@@ -1,6 +1,13 @@
 # Copyright (C) 2022-present Naver Corporation. All rights reserved.
 # Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
 
+"""
+Author: Kevin Mathew T
+Date: 2025-08-17
+LinkedIn: https://www.linkedin.com/in/kevinmathewt/
+"""
+
+
 
 # --------------------------------------------------------
 # Main encoder/decoder blocks
@@ -238,4 +245,3 @@ class PatchEmbed(nn.Module):
     def _init_weights(self):
         w = self.proj.weight.data
         torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1])) 
-

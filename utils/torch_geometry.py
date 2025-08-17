@@ -1,6 +1,7 @@
 """
-Author: DynaDUSt3R Project
-Date: 2025-04-12
+Author: Kevin Mathew T
+Date: 2025-08-17
+LinkedIn: https://www.linkedin.com/in/kevinmathewt/
 """
 
 import torch
@@ -154,4 +155,3 @@ def create_point_maps_from_projections(points_3d, u, v, in_bounds, image_shape, 
             point_map[b, tgt_y, tgt_x, 3] = 1.0
     
     return point_map
-

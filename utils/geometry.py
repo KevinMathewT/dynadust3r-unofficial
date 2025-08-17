@@ -1,78 +1,73 @@
 """
-Minimal geometry utilities needed by the training pipeline.
+Author: Kevin Mathew T
+Date: 2025-08-17
+LinkedIn: https://www.linkedin.com/in/kevinmathewt/
+
+Geometry and camera utilities for stereo and motion learning.
+
+This module centralizes a broad set of geometry helpers used across the
+training and evaluation pipeline. It focuses on lightweight, explicit
+operations that map cleanly to common computer vision conventions
+without hiding important semantics. The functions are intentionally
+minimal and composable so they can be applied to large WebDataset-driven
+workloads and multi‑GPU training without unnecessary overhead.
+
+What this module provides
+- Coordinate transforms:
+  - World ↔ Camera conversions using standard 4x4 or 3x4 extrinsics
+    where extrinsics encode world→cam (P_c = R P_w + t).
+  - Depth map to point cloud conversions in camera/world frames.
+  - Point map creation where per‑pixel XYZ lives in a chosen reference
+    camera while pixels index a source image (useful for stereo).
+
+- Projection helpers:
+  - Project 3D points to image plane via intrinsics with proper handling
+    of visibility (z > 0) and image bounds checks.
+
+- Motion map construction:
+  - Direct 3D motion in a chosen reference frame for pairs of frames
+    (e.g., left→mid, right→mid, left→right, right→left), stored sparsely
+    at the projection locations of source points.
+
+- Camera intrinsics updates under image transforms:
+  - Crop/resize utilities that keep intrinsics consistent when images are
+    cropped or rescaled, preserving geometric correctness.
+
+Design assumptions and conventions
+- Extrinsics are world→cam. Inverting a 3x4 [R|t] or 4x4 pose recovers
+  cam→world when needed.
+- Depth values are measured along the optical z axis in camera space.
+- Validity masks (stored in the last channel for point/motion maps) are
+  1 for valid and 0 for invalid.
+- Numpy is used for CPU paths and Torch for GPU‑friendly tensor paths; we
+  avoid mixing without explicit conversion.
+
+Numerical safety notes
+- Projections skip points with non‑positive or non‑finite depth to avoid
+  division errors and NaNs.
+- Bounds checks are applied before writing into image‑shaped outputs.
+
+Performance notes
+- Functions are written to minimize temporary allocations and to permit
+  batched execution in data loaders. Where appropriate, vectorized numpy
+  or torch operations are preferred over Python loops.
+
+This file intentionally avoids any side effects beyond importing standard
+libraries. Callers are expected to manage devices, dtypes, and casting
+explicitly when moving between numpy and torch tensors.
 """
+
+# Standard imports are centralized here to keep the module import order
+# clear and to avoid scattered imports throughout the file.
+import sys as _sys
+import numpy as np
 import torch
+import cv2
+from PIL import Image
+from scipy.spatial.transform import Rotation
 
 from utils.misc import invalid_to_zeros, invalid_to_nans
 
-
-def normalize_pointcloud(pts1, pts2, norm_mode='avg_dis', valid1=None, valid2=None, ret_factor=False):
-    """ renorm pointmaps pts1, pts2 with norm_mode
-    """
-    assert pts1.ndim >= 3 and pts1.shape[-1] == 3
-    assert pts2 is None or (pts2.ndim >= 3 and pts2.shape[-1] == 3)
-    norm_mode, dis_mode = norm_mode.split('_')
-
-    if norm_mode == 'avg':
-        # gather all points together (joint normalization)
-        nan_pts1, nnz1 = invalid_to_zeros(pts1, valid1, ndim=3)
-        nan_pts2, nnz2 = invalid_to_zeros(pts2, valid2, ndim=3) if pts2 is not None else (None, 0)
-        all_pts = torch.cat((nan_pts1, nan_pts2), dim=1) if pts2 is not None else nan_pts1
-
-        # compute distance to origin
-        all_dis = all_pts.norm(dim=-1)
-        if dis_mode == 'dis':
-            pass  # do nothing
-        elif dis_mode == 'log1p':
-            all_dis = torch.log1p(all_dis)
-        elif dis_mode == 'warp-log1p':
-            # actually warp input points before normalizing them
-            log_dis = torch.log1p(all_dis)
-            warp_factor = log_dis / all_dis.clip(min=1e-8)
-            H1, W1 = pts1.shape[1:-1]
-            pts1 = pts1 * warp_factor[:, :W1 * H1].view(-1, H1, W1, 1)
-            if pts2 is not None:
-                H2, W2 = pts2.shape[1:-1]
-                pts2 = pts2 * warp_factor[:, W1 * H1:].view(-1, H2, W2, 1)
-            all_dis = log_dis  # this is their true distance afterwards
-        else:
-            raise ValueError(f'bad {dis_mode=}')
-
-        norm_factor = all_dis.sum(dim=1) / (nnz1 + nnz2 + 1e-8)
-    else:
-        # gather all points together (joint normalization)
-        nan_pts1 = invalid_to_nans(pts1, valid1, ndim=3)
-        nan_pts2 = invalid_to_nans(pts2, valid2, ndim=3) if pts2 is not None else None
-        all_pts = torch.cat((nan_pts1, nan_pts2), dim=1) if pts2 is not None else nan_pts1
-
-        # compute distance to origin
-        all_dis = all_pts.norm(dim=-1)
-
-        if norm_mode == 'avg':
-            norm_factor = all_dis.nanmean(dim=1)
-        elif norm_mode == 'median':
-            norm_factor = all_dis.nanmedian(dim=1).values.detach()
-        elif norm_mode == 'sqrt':
-            norm_factor = all_dis.sqrt().nanmean(dim=1)**2
-        else:
-            raise ValueError(f'bad {norm_mode=}')
-
-    norm_factor = norm_factor.clip(min=1e-8)
-    while norm_factor.ndim < pts1.ndim:
-        norm_factor.unsqueeze_(-1)
-
-    res = pts1 / norm_factor
-    if pts2 is not None:
-        res = (res, pts2 / norm_factor)
-    if ret_factor:
-        res = res + (norm_factor,)
-    return res
-
-"""
-Motion computation utilities with clearer semantics.
-"""
-import numpy as np
-import sys as _sys
 # self-alias so calls to geo.* refer to functions in this module
 geo = _sys.modules[__name__]
 
@@ -212,12 +207,7 @@ Author: Kevin Mathew T
 Date: 2025-03-10
 """
 
-import cv2
-import torch
-import numpy as np
-from PIL import Image
-
-from scipy.spatial.transform import Rotation
+ 
 
 
 def inv(mat):
@@ -1069,3 +1059,66 @@ def bbox_from_intrinsics_in_out(input_intrinsics, output_intrinsics, output_reso
     crop_bbox = (l, t, l + out_width, t + out_height)  # (l, t, r, b)
 
     return crop_bbox
+
+
+def normalize_pointcloud(pts1, pts2, norm_mode='avg_dis', valid1=None, valid2=None, ret_factor=False):
+    """ renorm pointmaps pts1, pts2 with norm_mode
+    """
+    assert pts1.ndim >= 3 and pts1.shape[-1] == 3
+    assert pts2 is None or (pts2.ndim >= 3 and pts2.shape[-1] == 3)
+    norm_mode, dis_mode = norm_mode.split('_')
+
+    if norm_mode == 'avg':
+        # gather all points together (joint normalization)
+        nan_pts1, nnz1 = invalid_to_zeros(pts1, valid1, ndim=3)
+        nan_pts2, nnz2 = invalid_to_zeros(pts2, valid2, ndim=3) if pts2 is not None else (None, 0)
+        all_pts = torch.cat((nan_pts1, nan_pts2), dim=1) if pts2 is not None else nan_pts1
+
+        # compute distance to origin
+        all_dis = all_pts.norm(dim=-1)
+        if dis_mode == 'dis':
+            pass  # do nothing
+        elif dis_mode == 'log1p':
+            all_dis = torch.log1p(all_dis)
+        elif dis_mode == 'warp-log1p':
+            # actually warp input points before normalizing them
+            log_dis = torch.log1p(all_dis)
+            warp_factor = log_dis / all_dis.clip(min=1e-8)
+            H1, W1 = pts1.shape[1:-1]
+            pts1 = pts1 * warp_factor[:, :W1 * H1].view(-1, H1, W1, 1)
+            if pts2 is not None:
+                H2, W2 = pts2.shape[1:-1]
+                pts2 = pts2 * warp_factor[:, W1 * H1:].view(-1, H2, W2, 1)
+            all_dis = log_dis  # this is their true distance afterwards
+        else:
+            raise ValueError(f'bad {dis_mode=}')
+
+        norm_factor = all_dis.sum(dim=1) / (nnz1 + nnz2 + 1e-8)
+    else:
+        # gather all points together (joint normalization)
+        nan_pts1 = invalid_to_nans(pts1, valid1, ndim=3)
+        nan_pts2 = invalid_to_nans(pts2, valid2, ndim=3) if pts2 is not None else None
+        all_pts = torch.cat((nan_pts1, nan_pts2), dim=1) if pts2 is not None else nan_pts1
+
+        # compute distance to origin
+        all_dis = all_pts.norm(dim=-1)
+
+        if norm_mode == 'avg':
+            norm_factor = all_dis.nanmean(dim=1)
+        elif norm_mode == 'median':
+            norm_factor = all_dis.nanmedian(dim=1).values.detach()
+        elif norm_mode == 'sqrt':
+            norm_factor = all_dis.sqrt().nanmean(dim=1)**2
+        else:
+            raise ValueError(f'bad {norm_mode=}')
+
+    norm_factor = norm_factor.clip(min=1e-8)
+    while norm_factor.ndim < pts1.ndim:
+        norm_factor.unsqueeze_(-1)
+
+    res = pts1 / norm_factor
+    if pts2 is not None:
+        res = (res, pts2 / norm_factor)
+    if ret_factor:
+        res = res + (norm_factor,)
+    return res
