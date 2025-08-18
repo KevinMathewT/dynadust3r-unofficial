@@ -1,4 +1,4 @@
-# DynaDUSt3R (from Stereo4D)
+# DynaDUSt3R
 
 Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stereo4D paper details a DynaDUSt3R implementation but does **not** release model weights; this repo recreates that training pipeline based on the paper description and public **DUSt3R** code — for research purposes only.
 
