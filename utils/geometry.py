@@ -578,6 +578,7 @@ def create_pm_in_ref_frame(world_pc, validity, cam_source, cam_reference,
                 in_bounds = (u >= 0) & (u < w) & (v >= 0) & (v < h)
                 u = u[in_bounds]
                 v = v[in_bounds]
+                z = z[in_bounds]  # keep z aligned with u/v
                 valid_cam_pc_ref = valid_cam_pc_ref[in_bounds]
                 
                 # Handle potential duplicate projections by keeping the closest point

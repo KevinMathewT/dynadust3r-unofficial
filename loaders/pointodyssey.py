@@ -7,193 +7,200 @@ LinkedIn: https://www.linkedin.com/in/kevinmathewt/
 import os
 import cv2
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .stereo_motion_base import StereoMotionBase
 import utils.geometry as geom
 
+
 class PointOdyssey(StereoMotionBase):
-    def __init__(self, config, valid=False):
+    def __init__(self, config, valid: bool = False, time_debug: bool = False):
         """
-        PointOdyssey dataset implementation
-        
-        Args:
-            config: Configuration object containing dataset parameters
+        pointodyssey dataset implementation
         """
-        super().__init__(config)
+        super().__init__(config, valid, time_debug)
         print("loading pointodyssey dataset...")
 
         self.dataset_label = config.dataset.pointodyssey.name
         self.dataset_location = config.dataset.pointodyssey.path
         self.max_frame_window = config.dataset.pointodyssey.max_frame_window
-        
-        # dataset-specific parames
-        if not valid:
-            self.split = config.dataset.pointodyssey.train_split
-        else:
-            self.split = config.dataset.pointodyssey.valid_split
-        
-        # init sequence paths
+
+        self.split = (
+            config.dataset.pointodyssey.valid_split if valid
+            else config.dataset.pointodyssey.train_split
+        )
+
         split_dir = os.path.join(self.dataset_location, self.split)
         if not os.path.exists(split_dir):
-            raise ValueError(f"Dataset split directory not found: {split_dir}")
-        
-        for item in os.listdir(split_dir):
+            raise ValueError(f"dataset split directory not found: {split_dir}")
+
+        # collect sequences that have the expected structure
+        for item in sorted(os.listdir(split_dir)):
             seq_path = os.path.join(split_dir, item)
-            if os.path.isdir(seq_path) and \
-               os.path.exists(os.path.join(seq_path, "rgbs")) and \
-               os.path.exists(os.path.join(seq_path, "depths")) and \
-               os.path.exists(os.path.join(seq_path, "anno.npz")):
+            if (
+                os.path.isdir(seq_path)
+                and os.path.exists(os.path.join(seq_path, "rgbs"))
+                and os.path.exists(os.path.join(seq_path, "depths"))
+                and os.path.exists(os.path.join(seq_path, "anno.npz"))
+            ):
                 self.sequence_paths.append(seq_path)
-        
-        # count frames in each sequence
+
+        # count frames by enumerating jpgs (sorted numerically)
         self.frame_counts = []
         for seq_path in self.sequence_paths:
             rgb_dir = os.path.join(seq_path, "rgbs")
-            rgb_files = [f for f in os.listdir(rgb_dir) if f.endswith(".jpg")]
-            self.frame_counts.append(len(rgb_files))
-        
-        # compute triplets
+            jpgs = [f for f in os.listdir(rgb_dir) if f.endswith(".jpg")]
+            if not jpgs:
+                self.frame_counts.append(0)
+                continue
+            # ensure numeric sort in case of varying zero-padding
+            jpgs.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
+            self.frame_counts.append(len(jpgs))
+
+        # precompute triplets in the base
         self._compute_triplets()
 
-    def get_frame_info(self, sequence_path, frame_index):
-        """
-        Get information for a specific frame with consistent cropping
-        
-        Args:
-            sequence_path: Path to the sequence directory
-            frame_index: Frame index
-            
-        Returns:
-            Dictionary containing frame information
-        """
-        image = cv2.imread(f"{sequence_path}/rgbs/rgb_{frame_index:05d}.jpg")[:, :, ::-1]  # (H, W, 3)
-        dm_16bit = cv2.imread(
-            f"{sequence_path}/depths/depth_{frame_index:05d}.png", cv2.IMREAD_ANYDEPTH
-        )  # (H, W)
-        dm = dm_16bit.astype(np.float32) / 65535.0 * 1000.0 # convert to float depths # (H, W)
+    # ------------------------- file helpers -------------------------
 
-        annotations = np.load(f"{sequence_path}/anno.npz", allow_pickle=True)
-        intrinsics = annotations["intrinsics"][frame_index]  # (3, 3)
-        extrinsics = annotations["extrinsics"][frame_index]  # (4, 4)
-        cam = (intrinsics, extrinsics) # ((3,3), (4,4))
-        world_pc = annotations["trajs_3d"][frame_index]  # (N, 3)
-        validity = annotations["visibs"][frame_index][..., np.newaxis]  # (N, 1)
-        # validity = annotations["valids"][frame_index][..., np.newaxis]  # (N, 1)
-        world_pc_valid = np.concatenate([world_pc, validity], axis=1)  # (N, 4)
-        
+    @staticmethod
+    def _rgb_path(sequence_path: str, idx: int) -> str:
+        return f"{sequence_path}/rgbs/rgb_{idx:05d}.jpg"
 
+    @staticmethod
+    def _depth_path(sequence_path: str, idx: int) -> str:
+        return f"{sequence_path}/depths/depth_{idx:05d}.png"
+
+    @staticmethod
+    def _read_rgb_bgr_to_rgb(path: str) -> np.ndarray:
+        img_bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            raise FileNotFoundError(f"missing image: {path}")
+        return img_bgr[:, :, ::-1]  # (H, W, 3)  bgr->rgb view  # (H, W, 3)
+
+    @staticmethod
+    def _read_depth_to_meters(path: str) -> np.ndarray:
+        dm_u16 = cv2.imread(path, cv2.IMREAD_ANYDEPTH)
+        if dm_u16 is None:
+            raise FileNotFoundError(f"missing depth: {path}")
+        dm = dm_u16.astype(np.float32) / 65535.0 * 1000.0  # dataset-specific scaling  # (H, W)
+        return dm
+
+    # ------------------------- single frame api -------------------------
+
+    def get_frame_info(self, sequence_path: str, frame_index: int):
+        """
+        returns a single frame pack  # image: (H, W, 3), world_pc_valid: (N, 4)
+        """
+        # io
+        image = self._read_rgb_bgr_to_rgb(self._rgb_path(sequence_path, frame_index))  # (H, W, 3)
+        dm = self._read_depth_to_meters(self._depth_path(sequence_path, frame_index))  # (H, W)
+
+        # annotations
+        ann = np.load(f"{sequence_path}/anno.npz", allow_pickle=True, mmap_mode="r")
+        intrinsics = ann["intrinsics"][frame_index]       # (3, 3)
+        extrinsics = ann["extrinsics"][frame_index]       # (4, 4)
+        cam = (intrinsics, extrinsics)                    # ((3,3), (4,4))
+
+        world_pc = ann["trajs_3d"][frame_index]           # (N, 3)
+        visibs = ann["visibs"] if "visibs" in ann.files else ann["valids"]
+        validity = visibs[frame_index][..., None].astype(np.float32)  # (N, 1)
+        world_pc_valid = np.concatenate([world_pc, validity], axis=1).astype(np.float32)  # (N, 4)
+
+        # optional crop
         if self.config.data.crop:
-            output_resolution = (self.config.data.size, self.config.data.size)  # (W, H)
-            image, dm, cam = self.crop_data(image, dm, cam, output_resolution) # apply cropping
-        
+            out_res = (self.config.data.size, self.config.data.size)  # (W, H)
+            image, dm, cam = self.crop_data(image, dm, cam, out_res)  # apply cropping
+
         return {
-            "image": image,  # (H, W, 3)
-            "world_pc_valid": world_pc_valid,  # (N, 4) scaled by factor "scale"
-            "cam": cam,  # ((3, 3), (4, 4) homogeneous)
-            "dm": dm,  # convert to meters, (H, W)
-            "instance": os.path.split(f"{sequence_path}/rgbs/rgb_{frame_index:05d}.jpg")[1] # string
+            "image": image,                        # (H, W, 3)
+            "world_pc_valid": world_pc_valid,      # (N, 4)
+            "cam": cam,                             # ((3, 3), (4, 4))
+            "dm": dm,                               # (H, W)
+            "instance": os.path.split(self._rgb_path(sequence_path, frame_index))[1],  # string
         }
 
+    # ------------------------- multi-frame api -------------------------
 
-import hydra
-from omegaconf import DictConfig, open_dict
+    def get_frame_infos(self, sequence_path: str, idxs: list[int]):
+        """
+        ultra-optimized multi-frame fetch from a single sequence.
+        minimizes disk seeks, batches io with threads, and vectorizes ann access.
 
-# usage: 
-# python -m loaders.pointodyssey dataset.pointodyssey.split=sample
-# python -m loaders.pointodyssey dataset.pointodyssey.split=sample dataset.pointodyssey.max_frame_window=30
-@hydra.main(version_base=None, config_path="../config", config_name="config")
-def main(config: DictConfig):
-    import torch
-    import loaders.utils.viz as viz
-    
-    # create dataset instance with 3d tracks
-    with open_dict(config):
-        config.dataset.pointodyssey.pm_source = "dm"
-    
-    dataset_tracks = PointOdyssey(config)
-    print(f"total triplets: {len(dataset_tracks)}")
-    
-    for sample_idx in range(20, 30):
-        sample_tracks = dataset_tracks[sample_idx]
+        returns: list[dict] in the same order as idxs
+        """
+        if not idxs:
+            return []
 
-        # print basic info about the triplet
-        print(f"triplet frames: idxs={sample_tracks['idxs']}")
-        print("------------------------")
-        for k, v in sample_tracks.items():
-            if isinstance(v, torch.Tensor):
-                print(k, v.size(), v.dtype)
-            else:
-                print(k)
+        # sort indices to promote sequential disk access, track inverse permutation
+        idxs_np = np.asarray(idxs, dtype=np.int32)                    # (F,)
+        order = np.argsort(idxs_np)                                   # (F,)
+        rev = np.empty_like(order)
+        rev[order] = np.arange(order.size)
+        idxs_sorted = idxs_np[order]
 
-        # prepare point maps and images for visualization
-        track_pms = np.array(
-            [sample_tracks["left_pm"], sample_tracks["mid_pm"], sample_tracks["right_pm"]]
-        )
+        # load annotations once (mmap to reduce peak rss)
+        ann = np.load(f"{sequence_path}/anno.npz", allow_pickle=True, mmap_mode="r")
+        intr_all = ann["intrinsics"]                                  # (T, 3, 3)
+        extr_all = ann["extrinsics"]                                  # (T, 4, 4)
+        trajs_all = ann["trajs_3d"]                                   # (T, Ni, 3) variable Ni
+        visibs_all = ann["visibs"] if "visibs" in ann.files else ann["valids"]  # (T, Ni)
 
-        c1 = sample_tracks["cam"]   # or sample_tracks["cam"]
-        c2 = sample_tracks["cam_mid"]
-        c3 = sample_tracks["cam_right"]
+        # parallel image & depth reads (io-bound)
+        def _load_pair(fid: int):
+            rgb = self._read_rgb_bgr_to_rgb(self._rgb_path(sequence_path, fid))      # (H, W, 3)
+            dm = self._read_depth_to_meters(self._depth_path(sequence_path, fid))    # (H, W)
+            return fid, rgb, dm
 
-        img_l = sample_tracks["left_image"].permute(1,2,0).numpy()
-        img_m = sample_tracks["mid_image"].permute(1,2,0).numpy()
-        img_r = sample_tracks["right_image"].permute(1,2,0).numpy()
+        max_workers = min(8, max(1, (os.cpu_count() or 4) // 2), len(idxs_sorted))
+        rgb_sorted = [None] * len(idxs_sorted)
+        dm_sorted = [None] * len(idxs_sorted)
 
-        images = [
-            img_l,
-            geom.recolor(track_pms[1], c1, c2, img_m),
-            geom.recolor(track_pms[2], c1, c3, img_r),
-        ]
+        if max_workers > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = [ex.submit(_load_pair, int(fid)) for fid in idxs_sorted]
+                for fut in as_completed(futs):
+                    fid, rgb, dm = fut.result()
+                    j = int(np.searchsorted(idxs_sorted, fid))  # idxs_sorted is sorted
+                    rgb_sorted[j] = rgb
+                    dm_sorted[j] = dm
+        else:
+            for j, fid in enumerate(idxs_sorted):
+                rgb, dm = self._read_rgb_bgr_to_rgb(self._rgb_path(sequence_path, int(fid))), \
+                          self._read_depth_to_meters(self._depth_path(sequence_path, int(fid)))
+                rgb_sorted[j] = rgb
+                dm_sorted[j] = dm
 
-        viz.visualize_image(
-            sample_tracks["left_image"].permute(1, 2, 0).numpy(), name="left_image"
-        )
-        # viz.visualize_dm(sample_tracks['left_dm'], name="left_dm")
-        viz.visualize_image(
-            sample_tracks["mid_image"].permute(1, 2, 0).numpy(), name="mid_image"
-        )
-        # viz.visualize_dm(sample_tracks['mid_dm'], name="mid_dm")
-        viz.visualize_image(
-            sample_tracks["right_image"].permute(1, 2, 0).numpy(), name="right_image"
-        )
-        # viz.visualize_dm(sample_tracks['right_dm'], name="right_dm")
+        # unsort to original order
+        rgbs = [rgb_sorted[k] for k in rev]                            # list[(H, W, 3)]
+        dms = [dm_sorted[k] for k in rev]                              # list[(H, W)]
 
-        viz.visualize_pm(
-            track_pms[0], image=images[0], cam=sample_tracks["cam"], name="left_pm"
-        )
-        viz.visualize_pm(track_pms[1], image=images[1], cam=sample_tracks["cam"], name="mid_pm")
-        viz.visualize_pm(
-            track_pms[2], image=images[2], cam=sample_tracks["cam"], name="right_pm"
-        )
+        # gather per-frame ann with vectorized indexing where possible
+        intr_batch = intr_all[idxs_np]                                 # (F, 3, 3)
+        extr_batch = extr_all[idxs_np]                                 # (F, 4, 4)
 
-        # prepare motion maps
-        left_to_mid = sample_tracks["left_to_mid_motion"]
-        right_to_mid = sample_tracks["right_to_mid_motion"]
+        # package outputs
+        results = [None] * len(idxs)
+        for j, fidx in enumerate(idxs_np):
+            world_pc = trajs_all[int(fidx)]                            # (N, 3)
+            validity = visibs_all[int(fidx)][..., None].astype(np.float32)  # (N, 1)
+            world_pc_valid = np.concatenate([world_pc, validity], axis=1).astype(np.float32)  # (N, 4)
 
-        # create single-step motion maps for each visualization
-        h, w, _ = sample_tracks["left_pm"].shape
+            cam = (intr_batch[j], extr_batch[j])                      # ((3,3), (4,4))
 
-        # 1. tracks + left_to_mid
-        left_to_mid_map = np.zeros((1, h, w, 4), dtype=np.float32)
-        left_to_mid_map[0] = left_to_mid
+            img = rgbs[j]
+            dm = dms[j]
 
-        # 2. tracks + right_to_mid
-        right_to_mid_map = np.zeros((1, h, w, 4), dtype=np.float32)
-        right_to_mid_map[0] = right_to_mid
+            # optional crop per-frame (kept here to preserve correctness of intrinsics)
+            if self.config.data.crop:
+                out_res = (self.config.data.size, self.config.data.size)  # (W, H)
+                img, dm, cam = self.crop_data(img, dm, cam, out_res)
 
-        viz.visualize_sequence_from_pms(
-            track_pms[:2],  # just left and mid for left_to_mid
-            left_to_mid_map,
-            images[:2],
-            name="tracksl",
-        )
+            results[j] = {
+                "image": img,                         # (H, W, 3)
+                "world_pc_valid": world_pc_valid,     # (N, 4)
+                "cam": cam,                            # ((3, 3), (4, 4))
+                "dm": dm,                              # (H, W)
+                "instance": os.path.split(self._rgb_path(sequence_path, int(fidx)))[1],  # string
+            }
 
-        viz.visualize_sequence_from_pms(
-            np.array([track_pms[2], track_pms[1]]),  # right and mid for right_to_mid
-            right_to_mid_map,
-            [images[2], images[1]],
-            name="tracksr",
-        )
-
-
-if __name__ == "__main__":
-    main()
+        return results

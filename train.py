@@ -47,13 +47,18 @@ def get_cycled_batches(dataloader, accelerator, total_iterations):
 @hydra.main(version_base=None, config_path="config", config_name="config")
 def main(config: DictConfig):
 
-    # tiny debug dataset
-    # config.data.len        = 1
-    # config.data.valid_len  = 1
-
-    # align dataset sizes with training plan
-    config.data.len       = config.train.iterations * config.data.batch_size
-    config.data.valid_len = config.data.valid_len * config.data.batch_size
+    if config.debug:
+        # overfitting experiment on tiny debug dataset
+        config.data.len                   = 1
+        config.data.valid_len             = 1
+        config.data.batch_size            = 1
+        config.train.validation_frequency = 1
+        train_viz_interval                = 5
+    else:
+        # align dataset sizes with training plan
+        config.data.len                   = config.train.iterations * config.data.batch_size
+        config.data.valid_len             = config.data.valid_len * config.data.batch_size
+        train_viz_interval                = 250
 
     setup_distributed(config.seed)
     is_main = (not torch.distributed.is_initialized() or
@@ -165,11 +170,12 @@ def main(config: DictConfig):
                 iteration, current_epoch, loss.item(), lr, loss_details, train_metrics, config, accelerator
             )
 
-        if iteration % 250 == 0 and accelerator.is_local_main_process:
+        if iteration % train_viz_interval == 0 and accelerator.is_local_main_process:
             unwrapped_model = accelerator.unwrap_model(model)
             base_name = f"t_e_{current_epoch}_b_{iteration}"
             unwrapped_model.save_visualizations(batch, outputs, base_name)  # imgs/grids  # (B,H,W,3)
-        if iteration % 250 == 0:
+
+        if iteration % train_viz_interval == 0:
             accelerator.wait_for_everyone()  # barrier after rank-0 training viz
 
         # validation

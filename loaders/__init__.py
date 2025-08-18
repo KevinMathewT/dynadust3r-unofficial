@@ -10,18 +10,12 @@ from torch.utils.data._utils.collate import default_collate
 
 from loaders.pointodyssey import PointOdyssey
 from loaders.stereo4d import Stereo4D
-from loaders.stereo4dv2 import Stereo4Dv2
-from loaders.stereo4dv3 import Stereo4Dv3
-from loaders.stereo4dv4 import Stereo4Dv4
-from loaders.stereo4dv5 import Stereo4Dv5
+from loaders.stereo4d_wds import Stereo4DWDS
 
 LOADERS = {
     "pointodyssey": PointOdyssey,
     # "stereo4d": Stereo4D,
-    # "stereo4d": Stereo4Dv2,
-    # "stereo4d": Stereo4Dv3,
-    # "stereo4d": Stereo4Dv4,
-    "stereo4d": Stereo4Dv5,
+    "stereo4d": Stereo4DWDS,
 }
 
 def add_batch_size_wrapper(batch):

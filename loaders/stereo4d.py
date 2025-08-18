@@ -1,315 +1,283 @@
-"""
-Author: Kevin Mathew T
-Date: 2025-08-17
-LinkedIn: https://www.linkedin.com/in/kevinmathewt/
-"""
+# stereo4dv6.py
 
-import os
+import os, io, time
+from pathlib import Path
+from typing import List, Dict, Tuple
+
 import cv2
 import numpy as np
-from tqdm import tqdm
-from joblib import Parallel, delayed
+import pandas as pd
+from decord import VideoReader, cpu
 
 from .stereo_motion_base import StereoMotionBase
-# removed unused stereo4d_utils import
 import utils.geometry as geom
 
 
-def load_dataset_npz(path):
-    """
-    Load npz via memory-map, returning only the fields needed for Stereo4D:
-      - track_lengths
-      - track_indices
-      - track_coordinates
-      - camera2world
-    """
-    z = np.load(path, mmap_mode="r")
-    return {
-        "track_lengths": z["track_lengths"],
-        "track_indices": z["track_indices"],
-        "track_coordinates": z["track_coordinates"],
-        "camera2world": z["camera2world"],
-    }
+def _intrinsic_K(width: int, hfov_deg: float) -> np.ndarray:
+    # compute pinhole intrinsics from hfov and image width
+    fx = width * 0.5 / np.tan(np.deg2rad(hfov_deg) * 0.5)
+    return np.array([[fx, 0, width / 2],
+                     [0, fx, width / 2],
+                     [0,  0,          1]], dtype=np.float32)  # (3, 3)
 
 
-import os
-import pandas as pd
+def _optimized_pcs(lengths: np.ndarray,
+                   track_indices: np.ndarray,
+                   track_coordinates: np.ndarray,
+                   idxs: np.ndarray) -> np.ndarray:
+    # vectorized scatter into (tracks, len(idxs), 3), with valid mask appended
+    frame_idxs = np.asarray(idxs)
+    col_idx_full = track_indices
+    keep = np.isin(col_idx_full, frame_idxs)
+
+    if keep.any():
+        obs_idx = np.flatnonzero(keep)
+        row_s = np.searchsorted(lengths.cumsum(), obs_idx, side='right')
+
+        frames_kept = col_idx_full[keep]
+        max_frame = int(col_idx_full.max())
+        frame2col = np.full(max_frame + 1, -1, dtype=np.int32)
+        frame2col[frame_idxs] = np.arange(len(frame_idxs), dtype=np.int32)
+        col_s = frame2col[frames_kept]
+
+        coord_s = track_coordinates[keep]
+    else:
+        row_s = col_s = np.empty((0,), dtype=np.int32)
+        coord_s = np.empty((0, 3), dtype=np.float32)
+
+    tracks = np.full((len(lengths), len(frame_idxs), 3), np.nan, np.float32)  # (T, F, 3)
+    if len(row_s):
+        tracks[row_s, col_s] = coord_s
+    valid = (~np.isnan(tracks[..., 0]))[..., None].astype(np.float32)  # (T, F, 1)
+    return np.concatenate([tracks, valid], axis=-1)  # (T, F, 4)
 
 
 class Stereo4D(StereoMotionBase):
     """
-    Dataset for stereo-motion sequences (Stereo4D).
+    ultra-lightweight Stereo-4D dataloader (direct-from-disk).
+    reads sequence-level mp4/npz files without webdataset.
 
-    Scans annotation files in parallel to build a list of valid sequences
-    and their frame counts, then precomputes random frame triplets.
+    design:
+    - single-frame path opens & seeks once, no persistent caches
+    - multi-frame path opens once per sequence, batches seeks
+    - intrinsics computed from hfov + width (memoized per seq)
     """
 
-    def __init__(self, config, valid=False):
-        super().__init__(config)
-        print("loading stereo4d dataset...")
+    def __init__(self, config, valid: bool = False, time_debug: bool = False):
+        super().__init__(config, valid, time_debug)
+        print("loading stereo4d dataset (direct-from-disk)...")
 
         self.dataset_label = config.dataset.stereo4d.name
-        self.dataset_location = config.dataset.stereo4d.path
-        self.max_frame_window = config.dataset.stereo4d.max_frame_window
-
-        split = (
-            config.dataset.stereo4d.valid_split
-            if valid
-            else config.dataset.stereo4d.train_split
-        )
-        self.lefteye_dir = os.path.join(config.dataset.stereo4d.lefteye_dir, split)
-        self.anno_dir = os.path.join(config.dataset.stereo4d.path, split)
+        self.split = config.dataset.stereo4d.valid_split if valid else config.dataset.stereo4d.train_split
         self.hfov = config.dataset.stereo4d.hfov
+        self.max_frame_window = config.dataset.stereo4d.max_frame_window
+        
+        self.config = config
+        self.time_debug = time_debug
 
-        meta_csv = os.path.join(
-            config.dataset.stereo4d.meta_dir, "stereo4d_id_to_time_and_fov_metadata.csv"
-        )
-        stats_csv = os.path.join(config.dataset.stereo4d.meta_dir, "stats.csv")
+        # dirs
+        self.left_mp4_dir = Path(config.dataset.stereo4d.lefteye_dir) / self.split
+        self.npz_dir = Path(config.dataset.stereo4d.path) / self.split
+
+        # lightweight per-seq memo for intrinsics width
+        self._intrinsics_by_seq: Dict[str, np.ndarray] = {}
+
+        # build available sequences + frame counts using provided metadata
+        stats_csv = Path(config.dataset.stereo4d.meta_dir) / "stats.csv"
+        meta_csv = Path(config.dataset.stereo4d.meta_dir) / "stereo4d_id_to_time_and_fov_metadata.csv"
+
+        stats_df = pd.read_csv(stats_csv, skipinitialspace=True)
         meta_df = pd.read_csv(
             meta_csv,
             header=0,
-            names=[
-                "vid",
-                "clipid",
-                "timestamp",
-                "start_yaw",
-                "end_yaw",
-                "start_tilt",
-                "end_tilt",
-            ],
+            names=["vid", "clipid", "timestamp", "start_yaw", "end_yaw", "start_tilt", "end_tilt"],
         )
-        stats_df = pd.read_csv(stats_csv, skipinitialspace=True)
-        stats_df = stats_df[stats_df["displacement_percentage_50"] > 0.10]
-        stats_df = stats_df[stats_df["d_frame"] > 5 * 16]
-        limit = len(stats_df) # min(len(stats_df), config.data.len)
-        stats_df = stats_df.sample(n=limit, random_state=config.seed)
 
-        for _, r in stats_df.iterrows():
-            vid, cid = r["ytid"], r["clipid"]
-            ts = meta_df.loc[
-                (meta_df.vid == vid) & (meta_df.clipid == cid), "timestamp"
-            ]
-            if ts.empty:
-                continue
-            seq = f"{vid}_{int(ts.values[0])}"
-            mp4 = os.path.join(self.lefteye_dir, f"{seq}-left_rectified.mp4")
-            if not os.path.exists(mp4):
-                continue
+        merged = stats_df.merge(
+            meta_df[["vid", "clipid", "timestamp"]],
+            left_on=["ytid", "clipid"],
+            right_on=["vid", "clipid"],
+            how="inner",
+        )
+        merged = merged.groupby(["ytid", "clipid"]).first().reset_index()
+        merged["seq"] = merged["ytid"] + "_" + merged["timestamp"].astype(int).astype(str)
+
+        # keep only seqs that have both mp4 + npz on disk
+        def _exists(seq: str) -> bool:
+            mp4 = self.left_mp4_path(seq)
+            npz = self.npz_path(seq)
+            return mp4.is_file() and npz.is_file()
+
+        merged = merged[merged["seq"].map(_exists)]
+        seq_to_frame_count = dict(zip(merged["seq"], merged["d_frame"].astype(int)))
+
+        print(f"found {len(seq_to_frame_count)} sequences on disk")
+
+        # sample sequences
+        available = list(seq_to_frame_count.keys())
+        limit = min(len(available), config.data.len if not valid else config.data.valid_len)
+
+        np.random.seed(config.seed)
+        selected = np.random.choice(available, size=limit, replace=False)
+
+        for seq in selected:
             self.sequence_paths.append(seq)
-            self.frame_counts.append(int(r["d_frame"]))
+            self.frame_counts.append(int(seq_to_frame_count[seq]))
 
         print(f"total sequences: {len(self.sequence_paths)}")
-        print(f"total frames: {sum(self.frame_counts)}")
+        print(f"total frames   : {sum(self.frame_counts)}")
+
+        # precompute triplets as in base impl
         self._compute_triplets()
 
-    # ---------- helpers ----------
-    def _K(self, width):
-        """
-        Compute the camera intrinsic matrix for a square image of given width.
+    # ----------------------------- path helpers -----------------------------
 
-        Args:
-            width (int): image width in pixels
+    def left_mp4_path(self, seq: str) -> Path:
+        return self.left_mp4_dir / f"{seq}-left_rectified.mp4"
 
-        Returns:
-            np.ndarray: 3×3 intrinsic matrix
-        """
-        fx = width * 0.5 / np.tan(np.deg2rad(self.hfov) * 0.5)
-        return np.array([[fx, 0, width / 2], [0, fx, width / 2], [0, 0, 1]], np.float32)
+    def npz_path(self, seq: str) -> Path:
+        return self.npz_dir / f"{seq}.npz"
 
-    def _pc_for_frame(self, data, frame_idx):
-        """
-        Extract sparse 3D point cloud for a given frame.
+    # ----------------------------- core loaders -----------------------------
 
-        Args:
-            data (dict): output of load_dataset_npz
-            frame_idx (int): index of the frame within the sequence
+    def _load_single_frame(self, seq: str, idx: int) -> np.ndarray:
+        if self.time_debug:
+            t0 = time.perf_counter()
+        vr = VideoReader(str(self.left_mp4_path(seq)), ctx=cpu(0))
+        frame = vr[idx].asnumpy()  # (H, W, 3)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # (H, W, 3)
+        del vr
+        if self.time_debug:
+            print(f"[TIME] single frame {seq}[{idx}]: {(time.perf_counter()-t0)*1000:.2f}ms")
+        return frame_rgb  # (H, W, 3)
 
-        Returns:
-            np.ndarray: (N,4) array of [x,y,z,valid_flag]
-        """
-        lengths = data["track_lengths"]
-        indices = data["track_indices"]
-        coords = data["track_coordinates"]
-        num_tracks = len(lengths)
-        points = np.zeros((num_tracks, 3), np.float32)
-        valid = np.zeros((num_tracks, 1), np.float32)
-        ptr = 0
-        for i, L in enumerate(lengths):
-            ids = indices[ptr : ptr + L]
-            crd = coords[ptr : ptr + L]
-            ptr += L
-            mask = ids == frame_idx
-            if mask.any():
-                points[i] = crd[mask][0]
-                valid[i] = 1
+    def _load_single_frame_annotations(self, seq: str, idx: int) -> np.ndarray:
+        if self.time_debug:
+            t0 = time.perf_counter()
+        ann = np.load(self.npz_path(seq), allow_pickle=True)
+        pcs_all = _optimized_pcs(
+            lengths=ann["track_lengths"],
+            track_indices=ann["track_indices"],
+            track_coordinates=ann["track_coordinates"],
+            idxs=np.array([idx], dtype=np.int32),
+        )  # (T, 1, 4)
+        pcs = pcs_all[:, 0, :]  # (T, 4)
+        if self.time_debug:
+            print(f"[TIME] ann frame {seq}[{idx}]: {(time.perf_counter()-t0)*1000:.2f}ms")
+        return pcs.astype(np.float32)  # (T, 4)
 
-        return np.hstack([points, valid])
+    def _get_intrinsics(self, seq: str) -> np.ndarray:
+        K = self._intrinsics_by_seq.get(seq)
+        if K is not None:
+            return K  # (3, 3)
+        vr = VideoReader(str(self.left_mp4_path(seq)), ctx=cpu(0))
+        h, w = vr[0].shape[0], vr[0].shape[1]
+        del vr
+        K = _intrinsic_K(w, self.hfov)  # (3, 3)
+        self._intrinsics_by_seq[seq] = K
+        return K  # (3, 3)
 
-    # ---------- main API ----------
-    def get_frame_info(self, seq, idx):
-        """
-        Load image and point cloud for a specific sequence and frame.
+    def _load_camera_data(self, seq: str, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        if self.time_debug:
+            t0 = time.perf_counter()
+        K = self._get_intrinsics(seq)  # (3, 3)
+        ann = np.load(self.npz_path(seq), allow_pickle=True)
+        extr = geom.inv(ann["camera2world"][idx])  # (4, 4) or (3, 4) depending on your utils
+        if self.time_debug:
+            print(f"[TIME] cam {seq}[{idx}]: {(time.perf_counter()-t0)*1000:.2f}ms")
+        return K, extr  # (3, 3), (4, 4)
 
-        Args:
-            seq (str): sequence identifier
-            idx (int): frame index
+    # ------------------------------ public api ------------------------------
 
-        Returns:
-            dict: {
-                image: (H,W,3) RGB array,
-                world_pc_valid: (N,4) point cloud + valid flag,
-                cam: ((3,3), (4,4)) intrinsics + extrinsics,
-                dm: None,
-                instance: unique string "{seq}_{idx:05d}"
-            }
-        """
-        data = load_dataset_npz(os.path.join(self.anno_dir, f"{seq}.npz"))
-        video_path = os.path.join(self.lefteye_dir, f"{seq}-left_rectified.mp4")
-        cap = cv2.VideoCapture(video_path)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, img = cap.read()
-        cap.release()
-        if not ok:
-            raise RuntimeError("read fail")
-        img = img[:, :, ::-1]  # BGR→RGB
+    def get_frame_info(self, seq: str, idx: int) -> dict:
+        if self.time_debug:
+            t0 = time.perf_counter()
+            print(f"\n[TIME] get_frame_info({seq}, {idx})")
 
-        world_pc = self._pc_for_frame(data, idx)
-        # print(f"_pc_for_frame | seq: {seq} | valid: {world_pc[..., -1].sum()} | frame: {idx}")
-        extrinsics = geom.inv(data["camera2world"][idx])
-        intrinsics = self._K(img.shape[1])
-        cam = (intrinsics, extrinsics)
+        img = self._load_single_frame(seq, idx)  # (H, W, 3)
+        world_pc = self._load_single_frame_annotations(seq, idx)  # (T, 4)
+        intr, extr = self._load_camera_data(seq, idx)  # (3, 3), (4, 4)
 
-        # if self.config.data.crop:
-        #     size = self.config.data.size
-        #     img, _, cam = self.crop_data(img, None, cam, (size, size))
-        # print(f"_pc_for_frame-| seq: {seq} | valid: {world_pc[..., -1].sum()} | frame: {idx}")
+        if self.time_debug:
+            print(f"[TIME] TOTAL get_frame_info: {(time.perf_counter()-t0)*1000:.2f}ms")
 
         return dict(
-            image=img,
-            world_pc_valid=world_pc,
-            cam=cam,
+            image=img,                               # (H, W, 3)
+            world_pc_valid=world_pc,                 # (T, 4)
+            cam=(intr, extr),                        # ((3,3), (4,4))
             dm=None,
             instance=f"{seq}_{idx:05d}",
         )
 
+    def get_frame_infos(self, seq: str, idxs: List[int]) -> List[dict]:
+        if self.time_debug:
+            t0 = time.perf_counter()
+            print(f"\n[TIME] get_frame_infos({seq}, {idxs})")
 
-import hydra
-from omegaconf import DictConfig, open_dict
+        # open video once
+        t1 = time.perf_counter()
+        vr = VideoReader(str(self.left_mp4_path(seq)), ctx=cpu(0))
+        if self.time_debug:
+            print(f"[TIME] create VR: {(time.perf_counter()-t1)*1000:.2f}ms")
 
+        # batch load frames
+        frames: List[np.ndarray] = []
+        t1 = time.perf_counter()
+        for i in idxs:
+            frames.append(vr[i].asnumpy())  # (H, W, 3)
+        if self.time_debug:
+            print(f"[TIME] read {len(idxs)} frames: {(time.perf_counter()-t1)*1000:.2f}ms")
+        del vr
 
-# usage:
-# python -m loaders.stereo4d dataset.stereo4d.split=test
-# python -m loaders.stereo4d dataset.stereo4d.split=test dataset.stereo4d.max_frame_window=30
-# /scratch/projects/fouheylab/km6748/stereo4d-data/lefteye-perspective/train/yAAaVncw5g0_152118785-left_rectified.mp4
-@hydra.main(version_base=None, config_path="../config", config_name="config")
-def main(config: DictConfig):
-    import torch
-    import loaders.utils.viz as viz
+        # convert color space once
+        t1 = time.perf_counter()
+        frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]  # each (H, W, 3)
+        if self.time_debug:
+            print(f"[TIME] bgr→rgb {len(frames)}: {(time.perf_counter()-t1)*1000:.2f}ms")
 
-    dataset_tracks = Stereo4D(config)
-    print(f"total triplets: {len(dataset_tracks)}")
+        # load ann once
+        t1 = time.perf_counter()
+        ann = np.load(self.npz_path(seq), allow_pickle=True)
+        if self.time_debug:
+            print(f"[TIME] load ann: {(time.perf_counter()-t1)*1000:.2f}ms")
 
-    for sample_idx in range(0, 4):
-        sample_tracks = dataset_tracks[sample_idx]
+        # intrinsics once
+        intr = self._get_intrinsics(seq)  # (3, 3)
 
-        # print basic info about the triplet
-        print(
-            f"triplet frames: instance={sample_tracks['left_instance']}, {sample_tracks['right_instance']}| idxs={sample_tracks['idxs']}"
-        )
-        print("------------------------")
-        for k, v in sample_tracks.items():
-            if isinstance(v, torch.Tensor):
-                print(k, v.size(), v.dtype)
-            else:
-                print(k)
+        # annotations for selected frames
+        t1 = time.perf_counter()
+        pcs_all = _optimized_pcs(
+            lengths=ann["track_lengths"],
+            track_indices=ann["track_indices"],
+            track_coordinates=ann["track_coordinates"],
+            idxs=np.asarray(idxs, dtype=np.int32),
+        )  # (T, F, 4)
+        if self.time_debug:
+            print(f"[TIME] build pcs: {(time.perf_counter()-t1)*1000:.2f}ms")
 
-        # prepare point maps and images for visualization
-        track_pms = np.array(
-            [
-                sample_tracks["left_pm"],
-                sample_tracks["mid_pm"],
-                sample_tracks["right_pm"],
-            ]
-        )
+        # extrinsics for selected frames
+        t1 = time.perf_counter()
+        c2w = ann["camera2world"]
+        extr_list = [geom.inv(c2w[i]) for i in idxs]  # list of (4, 4)
+        if self.time_debug:
+            print(f"[TIME] extrinsics: {(time.perf_counter()-t1)*1000:.2f}ms")
 
-        c1 = sample_tracks["cam"]  # or sample_tracks["cam"]
-        c2 = sample_tracks["cam_mid"]
-        c3 = sample_tracks["cam_right"]
+        # col lookup
+        col_of_frame = {f: j for j, f in enumerate(idxs)}
 
-        img_l = sample_tracks["left_image"].permute(1, 2, 0).numpy()
-        img_m = sample_tracks["mid_image"].permute(1, 2, 0).numpy()
-        img_r = sample_tracks["right_image"].permute(1, 2, 0).numpy()
+        # package
+        t1 = time.perf_counter()
+        out: List[dict] = []
+        for j, fidx in enumerate(idxs):
+            out.append(dict(
+                image=frames[j],                                    # (H, W, 3)
+                world_pc_valid=pcs_all[:, col_of_frame[fidx], :],   # (T, 4)
+                cam=(intr, extr_list[j]),                           # ((3,3), (4,4))
+                dm=None,
+                instance=f"{seq}_{fidx:05d}",
+            ))
+        if self.time_debug:
+            print(f"[TIME] build results: {(time.perf_counter()-t1)*1000:.2f}ms")
+            print(f"[TIME] TOTAL get_frame_infos: {(time.perf_counter()-t0)*1000:.2f}ms")
 
-        images = [
-            img_l,
-            geom.recolor(track_pms[1], c1, c2, img_m),
-            geom.recolor(track_pms[2], c1, c3, img_r),
-        ]
-
-        viz.visualize_image(
-            sample_tracks["left_image"].permute(1, 2, 0).numpy(),
-            name=f"{sample_idx}-left_image",
-        )
-        # viz.visualize_dm(sample_tracks['left_dm'], name=f"{sample_idx}-left_dm")
-        viz.visualize_image(
-            sample_tracks["mid_image"].permute(1, 2, 0).numpy(),
-            name=f"{sample_idx}-mid_image",
-        )
-        # viz.visualize_dm(sample_tracks['mid_dm'], name=f"{sample_idx}-mid_dm")
-        viz.visualize_image(
-            sample_tracks["right_image"].permute(1, 2, 0).numpy(),
-            name=f"{sample_idx}-right_image",
-        )
-        # viz.visualize_dm(sample_tracks['right_dm'], name=f"{sample_idx}-right_dm")
-
-        viz.visualize_pm(
-            track_pms[0],
-            image=images[0],
-            cam=sample_tracks["cam"],
-            name=f"{sample_idx}-left_pm",
-        )
-        viz.visualize_pm(
-            track_pms[1],
-            image=images[1],
-            cam=sample_tracks["cam"],
-            name=f"{sample_idx}-mid_pm",
-        )
-        viz.visualize_pm(
-            track_pms[2],
-            image=images[2],
-            cam=sample_tracks["cam"],
-            name=f"{sample_idx}-right_pm",
-        )
-
-        # prepare motion maps
-        left_to_mid = sample_tracks["left_to_mid_motion"]
-        right_to_mid = sample_tracks["right_to_mid_motion"]
-
-        # create single-step motion maps for each visualization
-        h, w, _ = sample_tracks["left_pm"].shape
-
-        # 1. tracks + left_to_mid
-        left_to_mid_map = np.zeros((1, h, w, 4), dtype=np.float32)
-        left_to_mid_map[0] = left_to_mid
-
-        # 2. tracks + right_to_mid
-        right_to_mid_map = np.zeros((1, h, w, 4), dtype=np.float32)
-        right_to_mid_map[0] = right_to_mid
-
-        viz.visualize_sequence_from_pms(
-            track_pms[:2],  # just left and mid for left_to_mid
-            left_to_mid_map,
-            images[:2],
-            name=f"{sample_idx}-tracksl",
-        )
-
-        viz.visualize_sequence_from_pms(
-            np.array([track_pms[2], track_pms[1]]),  # right and mid for right_to_mid
-            right_to_mid_map,
-            [images[2], images[1]],
-            name=f"{sample_idx}-tracksr",
-        )
-
-
-if __name__ == "__main__":
-    main()
+        return out
