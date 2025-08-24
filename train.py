@@ -46,6 +46,7 @@ def get_cycled_batches(dataloader, accelerator, total_iterations):
 # ═════════════════════════════════════════════════════════════
 @hydra.main(version_base=None, config_path="config", config_name="config")
 def main(config: DictConfig):
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
     if config.debug:
         # overfitting experiment on tiny debug dataset
@@ -56,8 +57,8 @@ def main(config: DictConfig):
         train_viz_interval                = 5
     else:
         # align dataset sizes with training plan
-        config.data.len                   = config.train.iterations * config.data.batch_size
-        config.data.valid_len             = config.data.valid_len * config.data.batch_size
+        config.data.len                   = config.train.iterations * config.data.batch_size * world_size
+        config.data.valid_len             = config.data.valid_len * config.data.batch_size * world_size
         train_viz_interval                = 250
 
     setup_distributed(config.seed)
