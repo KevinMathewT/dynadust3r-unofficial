@@ -67,7 +67,7 @@ def get_loaders(config, num_workers_multiplier=0.75, time_debug=False, loader_kw
         collate_fn=add_batch_size_wrapper,
         pin_memory=True,  # Recommended for GPU training
         persistent_workers=persistent_workers_val,  # Keeps workers alive between epochs
-        # prefetch_factor=prefetch_factor_val,  # Prefetch batches for better performance
+        prefetch_factor=prefetch_factor_val,  # Prefetch batches for better performance
     )
 
     valid_loader = DataLoader(
@@ -78,7 +78,7 @@ def get_loaders(config, num_workers_multiplier=0.75, time_debug=False, loader_kw
         collate_fn=add_batch_size_wrapper,
         pin_memory=True,
         persistent_workers=persistent_workers_val,
-        # prefetch_factor=prefetch_factor_val,  # Prefetch batches for better performance
+        prefetch_factor=prefetch_factor_val,  # Prefetch batches for better performance
     )
 
     # Only print info if we're on the main process

@@ -442,6 +442,14 @@ class DynaDUSt3R(
         # Rename right's 3D points to indicate they're in left's frame
         res_right["map_pred_in_left_frame"] = res_right.pop("map_pred")
 
+        if "map_pred_conf" in res_left and res_left["map_pred_conf"] is not None:
+            if res_left["map_pred_conf"].ndim == 3:
+                res_left["map_pred_conf"] = res_left["map_pred_conf"].unsqueeze(-1)  # (B, H, W, 1)
+        if "map_pred_conf" in res_right and res_right["map_pred_conf"] is not None:
+            if res_right["map_pred_conf"].ndim == 3:
+                res_right["map_pred_conf"] = res_right["map_pred_conf"].unsqueeze(-1)  # (B, H, W, 1)
+
+
         # Combine results into single dictionary
         combined_results = {}
 
@@ -469,127 +477,135 @@ class DynaDUSt3R(
         # 'motion_pred': dict with dynamic keys like "l_to_0.2", "r_to_0.35" etc - motion predictions
         # 'batch_size': integer - batch size for metrics calculation
 
+
     def get_loss(self, batch, outputs):
         """
         Compute total loss with aggressive memory optimization.
         Fixed to match unoptimized version behavior exactly.
         """
-        device = batch["left_pm"].device
-        alpha = 0.2
+        device = batch["left_pm"].device  # ()
+        alpha = 0.2  # ()
         
         # Extract query time once
-        tq_mid = batch["query_times"][0, 0].item()
+        tq_mid = batch["query_times"][0, 0].item()  # ()
         
         # Process everything in chunks to avoid large intermediate tensors
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        loss_details = {}
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)  # ()
+        loss_details = {}  # (dict)
         
         # Define all loss computations
-        loss_configs = [
+        loss_configs = [  # (list[len=6])
             # Base point clouds
             {
                 "name": "left",
-                "gt": batch["left_pm"][..., :3],
-                "pred": outputs["left_map_pred"],
-                "valid": batch["left_pm"][..., 3] > 0,
-                "conf": outputs.get("left_map_pred_conf", None),
+                "gt": batch["left_pm"][..., :3],  # (B,H,W,3)
+                "pred": outputs["left_map_pred"],  # (B,H,W,3)
+                "valid": batch["left_pm"][..., 3] > 0,  # (B,H,W)
+                "conf": outputs.get("left_map_pred_conf", None),  # (B,H,W,1) or None
                 "is_base": True
             },
             {
                 "name": "right", 
-                "gt": batch["right_pm"][..., :3],
-                "pred": outputs["right_map_pred_in_left_frame"],
-                "valid": batch["right_pm"][..., 3] > 0,
-                "conf": outputs.get("right_map_pred_conf", None),
+                "gt": batch["right_pm"][..., :3],  # (B,H,W,3)
+                "pred": outputs["right_map_pred_in_left_frame"],  # (B,H,W,3)
+                "valid": batch["right_pm"][..., 3] > 0,  # (B,H,W)
+                "conf": outputs.get("right_map_pred_conf", None),  # (B,H,W,1) or None
                 "is_base": True
             },
             # Motion point clouds
             {
                 "name": "l2m",
-                "gt": batch["left_pm"][..., :3] + batch["motion_gt"]["l2m"][..., :3],
-                "pred": outputs["left_map_pred"] + outputs["motion_pred"][f"l_to_{tq_mid:.3g}"][..., :3],
-                "valid": (batch["left_pm"][..., 3] > 0) & (batch["motion_gt"]["l2m"][..., 3] > 0),
-                "conf": outputs["motion_pred"].get(f"l_to_{tq_mid:.3g}_conf", None),
+                "gt": batch["left_pm"][..., :3] + batch["motion_gt"]["l2m"][..., :3],  # (B,H,W,3)
+                "pred": outputs["left_map_pred"] + outputs["motion_pred"][f"l_to_{tq_mid:.3g}"][..., :3],  # (B,H,W,3)
+                "valid": (batch["left_pm"][..., 3] > 0) & (batch["motion_gt"]["l2m"][..., 3] > 0),  # (B,H,W)
+                "conf": outputs["motion_pred"].get(f"l_to_{tq_mid:.3g}_conf", None),  # (B,H,W,1) or None
                 "is_base": False
             },
             {
                 "name": "r2m",
-                "gt": batch["right_pm"][..., :3] + batch["motion_gt"]["r2m"][..., :3],
-                "pred": outputs["right_map_pred_in_left_frame"] + outputs["motion_pred"][f"r_to_{tq_mid:.3g}"][..., :3],
-                "valid": (batch["right_pm"][..., 3] > 0) & (batch["motion_gt"]["r2m"][..., 3] > 0),
-                "conf": outputs["motion_pred"].get(f"r_to_{tq_mid:.3g}_conf", None),
+                "gt": batch["right_pm"][..., :3] + batch["motion_gt"]["r2m"][..., :3],  # (B,H,W,3)
+                "pred": outputs["right_map_pred_in_left_frame"] + outputs["motion_pred"][f"r_to_{tq_mid:.3g}"][..., :3],  # (B,H,W,3)
+                "valid": (batch["right_pm"][..., 3] > 0) & (batch["motion_gt"]["r2m"][..., 3] > 0),  # (B,H,W)
+                "conf": outputs["motion_pred"].get(f"r_to_{tq_mid:.3g}_conf", None),  # (B,H,W,1) or None
                 "is_base": False
             },
             {
                 "name": "l2r",
-                "gt": batch["left_pm"][..., :3] + batch["motion_gt"]["l2r"][..., :3],
-                "pred": outputs["left_map_pred"] + outputs["motion_pred"]["l_to_1"][..., :3],
-                "valid": (batch["left_pm"][..., 3] > 0) & (batch["motion_gt"]["l2r"][..., 3] > 0),
-                "conf": outputs["motion_pred"].get("l_to_1_conf", None),
+                "gt": batch["left_pm"][..., :3] + batch["motion_gt"]["l2r"][..., :3],  # (B,H,W,3)
+                "pred": outputs["left_map_pred"] + outputs["motion_pred"]["l_to_1"][..., :3],  # (B,H,W,3)
+                "valid": (batch["left_pm"][..., 3] > 0) & (batch["motion_gt"]["l2r"][..., 3] > 0),  # (B,H,W)
+                "conf": outputs["motion_pred"].get("l_to_1_conf", None),  # (B,H,W,1) or None
                 "is_base": False
             },
             {
                 "name": "r2l",
-                "gt": batch["right_pm"][..., :3] + batch["motion_gt"]["r2l"][..., :3],
-                "pred": outputs["right_map_pred_in_left_frame"] + outputs["motion_pred"]["r_to_0"][..., :3],
-                "valid": (batch["right_pm"][..., 3] > 0) & (batch["motion_gt"]["r2l"][..., 3] > 0),
-                "conf": outputs["motion_pred"].get("r_to_0_conf", None),
+                "gt": batch["right_pm"][..., :3] + batch["motion_gt"]["r2l"][..., :3],  # (B,H,W,3)
+                "pred": outputs["right_map_pred_in_left_frame"] + outputs["motion_pred"]["r_to_0"][..., :3],  # (B,H,W,3)
+                "valid": (batch["right_pm"][..., 3] > 0) & (batch["motion_gt"]["r2l"][..., 3] > 0),  # (B,H,W)
+                "conf": outputs["motion_pred"].get("r_to_0_conf", None),  # (B,H,W,1) or None
                 "is_base": False
             }
-        ]
+        ]  # (list[len=6])
         
         # Compute normalization factors once for base PCs
-        with torch.no_grad():
+        with torch.no_grad():  # ()
             # Extract base PCs and validity
-            gt_left_pc = batch["left_pm"][..., :3]
-            gt_right_pc = batch["right_pm"][..., :3]
-            valid_left = batch["left_pm"][..., 3] > 0
-            valid_right = batch["right_pm"][..., 3] > 0
+            gt_left_pc = batch["left_pm"][..., :3]  # (B,H,W,3)
+            gt_right_pc = batch["right_pm"][..., :3]  # (B,H,W,3)
+            valid_left = batch["left_pm"][..., 3] > 0  # (B,H,W)
+            valid_right = batch["right_pm"][..., 3] > 0  # (B,H,W)
             
             # GT normalization - using the FIXED version to match unoptimized
-            gt_scale = self._compute_norm_factor_fixed(
+            gt_scale = self._compute_norm_factor_fixed(  # (B,1,1,1)
                 gt_left_pc, gt_right_pc, valid_left, valid_right
             )
         
         # Pred normalization (needs gradients)
-        pred_scale = self._compute_norm_factor_fixed(
+        pred_scale = self._compute_norm_factor_fixed(  # (B,1,1,1)
             outputs["left_map_pred"], 
             outputs["right_map_pred_in_left_frame"],
             valid_left, valid_right
         )
         
         # Process each loss component
-        for cfg in loss_configs:
+        for cfg in loss_configs:  # ()
+            # # debug: print shapes per component once
+            # if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+            #     def s(x): return None if x is None else tuple(x.shape)
+            #     print(f"[loss-cfg] {cfg['name']}: gt={s(cfg['gt'])} pred={s(cfg['pred'])} valid={s(cfg['valid'])} conf={s(cfg['conf'])}")
+            #     if cfg["conf"] is not None and cfg["conf"].ndim == 4 and cfg["conf"].shape[-1] != 1:
+            #         print(f"[conf-multi] {cfg['name']} conf has C={cfg['conf'].shape[-1]} channels")  # (B,H,W,C)
+
             # Compute single loss component
-            loss_comp = self._compute_single_loss_fixed(
+            loss_comp = self._compute_single_loss_fixed(  # ()
                 cfg["gt"], cfg["pred"], cfg["valid"], cfg["conf"],
                 gt_scale, pred_scale, alpha, device
             )
             
             # Accumulate loss
-            total_loss = total_loss + loss_comp
+            total_loss = total_loss + loss_comp  # ()
             
             # Store details - FIXED to match unoptimized naming
-            if cfg["conf"] is not None:
-                loss_details[f"{cfg['name']}_conf"] = loss_comp.item()
-                loss_details[f"{cfg['name']}_l2"] = 0.0  # L2 not used when conf available
+            if cfg["conf"] is not None:  # ()
+                loss_details[f"{cfg['name']}_conf"] = loss_comp.item()  # ()
+                loss_details[f"{cfg['name']}_l2"] = 0.0  # L2 not used when conf available  # ()
             else:
-                loss_details[f"{cfg['name']}_conf"] = 0.0
-                loss_details[f"{cfg['name']}_l2"] = loss_comp.item()
+                loss_details[f"{cfg['name']}_conf"] = 0.0  # ()
+                loss_details[f"{cfg['name']}_l2"] = loss_comp.item()  # ()
             
             # Explicitly delete intermediate tensors if not base PC
-            if not cfg["is_base"]:
-                del cfg["gt"], cfg["pred"]
-                if "valid" in cfg:
-                    del cfg["valid"]
+            if not cfg["is_base"]:  # ()
+                del cfg["gt"], cfg["pred"]  # ()
+                if "valid" in cfg:  # ()
+                    del cfg["valid"]  # ()
         
-        loss_details["total_loss"] = total_loss.item()
+        loss_details["total_loss"] = total_loss.item()  # ()
         
         # Force garbage collection for large tensors
-        if hasattr(torch.cuda, 'empty_cache'):
-            torch.cuda.empty_cache()
+        if hasattr(torch.cuda, 'empty_cache'):  # ()
+            torch.cuda.empty_cache()  # ()
         
-        return total_loss, loss_details
+        return total_loss, loss_details  # ((), dict)
 
 
     def _compute_norm_factor_fixed(self, pc1, pc2, valid1, valid2):
@@ -597,32 +613,32 @@ class DynaDUSt3R(
         Compute normalization factor matching unoptimized version exactly.
         Uses masked approach instead of extracting valid points.
         """
-        batch_size = pc1.shape[0]
-        device = pc1.device
+        batch_size = pc1.shape[0]  # ()
+        device = pc1.device  # ()
         
         # Mask invalid points to 0 (matching unoptimized)
-        pc1_masked = pc1.clone()
-        pc2_masked = pc2.clone()
-        pc1_masked[~valid1] = 0
-        pc2_masked[~valid2] = 0
+        pc1_masked = pc1.clone()  # (B,H,W,3)
+        pc2_masked = pc2.clone()  # (B,H,W,3)
+        pc1_masked[~valid1] = 0  # (B,H,W,3)
+        pc2_masked[~valid2] = 0  # (B,H,W,3)
         
         # Stack and compute distances (matching unoptimized)
-        all_pts = torch.cat([pc1_masked.flatten(1, 2), pc2_masked.flatten(1, 2)], dim=1)
-        all_dis = all_pts.norm(dim=-1)
+        all_pts = torch.cat([pc1_masked.flatten(1, 2), pc2_masked.flatten(1, 2)], dim=1)  # (B,2*H*W,3)
+        all_dis = all_pts.norm(dim=-1)  # (B,2*H*W)
         
         # Count valid points
-        nnz1 = valid1.sum(dim=(1, 2))
-        nnz2 = valid2.sum(dim=(1, 2))
+        nnz1 = valid1.sum(dim=(1, 2))  # (B,)
+        nnz2 = valid2.sum(dim=(1, 2))  # (B,)
         
         # Average distance
-        norm_factor = all_dis.sum(dim=1) / (nnz1 + nnz2 + 1e-8)
-        norm_factor = norm_factor.clip(min=1e-8)
+        norm_factor = all_dis.sum(dim=1) / (nnz1 + nnz2 + 1e-8)  # (B,)
+        norm_factor = norm_factor.clip(min=1e-8)  # (B,)
         
         # Expand to match PC dimensions
-        while norm_factor.ndim < pc1.ndim:
-            norm_factor = norm_factor.unsqueeze(-1)
+        while norm_factor.ndim < pc1.ndim:  # ()
+            norm_factor = norm_factor.unsqueeze(-1)  # (B,1,1,1) after loop
         
-        return norm_factor
+        return norm_factor  # (B,1,1,1)
 
 
     def _compute_single_loss_fixed(self, gt_pc, pred_pc, valid_mask, conf, 
@@ -633,40 +649,43 @@ class DynaDUSt3R(
         """
         # Always touch prediction (and conf) so parameters participate in the graph
         # even when no valid pixels on this rank. This avoids DDP desync.
-        zero_attach = (pred_pc[..., :1].sum() * 0.0)
-        if conf is not None:
+        zero_attach = (pred_pc[..., :1].sum() * 0.0)  # ()
+        if conf is not None:  # ()
             try:
-                zero_attach = zero_attach + (conf[..., :1].sum() * 0.0)
+                zero_attach = zero_attach + (conf[..., :1].sum() * 0.0)  # ()
             except Exception:
-                zero_attach = zero_attach + (conf.sum() * 0.0)
+                zero_attach = zero_attach + (conf.sum() * 0.0)  # ()
 
-        if not valid_mask.any():
-            return zero_attach
+        if not valid_mask.any():  # ()
+            return zero_attach  # ()
         
         # Normalize full PCs first (like unoptimized)
-        gt_pc_norm = gt_pc / gt_scale
-        pred_pc_norm = pred_pc / pred_scale
+        gt_pc_norm = gt_pc / gt_scale  # (B,H,W,3)
+        pred_pc_norm = pred_pc / pred_scale  # (B,H,W,3)
         
         # Compute L2 distance for all pixels
-        l2_dist = (pred_pc_norm - gt_pc_norm).norm(dim=-1)
+        l2_dist = (pred_pc_norm - gt_pc_norm).norm(dim=-1)  # (B,H,W)
         
         # Extract valid distances
-        l2_dist_valid = l2_dist[valid_mask]
+        l2_dist_valid = l2_dist[valid_mask]  # (N,)
         
         # CRITICAL FIX: Match unoptimized behavior
-        if conf is not None:
+        if conf is not None:  # ()
             # Extract valid confidence values
-            conf_valid = conf[valid_mask]
+            conf_valid = conf[valid_mask].squeeze(-1)  # (N,) or (N,1)
             # Remove .squeeze(-1) unless you're sure about the shape
             # conf_valid = conf_valid.squeeze(-1)  
             
+            assert l2_dist_valid.ndim == 1 and conf_valid.ndim == 1  # (K,), (K,)
+
             # Compute confidence loss (no clamping to match unoptimized exactly)
-            loss = (l2_dist_valid * conf_valid - alpha * torch.log(conf_valid)).mean() + zero_attach
+            loss = (l2_dist_valid * conf_valid - alpha * torch.log(conf_valid)).mean() + zero_attach  # ()
         else:
             # Return 0 when no confidence (matching unoptimized bug/feature)
-            loss = zero_attach
+            loss = zero_attach  # ()
         
-        return loss
+        return loss  # ()
+
 
 
     # ---------------------------------------------------------------------

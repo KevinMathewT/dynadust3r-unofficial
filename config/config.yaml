@@ -9,7 +9,7 @@ defaults:
 
 seed: 2
 
-debug: False
+debug: True
 
 # Scheduler configuration
 # To disable scheduler: sched: null

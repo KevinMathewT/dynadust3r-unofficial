@@ -49,9 +49,9 @@ def main(config: DictConfig):
 
     if config.debug:
         # overfitting experiment on tiny debug dataset
-        config.data.len                   = 1
-        config.data.valid_len             = 1
-        config.data.batch_size            = 1
+        config.data.len                   = 4
+        config.data.valid_len             = 4
+        config.data.batch_size            = 4
         config.train.validation_frequency = 10
         train_viz_interval                = 5
     else:
