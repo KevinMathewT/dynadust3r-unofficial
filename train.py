@@ -52,7 +52,7 @@ def main(config: DictConfig):
         config.data.len                   = 1
         config.data.valid_len             = 1
         config.data.batch_size            = 1
-        config.train.validation_frequency = 1
+        config.train.validation_frequency = 10
         train_viz_interval                = 5
     else:
         # align dataset sizes with training plan
