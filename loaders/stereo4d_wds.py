@@ -142,12 +142,11 @@ class Stereo4DWDS(StereoMotionBase):
 
         vr = self._open_vr_from_bytes(vbytes)
         frame = vr[idx].asnumpy()              # (H, W, 3)
-        frame_rgb = frame[:, :, ::-1]          # (H, W, 3) bgr->rgb view
         del vr
 
         if self.time_debug:
             print(f"[TIME] single frame {seq}[{idx}]: {(time.perf_counter()-t0)*1000:.2f}ms")
-        return frame_rgb
+        return frame
 
     def _load_single_frame_annotations(self, seq: str, idx: int, ann_data=None):
         """vectorized scatter for just one frame."""  # (T, 4)
@@ -248,12 +247,6 @@ class Stereo4DWDS(StereoMotionBase):
         del vr
         if self.time_debug:
             print(f"[TIME] decode {len(idxs)} frames: {(time.perf_counter() - t0)*1000:.2f}ms")
-
-        # bgr->rgb as a view
-        t0 = time.perf_counter()
-        frames_nd = frames_nd[..., ::-1]              # (F, H, W, 3)
-        if self.time_debug:
-            print(f"[TIME] bgr→rgb: {(time.perf_counter() - t0)*1000:.2f}ms")
 
         # load ann + intr once
         t0 = time.perf_counter()

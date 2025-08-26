@@ -145,11 +145,10 @@ class Stereo4D(StereoMotionBase):
             t0 = time.perf_counter()
         vr = VideoReader(str(self.left_mp4_path(seq)), ctx=cpu(0))
         frame = vr[idx].asnumpy()  # (H, W, 3)
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # (H, W, 3)
         del vr
         if self.time_debug:
             print(f"[TIME] single frame {seq}[{idx}]: {(time.perf_counter()-t0)*1000:.2f}ms")
-        return frame_rgb  # (H, W, 3)
+        return frame  # (H, W, 3)
 
     def _load_single_frame_annotations(self, seq: str, idx: int) -> np.ndarray:
         if self.time_debug:
@@ -228,12 +227,6 @@ class Stereo4D(StereoMotionBase):
         if self.time_debug:
             print(f"[TIME] read {len(idxs)} frames: {(time.perf_counter()-t1)*1000:.2f}ms")
         del vr
-
-        # convert color space once
-        t1 = time.perf_counter()
-        frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]  # each (H, W, 3)
-        if self.time_debug:
-            print(f"[TIME] bgr→rgb {len(frames)}: {(time.perf_counter()-t1)*1000:.2f}ms")
 
         # load ann once
         t1 = time.perf_counter()

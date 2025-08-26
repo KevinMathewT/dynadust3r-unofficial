@@ -54,7 +54,7 @@ def get_loaders(config, num_workers_multiplier=0.75, time_debug=False, loader_kw
     loader_kwargs = loader_kwargs or {}
 
     # derive final values (dict overrides the auto‑defaults when supplied)
-    persistent_workers_val = loader_kwargs.get('persistent_workers', True if num_workers > 0 else False)
+    persistent_workers_val = False # loader_kwargs.get('persistent_workers', True if num_workers > 0 else False)
     prefetch_factor_val    = loader_kwargs.get('prefetch_factor', 2 if num_workers > 0 else None)
 
     # Create dataloaders with FULL batch size
@@ -72,7 +72,7 @@ def get_loaders(config, num_workers_multiplier=0.75, time_debug=False, loader_kw
 
     valid_loader = DataLoader(
         valid_dataset,
-        batch_size=config.data.batch_size,  # Use full batch size
+        batch_size=config.data.batch_size * 4,  # Use full batch size
         shuffle=False,  # Never shuffle validation
         num_workers=num_workers,
         collate_fn=add_batch_size_wrapper,

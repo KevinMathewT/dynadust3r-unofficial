@@ -256,17 +256,33 @@ def save_visualizations(batch, outputs, base_name, i=0, *args, **kwargs):
     # per‑pixel confidence for maps to numpy
     conf_left_pred_np  = outputs.get("left_map_pred_conf",  None)
     conf_right_pred_np = outputs.get("right_map_pred_conf", None)
-    conf_left_pred_np  = conf_left_pred_np[i].detach().cpu().numpy()  if conf_left_pred_np  is not None else None
-    conf_right_pred_np = conf_right_pred_np[i].detach().cpu().numpy() if conf_right_pred_np is not None else None
+    if conf_left_pred_np is not None:
+        conf_left_pred_np = conf_left_pred_np[i]
+        if conf_left_pred_np.ndim == 3 and conf_left_pred_np.shape[-1] == 1:
+            conf_left_pred_np = conf_left_pred_np[..., 0]  # (H, W)
+        conf_left_pred_np = conf_left_pred_np.detach().cpu().numpy()
+    if conf_right_pred_np is not None:
+        conf_right_pred_np = conf_right_pred_np[i]
+        if conf_right_pred_np.ndim == 3 and conf_right_pred_np.shape[-1] == 1:
+            conf_right_pred_np = conf_right_pred_np[..., 0]  # (H, W)
+        conf_right_pred_np = conf_right_pred_np.detach().cpu().numpy()
     # print(f"DEBUG: save_visualizations - conf_left_pred_np shape: {conf_left_pred_np.shape if conf_left_pred_np is not None else 'None'}")
 
     # per‑pixel confidence for motions to numpy
     motion_pred = outputs["motion_pred"]
-    conf_motion_l2m_pred_np, conf_motion_r2m_pred_np, \
-    conf_motion_l2r_pred_np,  conf_motion_r2l_pred_np = [
-        (motion_pred.get(f"{k}_conf")[i].detach().cpu().numpy() if motion_pred.get(f"{k}_conf") is not None else None)
-        for k in (k_l2m, k_r2m, k_l2r, k_r2l)
-    ]
+    def _extract_conf_np(key):
+        arr = motion_pred.get(f"{key}_conf")
+        if arr is None:
+            return None
+        arr = arr[i]
+        if arr.ndim == 3 and arr.shape[-1] == 1:
+            arr = arr[..., 0]  # (H, W)
+        return arr.detach().cpu().numpy()
+
+    conf_motion_l2m_pred_np = _extract_conf_np(k_l2m)
+    conf_motion_r2m_pred_np = _extract_conf_np(k_r2m)
+    conf_motion_l2r_pred_np = _extract_conf_np(k_l2r)
+    conf_motion_r2l_pred_np = _extract_conf_np(k_r2l)
     # print(f"DEBUG: save_visualizations - conf_motion_l2m_pred_np shape: {conf_motion_l2m_pred_np.shape if conf_motion_l2m_pred_np is not None else 'None'}")
     # ---------------------------------------------------------------------------
 

@@ -82,7 +82,7 @@ class DynaDUSt3R(
         landscape_only=True,
         patch_embed_cls="PatchEmbedDust3R",  # PatchEmbedDust3R or ManyAR_PatchEmbed
         time_pos_emb_dim=128,
-        teacher_forcing=False,  
+        teacher_forcing=False,
         # Whether to use ground truth (True) or predicted (False) point clouds for motion
         # currently only False is supported - TODO: normalize/scale the gt point clouds correctly to match prediction space before adding predicted motion
         **croco_kwargs,
@@ -207,8 +207,10 @@ class DynaDUSt3R(
             time_pos_emb_dim=self.time_pos_emb_dim,
         )
         # magic wrapper
-        self.mhead1 = transpose_to_landscape(self.motion_head1, activate=landscape_only)
-        self.mhead2 = transpose_to_landscape(self.motion_head2, activate=landscape_only)
+        self.mhead1 = transpose_to_landscape(
+            self.motion_head1, activate=landscape_only)
+        self.mhead2 = transpose_to_landscape(
+            self.motion_head2, activate=landscape_only)
 
     def _encode_image(self, image, true_shape):
         # embed the image into patches  (x has size B x Npatches x C)
@@ -265,25 +267,43 @@ class DynaDUSt3R(
         return (shape1, shape2), (feat1, feat2), (pos1, pos2)
 
     def _decoder(self, f1, pos1, f2, pos2):
-        final_output = [(f1, f2)]  # before projection
+        """
+        Run dual decoder streams over encoded token sequences.
+
+        Args:
+            f1: (B, S, D_enc) - encoder tokens for left view
+            pos1: (B, S, D_pos) or (B, S, 2) depending on CroCo settings
+            f2: (B, S, D_enc) - encoder tokens for right view
+            pos2: (B, S, D_pos) or (B, S, 2)
+
+        Returns:
+            iterator over tuples (dec_left_stage, dec_right_stage), where each is (B, S, D_dec)
+            across stages including the pre-projection stage and all decoder block stages.
+            When consumed as: `dec_left, dec_right = self._decoder(...)`, each of
+            `dec_left` and `dec_right` is a tuple of T tensors, each tensor (B, S, D_dec),
+            where T = 1 (pre-proj) + dec_depth.
+        """
+        final_output = [(f1, f2)]  # [(B, S, D_enc), (B, S, D_enc)] before projection
 
         # project to decoder dim
-        f1 = self.decoder_embed(f1)
-        f2 = self.decoder_embed(f2)
+        f1 = self.decoder_embed(f1)  # (B, S, D_dec)
+        f2 = self.decoder_embed(f2)  # (B, S, D_dec)
 
-        final_output.append((f1, f2))
+        final_output.append((f1, f2))  # now: [((B, S, D_enc) x 2), ((B, S, D_dec) x 2)]
         for blk1, blk2 in zip(self.dec_blocks, self.dec_blocks2):
             # img1 side
-            f1, _ = blk1(*final_output[-1][::+1], pos1, pos2)
+            f1, _ = blk1(*final_output[-1][::+1], pos1, pos2)  # inputs: (B, S, D_dec),(B, S, D_dec); outputs f1: (B, S, D_dec)
             # img2 side
-            f2, _ = blk2(*final_output[-1][::-1], pos2, pos1)
+            f2, _ = blk2(*final_output[-1][::-1], pos2, pos1)  # inputs: (B, S, D_dec),(B, S, D_dec); outputs f2: (B, S, D_dec)
             # store the result
-            final_output.append((f1, f2))
+            final_output.append((f1, f2))  # append stage outputs; tensors (B, S, D_dec)
 
         # normalize last output
-        del final_output[1]  # duplicate with final_output[0]
-        final_output[-1] = tuple(map(self.dec_norm, final_output[-1]))
-        return zip(*final_output)
+        # At this point final_output is: [((B, S, D_enc) x 2), ((B, S, D_dec) x 2), dec_depth x ((B, S, D_dec) x 2)]
+        # Remove the projected stage to keep: [((B, S, D_enc) x 2), dec_depth x ((B, S, D_dec) x 2)]
+        del final_output[1]  # remove projected duplicate stage (keep pre-proj and all block stages)
+        final_output[-1] = tuple(map(self.dec_norm, final_output[-1]))  # apply norm: (B, S, D_dec)
+        return zip(*final_output)  # [(B, S, D_enc), dec_depth x (B, S, D_dec)] x 2
 
     def _downstream_head(self, head_num, decout, img_shape):
         B, S, D = decout[-1].shape
@@ -301,21 +321,21 @@ class DynaDUSt3R(
         
         Args:
             head_num: Which motion head to use (1 or 2)
-            decout: Decoder output features
-            img_shape: Image shape information
-            query_times: Tensor of shape (B, T) where T is number of query times
+            decout: tuple/list length = 1 + dec_depth; first (B, S, D_enc), rest (B, S, D_dec)
+            img_shape: (B, 2) tensor of (H, W)
+            query_times: (B, T) tensor where T is number of query times
             
         Returns:
-            dict: Motion predictions for all query times with shape (B, T, H, W, 3)
+            dict: { 'map_pred': (B, T, H, W, 3), optional 'map_pred_conf': (B, T, H, W, 1) }
         """
-        B = decout[-1].shape[0]
-        T = query_times.shape[1]
+        B = decout[-1].shape[0]  # (int)
+        T = query_times.shape[1]  # (int)
         
         # Prepare decoder outputs for batch processing
         # Replicate decoder outputs T times and flatten batch dimension
         decout_expanded = []
         for feat in decout:
-            # feat shape: (B, S, D)
+            # feat: (B, S, D)
             feat_expanded = feat.unsqueeze(1).expand(-1, T, -1, -1)  # (B, T, S, D)
             feat_expanded = feat_expanded.reshape(B * T, *feat.shape[1:])  # (B*T, S, D)
             decout_expanded.append(feat_expanded)
@@ -325,7 +345,7 @@ class DynaDUSt3R(
             img_shape_expanded = img_shape.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)  # (B*T, 2)
         else:
             # If img_shape is a tuple, repeat it
-            img_shape_expanded = img_shape
+            img_shape_expanded = img_shape  # (H, W) tuple (not used in current flow)
         
         # Flatten query times for batch processing
         query_times_flat = query_times.reshape(B * T)  # (B*T,)
@@ -333,10 +353,10 @@ class DynaDUSt3R(
         # Get motion head and process all queries at once
         head = getattr(self, f"mhead{head_num}")
         motion_out = head(decout_expanded, img_shape_expanded, query_times_flat)
-        # motion_out["map_pred"] shape: (B*T, H, W, 3)
+        # motion_out["map_pred"]: (B*T, H, W, 3); optional motion_out["map_pred_conf"]: (B*T, H, W)
         
         # Reshape outputs back to separate batch and time dimensions
-        H, W = motion_out["map_pred"].shape[1:3]
+        H, W = motion_out["map_pred"].shape[1:3]  # (int, int)
         motion_pred = motion_out["map_pred"].reshape(B, T, H, W, 3)  # (B, T, H, W, 3)
         
         result = {"map_pred": motion_pred}
@@ -344,7 +364,7 @@ class DynaDUSt3R(
         if "map_pred_conf" in motion_out:
             motion_conf = motion_out["map_pred_conf"].reshape(B, T, H, W, 1)  # (B, T, H, W, 1)
             result["map_pred_conf"] = motion_conf
-            
+        
         return result
 
     def forward(self, batch):
@@ -352,49 +372,61 @@ class DynaDUSt3R(
         Forward pass for the DynaDUSt3R model with general multi-query time support.
 
         Parameters:
-            batch: Dictionary containing:
-                - 'left_image': (B, C, H, W)
-                - 'right_image': (B, C, H, W)
-                - 'query_times': (B, T) or (T,) - arbitrary number of query times
+            batch (dict):
+                - 'left_image': (B, 3, H, W)
+                - 'right_image': (B, 3, H, W)
+                - 'query_times': (B, T) or (T,) or None - arbitrary number of query times
+                - 'left_instance': list[str] or None
+                - 'right_instance': list[str] or None
 
         Returns:
             dict: Combined dictionary with results from both views including motion predictions
+                - 'left_map_pred': (B, H, W, 3)
+                - 'left_map_pred_conf': (B, H, W, 1) or None
+                - 'right_map_pred_in_left_frame': (B, H, W, 3)
+                - 'right_map_pred_conf': (B, H, W, 1) or None
+                - 'motion_pred' (if query_times provided): dict mapping
+                    - 'l_to_{t}': (B, H, W, 3) for available t
+                    - 'r_to_{t}': (B, H, W, 3) for available t
+                    - optional '..._conf': (B, H, W, 1)
+                - 'batch_size': (int)
         """
         # extract views from batch
         left_view = {
-            "img": batch["left_image"],  # (B, C, H, W)
+            "img": batch["left_image"],  # (B, 3, H, W)
             "true_shape": torch.tensor(batch["left_image"].shape[-2:])[None].repeat(
                 batch["left_image"].size(0), 1
             ),  # (B, 2)
-            "instance": batch.get("left_instance", None),  # [B x string] or None
+            "instance": batch.get("left_instance", None),  # (list[str]) or None
         }
         right_view = {
-            "img": batch["right_image"],  # (B, C, H, W)
+            "img": batch["right_image"],  # (B, 3, H, W)
             "true_shape": torch.tensor(batch["right_image"].shape[-2:])[None].repeat(
                 batch["right_image"].size(0), 1
             ),  # (B, 2)
-            "instance": batch.get("right_instance", None),  # [B x string] or None
+            "instance": batch.get("right_instance", None),  # (list[str]) or None
         }
 
         # get query times
-        query_times = batch.get("query_times", None)  # (B, T) or (T,)
+        query_times = batch.get("query_times", None)  # (B, T) or (T,) or None
         
         # encode images
         (shape_left, shape_right), (feat_left, feat_right), (pos_left, pos_right) = (
             self._encode_symmetrized(left_view, right_view)
-        )
+        )  # shape_left: (B, 2), shape_right: (B, 2); feat_*: (B, S, D); pos_*: (B, S, D)
 
         # decode features
-        dec_left, dec_right = self._decoder(feat_left, pos_left, feat_right, pos_right)
+        dec_left, dec_right = self._decoder(feat_left, pos_left, feat_right, pos_right)  # dec_left, dec_right are tuples
+        # each: [(B,S,D_enc), dec_depth x (B,S,D_dec)], length = 1 + dec_depth; together: 2 x [(B,S,D_enc), dec_depth x (B,S,D_dec)]
 
         with torch.amp.autocast(device_type=self.device_type, enabled=False):
             # get 3d points for both views
             res_left = self._downstream_head(
                 1, [tok.float() for tok in dec_left], shape_left
-            )
+            )  # decout: list len=1+dec_depth, first (B,S,D_enc), rest (B,S,D_dec); returns dict: map_pred: (B,H,W,3); optional map_pred_conf: (B,H,W)
             res_right = self._downstream_head(
                 2, [tok.float() for tok in dec_right], shape_right
-            )
+            )  # decout: list len=1+dec_depth, first (B,S,D_enc), rest (B,S,D_dec); returns dict: map_pred: (B,H,W,3); optional map_pred_conf: (B,H,W)
 
             # predict motion if time queries provided
             if query_times is not None:
@@ -408,39 +440,43 @@ class DynaDUSt3R(
                     query_times = query_times.unsqueeze(0).expand(batch["left_image"].size(0), -1)
                 
                 # query_times shape: (B, T)
-                B, T = query_times.shape
+                B, T = query_times.shape  # (int, int)
                 
                 # Process all query times in parallel for both views
                 motion_left_all = self._motion_head_multi(
                     1, [tok.float() for tok in dec_left], shape_left, query_times
-                )
+                )  # decout: list len=1+dec_depth, first (B,S,D_enc), rest (B,S,D_dec); dict: map_pred: (B,T,H,W,3); optional map_pred_conf: (B,T,H,W,1)
                 motion_right_all = self._motion_head_multi(
                     2, [tok.float() for tok in dec_right], shape_right, query_times
-                )
+                )  # decout: list len=1+dec_depth, first (B,S,D_enc), rest (B,S,D_dec); dict: map_pred: (B,T,H,W,3); optional map_pred_conf: (B,T,H,W,1)
                 
                 # Organize motion predictions with dynamic keys
-                motion_pred = {}
+                motion_pred = {}  # dict[str, Tensor]
                 
                 for t_idx in range(T):
                     # Get the actual time value for this index
-                    t_val = query_times[0, t_idx].item()  # Assuming all batches have same query times
+                    t_val = query_times[0, t_idx].item()  # (float) Assuming all batches share query_times
                     
                     # Left view predicts motion to all times except 0
-                    if abs(t_val - 0.0) > 1e-6:  # Not at t=0
-                        key = f"l_to_{t_val:.3g}"  # Format nicely (e.g., 0.35 instead of 0.350)
+                    if abs(t_val - 0.0) > 1e-6:  # (bool) Not at t=0
+                        key = f"l_to_{t_val:.3g}"  # (str) Format nicely (e.g., 0.35 instead of 0.350)
                         motion_pred[key] = motion_left_all["map_pred"][:, t_idx]  # (B, H, W, 3)
                         if "map_pred_conf" in motion_left_all:
-                            motion_pred[f"{key}_conf"] = motion_left_all["map_pred_conf"][:, t_idx]  # (B, H, W, 1)
+                            motion_pred[f"{key}_conf"] = motion_left_all["map_pred_conf"][
+                                :, t_idx
+                            ]  # (B, H, W, 1)
                     
                     # Right view predicts motion to all times except 1
-                    if abs(t_val - 1.0) > 1e-6:  # Not at t=1
-                        key = f"r_to_{t_val:.3g}"
+                    if abs(t_val - 1.0) > 1e-6:  # (bool) Not at t=1
+                        key = f"r_to_{t_val:.3g}"  # (str)
                         motion_pred[key] = motion_right_all["map_pred"][:, t_idx]  # (B, H, W, 3)
                         if "map_pred_conf" in motion_right_all:
-                            motion_pred[f"{key}_conf"] = motion_right_all["map_pred_conf"][:, t_idx]  # (B, H, W, 1)
+                            motion_pred[f"{key}_conf"] = motion_right_all["map_pred_conf"][
+                                :, t_idx
+                            ]  # (B, H, W, 1)
 
         # Rename right's 3D points to indicate they're in left's frame
-        res_right["map_pred_in_left_frame"] = res_right.pop("map_pred")
+        res_right["map_pred_in_left_frame"] = res_right.pop("map_pred")  # (B, H, W, 3)
 
         if "map_pred_conf" in res_left and res_left["map_pred_conf"] is not None:
             if res_left["map_pred_conf"].ndim == 3:
@@ -451,122 +487,149 @@ class DynaDUSt3R(
 
 
         # Combine results into single dictionary
-        combined_results = {}
+        combined_results = {}  # dict[str, Tensor or dict]
 
         # Add left view 3D points
         for k, v in res_left.items():
-            combined_results[f"left_{k}"] = v
+            combined_results[f"left_{k}"] = v  # left_map_pred: (B, H, W, 3); left_map_pred_conf: (B, H, W, 1)
 
         # Add right view 3D points
         for k, v in res_right.items():
-            combined_results[f"right_{k}"] = v
+            combined_results[f"right_{k}"] = v  # right_map_pred_in_left_frame: (B, H, W, 3); right_map_pred_conf: (B, H, W, 1)
 
         # Add motion predictions if computed
         if query_times is not None:
-            combined_results["motion_pred"] = motion_pred
+            combined_results["motion_pred"] = motion_pred  # dict[str, Tensor]
 
         # Add batch size for metrics calculation
-        combined_results["batch_size"] = batch["left_image"].size(0)
+        combined_results["batch_size"] = batch["left_image"].size(0)  # (int)
 
-        return combined_results
+        return combined_results  # dict
         # Output dictionary contains:
         # 'left_map_pred': (B, H, W, 3) - 3D points from left view
         # 'left_map_pred_conf': optional (B, H, W, 1) - confidence for left view points
         # 'right_map_pred_in_left_frame': (B, H, W, 3) - 3D points from right view in left frame
         # 'right_map_pred_conf': optional (B, H, W, 1) - confidence for right view points
-        # 'motion_pred': dict with dynamic keys like "l_to_0.2", "r_to_0.35" etc - motion predictions
+        # 'motion_pred': dict of dynamic keys (present only if query_times is provided):
+        #   - "l_to_{t}": (B, H, W, 3) motion from left (t=0) to time t for each queried t with t != 0
+        #       - optional "l_to_{t}_conf": (B, H, W, 1) if confidence is enabled (conf_mode != None)
+        #   - "r_to_{t}": (B, H, W, 3) motion from right (t=1) to time t for each queried t with t != 1
+        #       - optional "r_to_{t}_conf": (B, H, W, 1) if confidence is enabled (conf_mode != None)
+        #   - t is a float value taken from query_times[0, t_idx]; keys exist only for those specific t values
         # 'batch_size': integer - batch size for metrics calculation
-
 
     def get_loss(self, batch, outputs):
         """
         Compute total loss with aggressive memory optimization.
         Fixed to match unoptimized version behavior exactly.
+
+        Args:
+            batch (dict):
+                - left_pm: (B, H, W, 4)
+                - right_pm: (B, H, W, 4)
+                - motion_gt (dict):
+                    - 'l2m': (B, H, W, 4)
+                    - 'r2m': (B, H, W, 4)
+                    - 'l2r': (B, H, W, 4)
+                    - 'r2l': (B, H, W, 4)
+                - left_image: (B, 3, H, W)
+                - right_image: (B, 3, H, W)
+                - query_times: (B, T) or (T,)
+            outputs (dict):
+                - left_map_pred: (B, H, W, 3)
+                - left_map_pred_conf: (B, H, W, 1) or None
+                - right_map_pred_in_left_frame: (B, H, W, 3)
+                - right_map_pred_conf: (B, H, W, 1) or None
+                - motion_pred (dict):
+                    - "l_to_{t}": (B, H, W, 3) for available t
+                    - "r_to_{t}": (B, H, W, 3) for available t
+                    - optional "..._conf": (B, H, W, 1)
+
+        Returns:
+            total_loss: ()
+            loss_details: dict[str, float]
         """
-        device = batch["left_pm"].device  # ()
-        alpha = 0.2  # ()
-        
+        device = batch["left_pm"].device  # (torch.device)
+        alpha = 0.2  # (float)
+
         # Extract query time once
-        tq_mid = batch["query_times"][0, 0].item()  # ()
-        
+        tq_mid = batch["query_times"][0, 0].item()  # (float)
+
         # Process everything in chunks to avoid large intermediate tensors
         total_loss = torch.tensor(0.0, device=device, requires_grad=True)  # ()
         loss_details = {}  # (dict)
-        
-        # Define all loss computations
-        loss_configs = [  # (list[len=6])
-            # Base point clouds
+
+        loss_configs = [
             {
                 "name": "left",
-                "gt": batch["left_pm"][..., :3],  # (B,H,W,3)
-                "pred": outputs["left_map_pred"],  # (B,H,W,3)
-                "valid": batch["left_pm"][..., 3] > 0,  # (B,H,W)
-                "conf": outputs.get("left_map_pred_conf", None),  # (B,H,W,1) or None
+                "gt": batch["left_pm"][..., :3],  # (B, H, W, 3)
+                "pred": outputs["left_map_pred"],  # (B, H, W, 3)
+                "valid": batch["left_pm"][..., 3] > 0,  # (B, H, W)
+                "conf": outputs.get("left_map_pred_conf", None),  # (B, H, W, 1) or None
                 "is_base": True
             },
             {
                 "name": "right", 
-                "gt": batch["right_pm"][..., :3],  # (B,H,W,3)
-                "pred": outputs["right_map_pred_in_left_frame"],  # (B,H,W,3)
-                "valid": batch["right_pm"][..., 3] > 0,  # (B,H,W)
-                "conf": outputs.get("right_map_pred_conf", None),  # (B,H,W,1) or None
+                "gt": batch["right_pm"][..., :3],  # (B, H, W, 3)
+                "pred": outputs["right_map_pred_in_left_frame"],  # (B, H, W, 3)
+                "valid": batch["right_pm"][..., 3] > 0,  # (B, H, W)
+                "conf": outputs.get("right_map_pred_conf", None),  # (B, H, W, 1) or None
                 "is_base": True
             },
-            # Motion point clouds
             {
                 "name": "l2m",
-                "gt": batch["left_pm"][..., :3] + batch["motion_gt"]["l2m"][..., :3],  # (B,H,W,3)
-                "pred": outputs["left_map_pred"] + outputs["motion_pred"][f"l_to_{tq_mid:.3g}"][..., :3],  # (B,H,W,3)
-                "valid": (batch["left_pm"][..., 3] > 0) & (batch["motion_gt"]["l2m"][..., 3] > 0),  # (B,H,W)
-                "conf": outputs["motion_pred"].get(f"l_to_{tq_mid:.3g}_conf", None),  # (B,H,W,1) or None
+                "gt": batch["left_pm"][..., :3] + batch["motion_gt"]["l2m"][..., :3],  # (B, H, W, 3)
+                "pred": outputs["left_map_pred"] + outputs["motion_pred"][f"l_to_{tq_mid:.3g}"][..., :3],  # (B, H, W, 3)
+                "valid": (batch["left_pm"][..., 3] > 0) & (batch["motion_gt"]["l2m"][..., 3] > 0),  # (B, H, W)
+                "conf": outputs["motion_pred"].get(f"l_to_{tq_mid:.3g}_conf", None),  # (B, H, W, 1) or None
                 "is_base": False
             },
             {
                 "name": "r2m",
-                "gt": batch["right_pm"][..., :3] + batch["motion_gt"]["r2m"][..., :3],  # (B,H,W,3)
-                "pred": outputs["right_map_pred_in_left_frame"] + outputs["motion_pred"][f"r_to_{tq_mid:.3g}"][..., :3],  # (B,H,W,3)
-                "valid": (batch["right_pm"][..., 3] > 0) & (batch["motion_gt"]["r2m"][..., 3] > 0),  # (B,H,W)
-                "conf": outputs["motion_pred"].get(f"r_to_{tq_mid:.3g}_conf", None),  # (B,H,W,1) or None
+                "gt": batch["right_pm"][..., :3] + batch["motion_gt"]["r2m"][..., :3],  # (B, H, W, 3)
+                "pred": outputs["right_map_pred_in_left_frame"] + outputs["motion_pred"][f"r_to_{tq_mid:.3g}"][..., :3],  # (B, H, W, 3)
+                "valid": (batch["right_pm"][..., 3] > 0) & (batch["motion_gt"]["r2m"][..., 3] > 0),  # (B, H, W)
+                "conf": outputs["motion_pred"].get(f"r_to_{tq_mid:.3g}_conf", None),  # (B, H, W, 1) or None
                 "is_base": False
             },
             {
                 "name": "l2r",
-                "gt": batch["left_pm"][..., :3] + batch["motion_gt"]["l2r"][..., :3],  # (B,H,W,3)
-                "pred": outputs["left_map_pred"] + outputs["motion_pred"]["l_to_1"][..., :3],  # (B,H,W,3)
-                "valid": (batch["left_pm"][..., 3] > 0) & (batch["motion_gt"]["l2r"][..., 3] > 0),  # (B,H,W)
-                "conf": outputs["motion_pred"].get("l_to_1_conf", None),  # (B,H,W,1) or None
+                "gt": batch["left_pm"][..., :3] + batch["motion_gt"]["l2r"][..., :3],  # (B, H, W, 3)
+                "pred": outputs["left_map_pred"] + outputs["motion_pred"]["l_to_1"][..., :3],  # (B, H, W, 3)
+                "valid": (batch["left_pm"][..., 3] > 0) & (batch["motion_gt"]["l2r"][..., 3] > 0),  # (B, H, W)
+                "conf": outputs["motion_pred"].get("l_to_1_conf", None),  # (B, H, W, 1) or None
                 "is_base": False
             },
             {
                 "name": "r2l",
-                "gt": batch["right_pm"][..., :3] + batch["motion_gt"]["r2l"][..., :3],  # (B,H,W,3)
-                "pred": outputs["right_map_pred_in_left_frame"] + outputs["motion_pred"]["r_to_0"][..., :3],  # (B,H,W,3)
-                "valid": (batch["right_pm"][..., 3] > 0) & (batch["motion_gt"]["r2l"][..., 3] > 0),  # (B,H,W)
-                "conf": outputs["motion_pred"].get("r_to_0_conf", None),  # (B,H,W,1) or None
+                "gt": batch["right_pm"][..., :3] + batch["motion_gt"]["r2l"][..., :3],  # (B, H, W, 3)
+                "pred": outputs["right_map_pred_in_left_frame"] + outputs["motion_pred"]["r_to_0"][..., :3],  # (B, H, W, 3)
+                "valid": (batch["right_pm"][..., 3] > 0) & (batch["motion_gt"]["r2l"][..., 3] > 0),  # (B, H, W)
+                "conf": outputs["motion_pred"].get("r_to_0_conf", None),  # (B, H, W, 1) or None
                 "is_base": False
             }
         ]  # (list[len=6])
-        
+
         # Compute normalization factors once for base PCs
         with torch.no_grad():  # ()
             # Extract base PCs and validity
-            gt_left_pc = batch["left_pm"][..., :3]  # (B,H,W,3)
-            gt_right_pc = batch["right_pm"][..., :3]  # (B,H,W,3)
-            valid_left = batch["left_pm"][..., 3] > 0  # (B,H,W)
-            valid_right = batch["right_pm"][..., 3] > 0  # (B,H,W)
-            
+            gt_left_pc = batch["left_pm"][..., :3]  # (B, H, W, 3)
+            gt_right_pc = batch["right_pm"][..., :3]  # (B, H, W, 3)
+            valid_left = batch["left_pm"][..., 3] > 0  # (B, H, W)
+            valid_right = batch["right_pm"][..., 3] > 0  # (B, H, W)
+
             # GT normalization - using the FIXED version to match unoptimized
             gt_scale = self._compute_norm_factor_fixed(  # (B,1,1,1)
                 gt_left_pc, gt_right_pc, valid_left, valid_right
             )
-        
+
         # Pred normalization (needs gradients)
         pred_scale = self._compute_norm_factor_fixed(  # (B,1,1,1)
-            outputs["left_map_pred"], 
+            outputs["left_map_pred"],
             outputs["right_map_pred_in_left_frame"],
             valid_left, valid_right
         )
-        
+
         # Process each loss component
         for cfg in loss_configs:  # ()
             # # debug: print shapes per component once
@@ -574,39 +637,40 @@ class DynaDUSt3R(
             #     def s(x): return None if x is None else tuple(x.shape)
             #     print(f"[loss-cfg] {cfg['name']}: gt={s(cfg['gt'])} pred={s(cfg['pred'])} valid={s(cfg['valid'])} conf={s(cfg['conf'])}")
             #     if cfg["conf"] is not None and cfg["conf"].ndim == 4 and cfg["conf"].shape[-1] != 1:
-            #         print(f"[conf-multi] {cfg['name']} conf has C={cfg['conf'].shape[-1]} channels")  # (B,H,W,C)
+            #         print(f"[conf-multi] {cfg['name']} conf has C={cfg['conf'].shape[-1]} channels")  # (B, H, W, C)
 
             # Compute single loss component
             loss_comp = self._compute_single_loss_fixed(  # ()
                 cfg["gt"], cfg["pred"], cfg["valid"], cfg["conf"],
                 gt_scale, pred_scale, alpha, device
             )
-            
+
             # Accumulate loss
             total_loss = total_loss + loss_comp  # ()
-            
+
             # Store details - FIXED to match unoptimized naming
             if cfg["conf"] is not None:  # ()
-                loss_details[f"{cfg['name']}_conf"] = loss_comp.item()  # ()
-                loss_details[f"{cfg['name']}_l2"] = 0.0  # L2 not used when conf available  # ()
+                # (float)
+                loss_details[f"{cfg['name']}_conf"] = loss_comp.item()
+                # L2 not used when conf available  # (float)
+                loss_details[f"{cfg['name']}_l2"] = 0.0
             else:
-                loss_details[f"{cfg['name']}_conf"] = 0.0  # ()
-                loss_details[f"{cfg['name']}_l2"] = loss_comp.item()  # ()
-            
+                loss_details[f"{cfg['name']}_conf"] = 0.0  # (float)
+                loss_details[f"{cfg['name']}_l2"] = loss_comp.item()  # (float)
+
             # Explicitly delete intermediate tensors if not base PC
             if not cfg["is_base"]:  # ()
                 del cfg["gt"], cfg["pred"]  # ()
                 if "valid" in cfg:  # ()
                     del cfg["valid"]  # ()
-        
-        loss_details["total_loss"] = total_loss.item()  # ()
-        
+
+        loss_details["total_loss"] = total_loss.item()  # (float)
+
         # Force garbage collection for large tensors
         if hasattr(torch.cuda, 'empty_cache'):  # ()
             torch.cuda.empty_cache()  # ()
-        
-        return total_loss, loss_details  # ((), dict)
 
+        return total_loss, loss_details  # ((), dict)
 
     def _compute_norm_factor_fixed(self, pc1, pc2, valid1, valid2):
         """
@@ -615,34 +679,34 @@ class DynaDUSt3R(
         """
         batch_size = pc1.shape[0]  # ()
         device = pc1.device  # ()
-        
+
         # Mask invalid points to 0 (matching unoptimized)
-        pc1_masked = pc1.clone()  # (B,H,W,3)
-        pc2_masked = pc2.clone()  # (B,H,W,3)
-        pc1_masked[~valid1] = 0  # (B,H,W,3)
-        pc2_masked[~valid2] = 0  # (B,H,W,3)
-        
+        pc1_masked = pc1.clone()  # (B, H, W, 3)
+        pc2_masked = pc2.clone()  # (B, H, W, 3)
+        pc1_masked[~valid1] = 0  # (B, H, W, 3)
+        pc2_masked[~valid2] = 0  # (B, H, W, 3)
+
         # Stack and compute distances (matching unoptimized)
-        all_pts = torch.cat([pc1_masked.flatten(1, 2), pc2_masked.flatten(1, 2)], dim=1)  # (B,2*H*W,3)
+        all_pts = torch.cat(
+            [pc1_masked.flatten(1, 2), pc2_masked.flatten(1, 2)], dim=1)  # (B,2*H*W,3)
         all_dis = all_pts.norm(dim=-1)  # (B,2*H*W)
-        
+
         # Count valid points
         nnz1 = valid1.sum(dim=(1, 2))  # (B,)
         nnz2 = valid2.sum(dim=(1, 2))  # (B,)
-        
+
         # Average distance
         norm_factor = all_dis.sum(dim=1) / (nnz1 + nnz2 + 1e-8)  # (B,)
         norm_factor = norm_factor.clip(min=1e-8)  # (B,)
-        
+
         # Expand to match PC dimensions
         while norm_factor.ndim < pc1.ndim:  # ()
             norm_factor = norm_factor.unsqueeze(-1)  # (B,1,1,1) after loop
-        
+
         return norm_factor  # (B,1,1,1)
 
-
-    def _compute_single_loss_fixed(self, gt_pc, pred_pc, valid_mask, conf, 
-                                gt_scale, pred_scale, alpha, device):
+    def _compute_single_loss_fixed(self, gt_pc, pred_pc, valid_mask, conf,
+                                   gt_scale, pred_scale, alpha, device):
         """
         Compute loss for a single PC pair matching unoptimized behavior.
         Key fix: Only return confidence loss when available, otherwise return 0.
@@ -658,39 +722,40 @@ class DynaDUSt3R(
 
         if not valid_mask.any():  # ()
             return zero_attach  # ()
-        
+
         # Normalize full PCs first (like unoptimized)
-        gt_pc_norm = gt_pc / gt_scale  # (B,H,W,3)
-        pred_pc_norm = pred_pc / pred_scale  # (B,H,W,3)
-        
+        gt_pc_norm = gt_pc / gt_scale  # (B, H, W, 3)
+        pred_pc_norm = pred_pc / pred_scale  # (B, H, W, 3)
+
         # Compute L2 distance for all pixels
-        l2_dist = (pred_pc_norm - gt_pc_norm).norm(dim=-1)  # (B,H,W)
-        
+        l2_dist = (pred_pc_norm - gt_pc_norm).norm(dim=-1)  # (B, H, W)
+
         # Extract valid distances
         l2_dist_valid = l2_dist[valid_mask]  # (N,)
-        
+
         # CRITICAL FIX: Match unoptimized behavior
         if conf is not None:  # ()
             # Extract valid confidence values
-            conf_valid = conf[valid_mask].squeeze(-1)  # (N,) or (N,1)
+            conf_valid = conf[valid_mask].squeeze(-1)  # (N,)
             # Remove .squeeze(-1) unless you're sure about the shape
-            # conf_valid = conf_valid.squeeze(-1)  
-            
-            assert l2_dist_valid.ndim == 1 and conf_valid.ndim == 1  # (K,), (K,)
+            # conf_valid = conf_valid.squeeze(-1)
+
+            # (K,), (K,)
+            assert l2_dist_valid.ndim == 1 and conf_valid.ndim == 1
 
             # Compute confidence loss (no clamping to match unoptimized exactly)
-            loss = (l2_dist_valid * conf_valid - alpha * torch.log(conf_valid)).mean() + zero_attach  # ()
+            loss = (l2_dist_valid * conf_valid - alpha *
+                    torch.log(conf_valid)).mean() + zero_attach  # ()
         else:
             # Return 0 when no confidence (matching unoptimized bug/feature)
             loss = zero_attach  # ()
-        
+
         return loss  # ()
-
-
 
     # ---------------------------------------------------------------------
     #  UPDATED: compute_metrics – static error + *point-cloud* motion error
     # ---------------------------------------------------------------------
+
     def compute_metrics(self, batch, outputs):
         """
         Returns:
@@ -704,7 +769,8 @@ class DynaDUSt3R(
         if "left_map_pred" in outputs and batch["left_pm"][..., 3].sum() > 0:
             mask = batch["left_pm"][..., 3] > 0
             metrics["left_3d_error"] = torch.norm(
-                outputs["left_map_pred"][mask] - batch["left_pm"][..., :3][mask],
+                outputs["left_map_pred"][mask] -
+                batch["left_pm"][..., :3][mask],
                 dim=-1,
             ).mean().item()
 
@@ -737,29 +803,34 @@ class DynaDUSt3R(
         dir_cfg = {
             "l2m": {
                 "pred_key": f"l_to_{tq_mid:.3g}",
-                "src_pts": outputs["left_map_pred"],                          # (B,H,W,3)
-                "tgt_pts": batch["left_pm"][..., :3] + batch["motion_gt"]["l2m"][..., :3],  # left base + l2m motion
+                # (B, H, W, 3)
+                "src_pts": outputs["left_map_pred"],
+                # left base + l2m motion
+                "tgt_pts": batch["left_pm"][..., :3] + batch["motion_gt"]["l2m"][..., :3],
                 "base_valid": batch["left_pm"][..., 3] > 0,
                 "motion_valid": batch["motion_gt"]["l2m"][..., 3] > 0,
             },
             "r2m": {
                 "pred_key": f"r_to_{tq_mid:.3g}",
                 "src_pts": outputs["right_map_pred_in_left_frame"],
-                "tgt_pts": batch["right_pm"][..., :3] + batch["motion_gt"]["r2m"][..., :3],  # right base + r2m motion
+                # right base + r2m motion
+                "tgt_pts": batch["right_pm"][..., :3] + batch["motion_gt"]["r2m"][..., :3],
                 "base_valid": batch["right_pm"][..., 3] > 0,
                 "motion_valid": batch["motion_gt"]["r2m"][..., 3] > 0,
             },
             "l2r": {
                 "pred_key": "l_to_1",
                 "src_pts": outputs["left_map_pred"],
-                "tgt_pts": batch["left_pm"][..., :3] + batch["motion_gt"]["l2r"][..., :3],  # left base + l2r motion
+                # left base + l2r motion
+                "tgt_pts": batch["left_pm"][..., :3] + batch["motion_gt"]["l2r"][..., :3],
                 "base_valid": batch["left_pm"][..., 3] > 0,
                 "motion_valid": batch["motion_gt"]["l2r"][..., 3] > 0,
             },
             "r2l": {
                 "pred_key": "r_to_0",
                 "src_pts": outputs["right_map_pred_in_left_frame"],
-                "tgt_pts": batch["right_pm"][..., :3] + batch["motion_gt"]["r2l"][..., :3],  # right base + r2l motion
+                # right base + r2l motion
+                "tgt_pts": batch["right_pm"][..., :3] + batch["motion_gt"]["r2l"][..., :3],
                 "base_valid": batch["right_pm"][..., 3] > 0,
                 "motion_valid": batch["motion_gt"]["r2l"][..., 3] > 0,
             },
@@ -770,9 +841,12 @@ class DynaDUSt3R(
             if cfg["pred_key"] not in outputs["motion_pred"]:
                 continue  # prediction absent
 
-            pred_disp = outputs["motion_pred"][cfg["pred_key"]]          # (B,H,W,3)
-            pts_pred  = cfg["src_pts"] + pred_disp                       # translated cloud
-            valid     = cfg["base_valid"] & cfg["motion_valid"]         # intersection validity
+            # (B, H, W, 3)
+            pred_disp = outputs["motion_pred"][cfg["pred_key"]]
+            # translated cloud
+            pts_pred = cfg["src_pts"] + pred_disp
+            # intersection validity
+            valid = cfg["base_valid"] & cfg["motion_valid"]
 
             if valid.sum() == 0:
                 continue  # no valid GT for this direction
@@ -785,16 +859,14 @@ class DynaDUSt3R(
             motion_errs.append(err)
 
         if motion_errs:
-            metrics["avg_motion_pc_error"] = sum(motion_errs) / len(motion_errs)
+            metrics["avg_motion_pc_error"] = sum(
+                motion_errs) / len(motion_errs)
 
         return metrics
-
-
 
     def save_visualizations(self, batch, outputs, base_name, i=0, *args, **kwargs):
         from utils.viz import save_visualizations as save_viz
         save_viz(batch, outputs, base_name, i=i, *args, **kwargs)
-
 
     def save_checkpoint(self, state, is_best, filename):
         """
@@ -847,12 +919,14 @@ class DynaDUSt3R(
             # Download if not already present
             if not os.path.exists(save_path):
                 print(f"downloading pretrained weights to {save_path}.")
-                subprocess.run(["wget", pretrained_url, "-O", save_path], check=True)
+                subprocess.run(
+                    ["wget", pretrained_url, "-O", save_path], check=True)
             else:
                 print(f"pretrained weights already exist at {save_path}.")
 
             # Load the checkpoint
-            checkpoint = torch.load(save_path, map_location=device, weights_only=False)
+            checkpoint = torch.load(
+                save_path, map_location=device, weights_only=False)
 
             # Some checkpoints have 'model' and 'args' keys, so extract the raw state dict if needed
             if isinstance(checkpoint, dict) and "model" in checkpoint:
