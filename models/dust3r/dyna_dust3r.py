@@ -705,51 +705,41 @@ class DynaDUSt3R(
 
         return norm_factor  # (B,1,1,1)
 
-    def _compute_single_loss_fixed(self, gt_pc, pred_pc, valid_mask, conf,
+    def _compute_single_loss_fixed(self, gt_pc, pred_pc, valid_mask, conf, 
                                    gt_scale, pred_scale, alpha, device):
         """
         Compute loss for a single PC pair matching unoptimized behavior.
         Key fix: Only return confidence loss when available, otherwise return 0.
         """
-        # Always touch prediction (and conf) so parameters participate in the graph
-        # even when no valid pixels on this rank. This avoids DDP desync.
-        zero_attach = (pred_pc[..., :1].sum() * 0.0)  # ()
-        if conf is not None:  # ()
-            try:
-                zero_attach = zero_attach + (conf[..., :1].sum() * 0.0)  # ()
-            except Exception:
-                zero_attach = zero_attach + (conf.sum() * 0.0)  # ()
-
         if not valid_mask.any():  # ()
-            return zero_attach  # ()
-
+            return torch.tensor(0.0, device=pred_pc.device)  # ()
+ 
         # Normalize full PCs first (like unoptimized)
         gt_pc_norm = gt_pc / gt_scale  # (B, H, W, 3)
         pred_pc_norm = pred_pc / pred_scale  # (B, H, W, 3)
-
+ 
         # Compute L2 distance for all pixels
         l2_dist = (pred_pc_norm - gt_pc_norm).norm(dim=-1)  # (B, H, W)
-
+ 
         # Extract valid distances
         l2_dist_valid = l2_dist[valid_mask]  # (N,)
-
+ 
         # CRITICAL FIX: Match unoptimized behavior
         if conf is not None:  # ()
             # Extract valid confidence values
             conf_valid = conf[valid_mask].squeeze(-1)  # (N,)
             # Remove .squeeze(-1) unless you're sure about the shape
-            # conf_valid = conf_valid.squeeze(-1)
-
+            # conf_valid = conf_valid.squeeze(-1)  
+ 
             # (K,), (K,)
             assert l2_dist_valid.ndim == 1 and conf_valid.ndim == 1
-
+ 
             # Compute confidence loss (no clamping to match unoptimized exactly)
-            loss = (l2_dist_valid * conf_valid - alpha *
-                    torch.log(conf_valid)).mean() + zero_attach  # ()
+            loss = (l2_dist_valid * conf_valid - alpha * torch.log(conf_valid)).mean()  # ()
         else:
             # Return 0 when no confidence (matching unoptimized bug/feature)
-            loss = zero_attach  # ()
-
+            loss = torch.tensor(0.0, device=pred_pc.device)  # ()
+ 
         return loss  # ()
 
     # ---------------------------------------------------------------------
@@ -763,22 +753,52 @@ class DynaDUSt3R(
         """
         metrics = {}
 
+        # Precompute validity masks
+        valid_left = batch["left_pm"][..., 3] > 0
+        valid_right = batch["right_pm"][..., 3] > 0
+
+        # Compute normalization factors exactly like in get_loss
+        with torch.no_grad():
+            gt_scale = self._compute_norm_factor_fixed(
+                batch["left_pm"][..., :3],
+                batch["right_pm"][..., :3],
+                valid_left,
+                valid_right,
+            )
+
+            pred_scale = None
+            if "left_map_pred" in outputs and "right_map_pred_in_left_frame" in outputs:
+                pred_scale = self._compute_norm_factor_fixed(
+                    outputs["left_map_pred"],
+                    outputs["right_map_pred_in_left_frame"],
+                    valid_left,
+                    valid_right,
+                )
+
         # ================================================================
-        #  1. static 3-D point-cloud errors
+        #  1. static 3-D point-cloud errors (scale-normalized)
         # ================================================================
-        if "left_map_pred" in outputs and batch["left_pm"][..., 3].sum() > 0:
-            mask = batch["left_pm"][..., 3] > 0
+        if (
+            pred_scale is not None
+            and "left_map_pred" in outputs
+            and valid_left.sum().item() > 0
+        ):
+            left_pred_n = outputs["left_map_pred"] / pred_scale
+            left_gt_n = batch["left_pm"][..., :3] / gt_scale
             metrics["left_3d_error"] = torch.norm(
-                outputs["left_map_pred"][mask] -
-                batch["left_pm"][..., :3][mask],
+                left_pred_n[valid_left] - left_gt_n[valid_left],
                 dim=-1,
             ).mean().item()
 
-        if "right_map_pred_in_left_frame" in outputs and batch["right_pm"][..., 3].sum() > 0:
-            mask = batch["right_pm"][..., 3] > 0
+        if (
+            pred_scale is not None
+            and "right_map_pred_in_left_frame" in outputs
+            and valid_right.sum().item() > 0
+        ):
+            right_pred_n = outputs["right_map_pred_in_left_frame"] / pred_scale
+            right_gt_n = batch["right_pm"][..., :3] / gt_scale
             metrics["right_3d_error"] = torch.norm(
-                outputs["right_map_pred_in_left_frame"][mask]
-                - batch["right_pm"][..., :3][mask],
+                right_pred_n[valid_right] - right_gt_n[valid_right],
                 dim=-1,
             ).mean().item()
 
@@ -788,7 +808,7 @@ class DynaDUSt3R(
             ) / 2.0
 
         # ================================================================
-        #  2. motion errors – compare *translated* point-clouds
+        #  2. motion errors – compare translated point-clouds (scale-normalized)
         # ================================================================
         if "motion_pred" not in outputs or "motion_gt" not in batch:
             return metrics  # nothing to add
@@ -803,35 +823,30 @@ class DynaDUSt3R(
         dir_cfg = {
             "l2m": {
                 "pred_key": f"l_to_{tq_mid:.3g}",
-                # (B, H, W, 3)
-                "src_pts": outputs["left_map_pred"],
-                # left base + l2m motion
+                "src_pts": outputs.get("left_map_pred"),
                 "tgt_pts": batch["left_pm"][..., :3] + batch["motion_gt"]["l2m"][..., :3],
-                "base_valid": batch["left_pm"][..., 3] > 0,
+                "base_valid": valid_left,
                 "motion_valid": batch["motion_gt"]["l2m"][..., 3] > 0,
             },
             "r2m": {
                 "pred_key": f"r_to_{tq_mid:.3g}",
-                "src_pts": outputs["right_map_pred_in_left_frame"],
-                # right base + r2m motion
+                "src_pts": outputs.get("right_map_pred_in_left_frame"),
                 "tgt_pts": batch["right_pm"][..., :3] + batch["motion_gt"]["r2m"][..., :3],
-                "base_valid": batch["right_pm"][..., 3] > 0,
+                "base_valid": valid_right,
                 "motion_valid": batch["motion_gt"]["r2m"][..., 3] > 0,
             },
             "l2r": {
                 "pred_key": "l_to_1",
-                "src_pts": outputs["left_map_pred"],
-                # left base + l2r motion
+                "src_pts": outputs.get("left_map_pred"),
                 "tgt_pts": batch["left_pm"][..., :3] + batch["motion_gt"]["l2r"][..., :3],
-                "base_valid": batch["left_pm"][..., 3] > 0,
+                "base_valid": valid_left,
                 "motion_valid": batch["motion_gt"]["l2r"][..., 3] > 0,
             },
             "r2l": {
                 "pred_key": "r_to_0",
-                "src_pts": outputs["right_map_pred_in_left_frame"],
-                # right base + r2l motion
+                "src_pts": outputs.get("right_map_pred_in_left_frame"),
                 "tgt_pts": batch["right_pm"][..., :3] + batch["motion_gt"]["r2l"][..., :3],
-                "base_valid": batch["right_pm"][..., 3] > 0,
+                "base_valid": valid_right,
                 "motion_valid": batch["motion_gt"]["r2l"][..., 3] > 0,
             },
         }
@@ -840,6 +855,8 @@ class DynaDUSt3R(
         for name, cfg in dir_cfg.items():
             if cfg["pred_key"] not in outputs["motion_pred"]:
                 continue  # prediction absent
+            if cfg["src_pts"] is None:
+                continue  # base prediction absent
 
             # (B, H, W, 3)
             pred_disp = outputs["motion_pred"][cfg["pred_key"]]
@@ -848,11 +865,15 @@ class DynaDUSt3R(
             # intersection validity
             valid = cfg["base_valid"] & cfg["motion_valid"]
 
-            if valid.sum() == 0:
+            if valid.sum().item() == 0:
                 continue  # no valid GT for this direction
 
+            # scale-normalized error (matching get_loss normalization)
+            pts_pred_n = pts_pred / pred_scale
+            tgt_pts_n = cfg["tgt_pts"] / gt_scale
+
             err = torch.norm(
-                pts_pred[valid] - cfg["tgt_pts"][valid], dim=-1
+                pts_pred_n[valid] - tgt_pts_n[valid], dim=-1
             ).mean().item()
 
             metrics[f"{name}_motion_pc_error"] = err

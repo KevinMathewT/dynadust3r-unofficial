@@ -50,11 +50,13 @@ def main(config: DictConfig):
 
     if config.debug:
         # overfitting experiment on tiny debug dataset
-        config.data.len                   = 4
-        config.data.valid_len             = 4
-        config.data.batch_size            = 4
-        config.train.validation_frequency = 10
-        train_viz_interval                = 5
+        config.data.len                   = config.train.iterations * config.data.batch_size * world_size
+        config.data.valid_len             = config.data.valid_len * config.data.batch_size * world_size
+        # config.data.len                   = 4
+        # config.data.valid_len             = 4
+        # config.data.batch_size            = 4
+        config.train.validation_frequency = 40
+        train_viz_interval                = 250
     else:
         # align dataset sizes with training plan
         config.data.len                   = config.train.iterations * config.data.batch_size * world_size
@@ -158,10 +160,10 @@ def main(config: DictConfig):
             local_bs  = len(batch["left_image"])
             global_bs = local_bs * accelerator.num_processes
             accelerator.print(
-                f"[{current_epoch+1}][{iteration+1}/{total_iterations}]"
-                f"[{dataset_position}/{batches_per_epoch}] "
+                f"[{current_epoch+1}][{iteration+1:5d}/{total_iterations}]"
+                f"[{dataset_position:5d}/{batches_per_epoch}] "
                 f"train loss: {loss.item():.10f} | lr: {lr:.10f} | "
-                f"grad norm: {grad_norm} | batch size: {local_bs} "
+                f"grad norm: {grad_norm:.10f} | batch size: {local_bs} "
                 f"(global: {global_bs}) | eta: {eta_str}"
             )
 
@@ -186,7 +188,7 @@ def main(config: DictConfig):
                     iteration, current_epoch, train_losses, train_metrics, optimizer, config, accelerator
                 )
 
-            accelerator.print(f"[{current_epoch+1}][{iteration+1}/{total_iterations}] train epoch loss: {train_losses.avg:.10f}")
+            accelerator.print(f"[{current_epoch+1}][{iteration+1:5d}/{total_iterations}] train epoch loss: {train_losses.avg:.10f}")
 
             train_metrics_str = ""
             for k, meter in train_metrics.items():
@@ -232,7 +234,7 @@ def main(config: DictConfig):
 
                     if (val_batch_idx == 0 or (val_batch_idx + 1) % 5 == 0 or val_batch_idx == len(valid_loader) - 1):
                         accelerator.print(
-                            f"[{current_epoch+1}][{iteration+1}/{total_iterations}][{val_batch_idx+1}/{len(valid_loader)}] valid loss: {val_loss.item():.10f}"
+                            f"[{current_epoch+1}][{iteration+1:5d}/{total_iterations}][{val_batch_idx+1:5d}/{len(valid_loader)}] valid loss: {val_loss.item():.10f}"
                         )
 
                 if accelerator.is_local_main_process:
@@ -246,7 +248,7 @@ def main(config: DictConfig):
             if accelerator.is_local_main_process:
                 wandb_logger.log_validation_epoch(iteration, current_epoch, val_losses, val_metrics, config, accelerator)
 
-            accelerator.print(f"[{current_epoch+1}][{iteration+1}/{total_iterations}] val epoch loss: {val_losses.avg:.10f}")
+            accelerator.print(f"[{current_epoch+1}][{iteration+1:5d}/{total_iterations}] val epoch loss: {val_losses.avg:.10f}")
 
             val_metrics_str = ""
             for k, meter in val_metrics.items():

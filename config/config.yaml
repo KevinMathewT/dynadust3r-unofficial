@@ -21,7 +21,7 @@ debug: False
 sched: null
 
 train:
-  validation_frequency: 1000  # Combined validation frequency (replaces both epoch_frequency and valid.interval)
+  validation_frequency: 500  # Combined validation frequency (replaces both epoch_frequency and valid.interval)
   iterations: 49000  # Total number of training iterations
   grad_clip: 0
 
@@ -45,4 +45,4 @@ data:
 
 logging:
   use_wandb: True
-  wandb_interval: 1
+  wandb_interval: 5

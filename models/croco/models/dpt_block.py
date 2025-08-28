@@ -258,14 +258,30 @@ class Interpolate(nn.Module):
         Returns:
             tensor: interpolated data
         """
-
-        x = self.interp(
-            x,
-            scale_factor=self.scale_factor,
-            mode=self.mode,
-            align_corners=self.align_corners,
-        )
-
+        x = x.contiguous(memory_format=torch.contiguous_format)
+        if isinstance(self.scale_factor, (tuple, list)):
+            sf_h, sf_w = self.scale_factor
+        else:
+            sf_h = self.scale_factor
+            sf_w = self.scale_factor
+        b, c, h, w = x.shape
+        out_h = int(h * sf_h)
+        out_w = int(w * sf_w)
+        elems_per_item = c * out_h * out_w
+        MAX_ELEMS = 2_147_483_647 - 1
+        if b * elems_per_item > MAX_ELEMS:
+            max_b = max(1, MAX_ELEMS // max(1, elems_per_item))
+            chunks = (b + max_b - 1) // max_b
+            xs = x.chunk(chunks, dim=0)
+            ys = [self.interp(xi, scale_factor=self.scale_factor, mode=self.mode, align_corners=self.align_corners) for xi in xs]
+            x = torch.cat(ys, dim=0)
+        else:
+            x = self.interp(
+                x,
+                scale_factor=self.scale_factor,
+                mode=self.mode,
+                align_corners=self.align_corners,
+            )
         return x
 
 class DPTOutputAdapter(nn.Module):

@@ -35,7 +35,10 @@ def _optimized_pcs(lengths: np.ndarray,
         row_s = np.searchsorted(lengths.cumsum(), obs_idx, side='right')
 
         frames_kept = col_idx_full[keep]
-        max_frame = int(col_idx_full.max())
+        # ensure mapping array can index both tracked and requested frames
+        max_track_frame = int(col_idx_full.max()) if col_idx_full.size > 0 else -1
+        max_req_frame = int(frame_idxs.max()) if len(frame_idxs) > 0 else -1
+        max_frame = max(max_track_frame, max_req_frame)
         frame2col = np.full(max_frame + 1, -1, dtype=np.int32)
         frame2col[frame_idxs] = np.arange(len(frame_idxs), dtype=np.int32)
         col_s = frame2col[frames_kept]
