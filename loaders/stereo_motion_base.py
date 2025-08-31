@@ -6,17 +6,17 @@ LinkedIn: https://www.linkedin.com/in/kevinmathewt/
 
 import numpy as np
 from PIL import Image
-import time
 
 import torch
 from torch.utils.data import Dataset
 
-import utils.geometry as geo
-import utils.geometry as geo_motion
+# import utils.geometry as geo
+# import utils.geometry as geo_motion
+import utils.torch_geometry as geo
 
 
 class StereoMotionBase(Dataset):
-    def __init__(self, config, valid: bool = False, time_debug: bool = False):
+    def __init__(self, config, valid: bool = False):
         """
         Base class for stereo motion datasets that handles loading and processing of
         multi-view time series data for stereo and motion analysis.
@@ -32,12 +32,10 @@ class StereoMotionBase(Dataset):
                 - dataset.<dataset>.path: Base directory path to dataset files
                 - dataset.<dataset>.max_frame_window: Maximum temporal window size for frame triplets
             valid: Whether this is a validation dataset (affects triplet count)
-            time_debug: Whether to print timing information for each operation
         """
         # initialize common parameters
         self.config = config
         self.is_valid = valid  # Store whether this is validation dataset
-        self.time_debug = time_debug  # Store time debug flag
 
         self.sequence_paths = []
 
@@ -69,7 +67,7 @@ class StereoMotionBase(Dataset):
 
             if frame_count < 3:  # skip if too short
                 continue
-
+            
             max_left = frame_count - 3  # sample left frame
             if max_left < 0:
                 continue
@@ -98,26 +96,41 @@ class StereoMotionBase(Dataset):
         """
         return self.num_triplets
 
+    def _apply_color_augmentation(self, image):
+        """
+        Apply dataset-provided color augmentation to a single image.
+        Preserves input type (torch.Tensor or numpy.ndarray) and shape (H, W, 3).
+        """
+        import torch as _torch
+        # Expect self.color_aug to be provided by child datasets (NoOp for valid)
+        if isinstance(image, _torch.Tensor):
+            device = image.device
+            img_np = image.detach().cpu().numpy()
+            aug_np = self.color_aug(image=img_np)["image"]
+            return _torch.from_numpy(aug_np).to(device=device)
+        else:
+            # numpy path
+            return self.color_aug(image=image)["image"]
+
     def _process_images(self, left_info, mid_info, right_info):
         """
         Process and normalize images for training.
-
-        Args:
-            left_info: Dictionary containing left frame information including "image" key
-            mid_info: Dictionary containing mid frame information including "image" key  
-            right_info: Dictionary containing right frame information including "image" key
-
-        Returns:
-            tuple: (left_image, mid_image, right_image) - normalized images with values in [-1, 1]
+        
+        Returns torch tensors (3,H,W) on the same device as input images.
         """
-        m = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-        s = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        m = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32, device=left_info["image"].device).view(3, 1, 1)
+        s = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32, device=left_info["image"].device).view(3, 1, 1)
 
-        left_image = (left_info["image"].astype(np.float32) / 255 - m) / s
-        mid_image = (mid_info["image"].astype(np.float32) / 255 - m) / s
-        right_image = (right_info["image"].astype(np.float32) / 255 - m) / s
+        def _proc(info):
+            # info["image"]: (H,W,3) torch tensor; convert to CHW float
+            img = info["image"].to(dtype=torch.float32)
+            if img.ndim == 3 and img.shape[-1] == 3:
+                img = img.permute(2, 0, 1)
+            img = img / 255.0
+            img = (img - m) / s
+            return img
 
-        return left_image, mid_image, right_image
+        return _proc(left_info), _proc(mid_info), _proc(right_info)
 
     def __getitem__(self, index):
         """
@@ -138,50 +151,29 @@ class StereoMotionBase(Dataset):
         - left_instance, right_instance: optional instance identifiers (str or None)
         - cam, cam_mid, cam_right: camera extrinsic & intrinsic tuples for each view
         """
-        if self.time_debug:
-            total_start = time.perf_counter()
+        import numpy as np
 
         while True:
-            if self.time_debug:
-                loop_start = time.perf_counter()
-                
             # get triplet info
-            if self.time_debug:
-                t0 = time.perf_counter()
             seq_idx, left_frame, mid_frame, right_frame = self.triplets[index]
             sequence_path = self.sequence_paths[seq_idx]
-            if self.time_debug:
-                print(f"[TIME] Get triplet info: {(time.perf_counter() - t0)*1000:.2f}ms")
 
             try:
-                # fetch frame info
-                if self.time_debug:
-                    t0 = time.perf_counter()
-                    
-                # ~21 mins for 200 batches
-                # left_info = self.get_frame_info(sequence_path, left_frame)
-                # mid_info = self.get_frame_info(sequence_path, mid_frame)
-                # right_info = self.get_frame_info(sequence_path, right_frame)
-
-                # ~ 8 mins for 200 batches
+                # optimized multi-frame fetch
                 left_info, mid_info, right_info = self.get_frame_infos(sequence_path, [left_frame, mid_frame, right_frame])
-                if self.time_debug:
-                    print(f"[TIME] Get frame infos: {(time.perf_counter() - t0)*1000:.2f}ms")
-                
-                # Assert that all frames have tracks
-                if self.time_debug:
-                    t0 = time.perf_counter()
+
+                # apply color augmentation to left and right images only
+                left_info["image"] = self._apply_color_augmentation(left_info["image"])  # (H, W, 3)
+                right_info["image"] = self._apply_color_augmentation(right_info["image"])  # (H, W, 3)
+
+                # Ensure frames have tracks
                 assert len(left_info["world_pc_valid"]) > 0, f"left frame {sequence_path}:{left_frame} has no tracks"
                 assert len(mid_info["world_pc_valid"]) > 0, f"mid frame {sequence_path}:{mid_frame} has no tracks"  
                 assert len(right_info["world_pc_valid"]) > 0, f"right frame {sequence_path}:{right_frame} has no tracks"
-                if self.time_debug:
-                    print(f"[TIME] Assert world_pc_valid: {(time.perf_counter() - t0)*1000:.2f}ms")
-                
-                if self.time_debug:
-                    t0 = time.perf_counter()
+
                 reference_cam = left_info["cam"]  # Use left camera as reference
                 
-                # Extract world points and validity
+                # Extract world points and validity (torch)
                 left_world_pc = left_info["world_pc_valid"][:, :3]
                 mid_world_pc = mid_info["world_pc_valid"][:, :3]
                 right_world_pc = right_info["world_pc_valid"][:, :3]
@@ -189,133 +181,59 @@ class StereoMotionBase(Dataset):
                 left_valid = left_info["world_pc_valid"][:, 3:4]
                 mid_valid = mid_info["world_pc_valid"][:, 3:4]
                 right_valid = right_info["world_pc_valid"][:, 3:4]
-                if self.time_debug:
-                    print(f"[TIME] Extract world points: {(time.perf_counter() - t0)*1000:.2f}ms")
-
+                
                 # Get dataset config
-                if self.time_debug:
-                    t0 = time.perf_counter()
                 dataset_config = getattr(self.config.dataset, self.config.data.loader.lower(), None)
                 pm_source = getattr(dataset_config, "pm_source", "") if dataset_config else ""
                 min_valid_pc_points = getattr(dataset_config, "min_valid_pc_points", 0) if dataset_config else 0
                 min_valid_mm_points = getattr(dataset_config, "min_valid_mm_points", 0) if dataset_config else 0
-                if self.time_debug:
-                    print(f"[TIME] Get dataset config: {(time.perf_counter() - t0)*1000:.2f}ms")
                 
                 if pm_source == "3d_tracks":
-                    if self.time_debug:
-                        t0 = time.perf_counter()
-                    # Create point maps with proper coordinate transforms
+                    # Create point maps with torch ops
                     left_pm = geo.create_pm_in_ref_frame(
-                        left_world_pc, left_valid, left_info["cam"], reference_cam, 
+                        left_world_pc, left_valid, left_info["cam"], reference_cam,
                         left_info["image"].shape[:2], pm_source="3d_tracks"
                     )
-                    if self.time_debug:
-                        print(f"[TIME] Create left_pm: {(time.perf_counter() - t0)*1000:.2f}ms")
-                    
-                    if self.time_debug:
-                        t0 = time.perf_counter()
                     mid_pm = geo.create_pm_in_ref_frame(
-                        mid_world_pc, mid_valid, mid_info["cam"], reference_cam, 
+                        mid_world_pc, mid_valid, mid_info["cam"], reference_cam,
                         mid_info["image"].shape[:2], pm_source="3d_tracks"
                     )
-                    if self.time_debug:
-                        print(f"[TIME] Create mid_pm: {(time.perf_counter() - t0)*1000:.2f}ms")
-                    
-                    if self.time_debug:
-                        t0 = time.perf_counter()
                     right_pm = geo.create_pm_in_ref_frame(
-                        right_world_pc, right_valid, right_info["cam"], reference_cam, 
+                        right_world_pc, right_valid, right_info["cam"], reference_cam,
                         right_info["image"].shape[:2], pm_source="3d_tracks"
                     )
-                    if self.time_debug:
-                        print(f"[TIME] Create right_pm: {(time.perf_counter() - t0)*1000:.2f}ms")
-                    
                 elif pm_source == "dm":
-                    if self.time_debug:
-                        t0 = time.perf_counter()
-                    # Create point maps from depth maps
                     left_pm = geo.dm_to_cam_pm(left_info["dm"], reference_cam)
-                    if self.time_debug:
-                        print(f"[TIME] Create left_pm from dm: {(time.perf_counter() - t0)*1000:.2f}ms")
-                    
-                    if self.time_debug:
-                        t0 = time.perf_counter()
                     mid_pm = geo.create_pm_from_dm_in_ref_frame(
                         mid_info["dm"], mid_info["cam"], reference_cam
                     )
-                    if self.time_debug:
-                        print(f"[TIME] Create mid_pm from dm: {(time.perf_counter() - t0)*1000:.2f}ms")
-                    
-                    if self.time_debug:
-                        t0 = time.perf_counter()
                     right_pm = geo.create_pm_from_dm_in_ref_frame(
                         right_info["dm"], right_info["cam"], reference_cam
                     )
-                    if self.time_debug:
-                        print(f"[TIME] Create right_pm from dm: {(time.perf_counter() - t0)*1000:.2f}ms")
-                    
                 else:
                     raise NotImplementedError("point map source not implemented")
 
-                # Assert that point maps have valid points
-                if self.time_debug:
-                    t0 = time.perf_counter()
-                assert np.sum(left_pm[:, :, 3]) >= min_valid_pc_points, f"left point map {sequence_path}:{left_frame} has {np.sum(left_pm[:, :, 3])} valid points, need at least {min_valid_pc_points}"
-                assert np.sum(mid_pm[:, :, 3]) >= min_valid_pc_points, f"mid point map {sequence_path}:{mid_frame} has {np.sum(mid_pm[:, :, 3])} valid points, need at least {min_valid_pc_points}"
-                assert np.sum(right_pm[:, :, 3]) >= min_valid_pc_points, f"right point map {sequence_path}:{right_frame} has {np.sum(right_pm[:, :, 3])} valid points, need at least {min_valid_pc_points}"
-                if self.time_debug:
-                    print(f"[TIME] Assert point maps: {(time.perf_counter() - t0)*1000:.2f}ms")
+                # Assert that point maps have valid points (torch)
+                assert torch.sum(left_pm[:, :, 3]) >= min_valid_pc_points, f"left point map {sequence_path}:{left_frame} has {torch.sum(left_pm[:, :, 3]).item()} valid points, need at least {min_valid_pc_points}"
+                assert torch.sum(mid_pm[:, :, 3]) >= min_valid_pc_points, f"mid point map {sequence_path}:{mid_frame} has {torch.sum(mid_pm[:, :, 3]).item()} valid points, need at least {min_valid_pc_points}"
+                assert torch.sum(right_pm[:, :, 3]) >= min_valid_pc_points, f"right point map {sequence_path}:{right_frame} has {torch.sum(right_pm[:, :, 3]).item()} valid points, need at least {min_valid_pc_points}"
 
-                # ---------------------------------------------------------------
-                # Compute motion maps generically
-                # ---------------------------------------------------------------
-                
-                # Calculate normalized temporal positions
-                if self.time_debug:
-                    t0 = time.perf_counter()
-                mid_tq = (mid_frame - left_frame) / (right_frame - left_frame)
-                
-                # Query times list: [mid_tq, 1.0, 0.0]
-                # Corresponding to: [position of mid, position of right from left, position of left from right]
-                query_times = torch.tensor([mid_tq, 1.0, 0.0]).float()
-                
-                # Store all frame infos and point maps for generic motion computation
-                frame_infos = [left_info, mid_info, right_info]
-                view_infos = [left_info, right_info]  # Only the stereo views (0 and 1)
-                if self.time_debug:
-                    print(f"[TIME] Compute temporal positions: {(time.perf_counter() - t0)*1000:.2f}ms")
-                
-                # Compute motion maps for all required pairs
-                # Format: motion_gt["i_j"] where i is source view index, j is query time
-                # IMPORTANT: All motions must be expressed in the left camera (reference) frame
-                
-                # Use cleaner motion computation
-                if self.time_debug:
-                    t0 = time.perf_counter()
-                    
-                motion_gt = geo_motion.compute_all_motion_maps(
+                # Compute motion maps with torch
+                H, W = left_info["image"].shape[:2]
+                motion_gt = geo.compute_all_motion_maps(
                     left_info["world_pc_valid"],
                     mid_info["world_pc_valid"],
                     right_info["world_pc_valid"],
                     left_info["cam"],
                     mid_info["cam"],
                     right_info["cam"],
-                    left_info["image"].shape[:2]
+                    (H, W)
                 )
-                
-                if self.time_debug:
-                    print(f"[TIME] Compute all motions: {(time.perf_counter() - t0)*1000:.2f}ms")
 
-                # Assert that motion maps have valid motion vectors
-                if self.time_debug:
-                    t0 = time.perf_counter()
-                assert np.sum(motion_gt["l2m"][:, :, 3]) >= min_valid_mm_points, f"l2m motion map {sequence_path}:{left_frame}->{mid_frame} has {np.sum(motion_gt['l2m'][:, :, 3])} valid points, need at least {min_valid_mm_points}"
-                assert np.sum(motion_gt["r2m"][:, :, 3]) >= min_valid_mm_points, f"r2m motion map {sequence_path}:{right_frame}->{mid_frame} has {np.sum(motion_gt['r2m'][:, :, 3])} valid points, need at least {min_valid_mm_points}"
-                assert np.sum(motion_gt["l2r"][:, :, 3]) >= min_valid_mm_points, f"l2r motion map {sequence_path}:{left_frame}->{right_frame} has {np.sum(motion_gt['l2r'][:, :, 3])} valid points, need at least {min_valid_mm_points}"
-                assert np.sum(motion_gt["r2l"][:, :, 3]) >= min_valid_mm_points, f"r2l motion map {sequence_path}:{right_frame}->{left_frame} has {np.sum(motion_gt['r2l'][:, :, 3])} valid points, need at least {min_valid_mm_points}"
-                if self.time_debug:
-                    print(f"[TIME] Assert motion maps: {(time.perf_counter() - t0)*1000:.2f}ms")
+                assert torch.sum(motion_gt["l2m"][..., 3]) >= min_valid_mm_points, f"l2m motion map {sequence_path}:{left_frame}->{mid_frame} has {torch.sum(motion_gt['l2m'][..., 3]).item()} valid points, need at least {min_valid_mm_points}"
+                assert torch.sum(motion_gt["r2m"][..., 3]) >= min_valid_mm_points, f"r2m motion map {sequence_path}:{right_frame}->{mid_frame} has {torch.sum(motion_gt['r2m'][..., 3]).item()} valid points, need at least {min_valid_mm_points}"
+                assert torch.sum(motion_gt["l2r"][..., 3]) >= min_valid_mm_points, f"l2r motion map {sequence_path}:{left_frame}->{right_frame} has {torch.sum(motion_gt['l2r'][..., 3]).item()} valid points, need at least {min_valid_mm_points}"
+                assert torch.sum(motion_gt["r2l"][..., 3]) >= min_valid_mm_points, f"r2l motion map {sequence_path}:{right_frame}->{left_frame} has {torch.sum(motion_gt['r2l'][..., 3]).item()} valid points, need at least {min_valid_mm_points}"
 
                 break
             except Exception as e:
@@ -326,53 +244,34 @@ class StereoMotionBase(Dataset):
                 traceback.print_exc()
                 
                 index = np.random.randint(0, len(self.triplets))
-                if self.time_debug:
-                    print(f"[TIME] Exception handling loop iteration: {(time.perf_counter() - loop_start)*1000:.2f}ms")
 
-        # Process images
-        if self.time_debug:
-            t0 = time.perf_counter()
+        # Process images (torch, returns CHW)
         left_image, mid_image, right_image = self._process_images(left_info, mid_info, right_info)
-        if self.time_debug:
-            print(f"[TIME] Process images: {(time.perf_counter() - t0)*1000:.2f}ms")
 
-        # Convert motion_gt dict to tensors
-        if self.time_debug:
-            t0 = time.perf_counter()
-        motion_gt_tensors = {k: torch.from_numpy(v.copy()).float() for k, v in motion_gt.items()}
-        if self.time_debug:
-            print(f"[TIME] Convert motion_gt to tensors: {(time.perf_counter() - t0)*1000:.2f}ms")
-
-        # Build return dictionary
-        if self.time_debug:
-            t0 = time.perf_counter()
+        # Build return dictionary (torch tensors)
         result = {
-            "left_pm": torch.from_numpy(left_pm.copy()).float(),  # (H, W, 4)
-            "mid_pm": torch.from_numpy(mid_pm.copy()).float(),  # (H, W, 4)
-            "right_pm": torch.from_numpy(right_pm.copy()).float(),  # (H, W, 4)
+            "left_pm": left_pm.float(),  # (H, W, 4)
+            "mid_pm": mid_pm.float(),  # (H, W, 4)
+            "right_pm": right_pm.float(),  # (H, W, 4)
             
-            # Generic motion ground truths
-            "motion_gt": motion_gt_tensors,  # Dict[str, Tensor] with keys "i_j"
+            # Generic motion ground truths (torch)
+            "motion_gt": {k: v.float() for k, v in motion_gt.items()},
             
-            "left_image": torch.from_numpy(left_image.copy()).permute(2, 0, 1).float(),  # (3, H, W)
-            "mid_image": torch.from_numpy(mid_image.copy()).permute(2, 0, 1).float(),  # (3, H, W)
-            "right_image": torch.from_numpy(right_image.copy()).permute(2, 0, 1).float(),  # (3, H, W)
+            "left_image": left_image.contiguous(),  # (3, H, W)
+            "mid_image": mid_image.contiguous(),  # (3, H, W)
+            "right_image": right_image.contiguous(),  # (3, H, W)
             
-            "idxs": torch.tensor((left_frame, mid_frame, right_frame)).float(),  # tensor of shape (3,)
-            "query_times": query_times,  # tensor of shape (3,) - [mid_tq, 1.0, 0.0]
-            "sequence_idx": torch.tensor(seq_idx).float(),  # scalar tensor
+            "idxs": torch.tensor((left_frame, mid_frame, right_frame), dtype=torch.float32, device=left_image.device),
+            "query_times": torch.tensor([(mid_frame - left_frame) / (right_frame - left_frame), 1.0, 0.0], dtype=torch.float32, device=left_image.device),
+            "sequence_idx": torch.tensor(seq_idx, dtype=torch.float32, device=left_image.device),
             
-            "left_instance": left_info.get("instance", None),  # string
-            "right_instance": right_info.get("instance", None),  # string
+            "left_instance": left_info.get("instance", None),
+            "right_instance": right_info.get("instance", None),
             
-            "cam": left_info["cam"],  # ((3,3), (4,4))
-            "cam_mid": mid_info["cam"],  # ((3,3), (4,4))
-            "cam_right": right_info["cam"],  # ((3,3), (4,4))
+            "cam": left_info["cam"],
+            "cam_mid": mid_info["cam"],
+            "cam_right": right_info["cam"],
         }
-        if self.time_debug:
-            print(f"[TIME] Build return dict: {(time.perf_counter() - t0)*1000:.2f}ms")
-            print(f"[TIME] TOTAL __getitem__: {(time.perf_counter() - total_start)*1000:.2f}ms")
-            print("-" * 60)
         
         return result
 

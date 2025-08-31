@@ -21,9 +21,10 @@ debug: False
 sched: null
 
 train:
-  validation_frequency: 500  # Combined validation frequency (replaces both epoch_frequency and valid.interval)
-  iterations: 49000  # Total number of training iterations
+  validation_frequency: 2000  # Combined validation frequency (replaces both epoch_frequency and valid.interval)
+  iterations: 98000  # Total number of training iterations
   grad_clip: 0
+  grad_acc: 2  # Gradient accumulation steps (1 = no accumulation)
 
 valid:
   save: 

@@ -4,18 +4,43 @@ Date: 2025-08-17
 LinkedIn: https://www.linkedin.com/in/kevinmathewt/
 """
 
-import os, json, io, time, tempfile
+import json, io, time, tempfile, os
 from pathlib import Path
 
-import cv2
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-import webdataset as wds, wids
-from decord import VideoReader, cpu
+import wids
+from decord import VideoReader, cpu, gpu
+import albumentations as A
 
 from .stereo_motion_base import StereoMotionBase
-import utils.geometry as geom
+# import utils.geometry as geom
+import utils.torch_geometry as geom
+
+
+# --- decord gpu helpers ---
+def _get_decord_ctx():
+    """Prefer current CUDA device for Decord; fallback to CPU."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            dev_id = torch.cuda.current_device()
+            return gpu(dev_id)
+    except Exception:
+        pass
+    return cpu(0)
+
+
+def _to_torch_cuda(decord_obj):
+    """Zero-copy convert a Decord NDArray/Frame to torch (keeps on GPU if decoded there)."""
+    import torch
+    try:
+        return torch.utils.dlpack.from_dlpack(decord_obj.to_dlpack())
+    except Exception:
+        # Fallback best-effort conversion (may copy)
+        print("Warning: Failed to convert Decord NDArray to torch tensor on GPU, falling back to CPU. Copying data instead...")
+        return torch.as_tensor(decord_obj)
 
 
 class Stereo4DWDS(StereoMotionBase):
@@ -36,9 +61,17 @@ class Stereo4DWDS(StereoMotionBase):
     # spill very large mp4 payloads to a temp file to cap peak ram
     _spill_threshold_bytes = 128 << 20  # 128mb
 
-    def __init__(self, config, valid: bool = False, time_debug: bool = False):
-        super().__init__(config, valid, time_debug)
+    def __init__(self, config, valid: bool = False):
+        super().__init__(config, valid)
         print("loading stereo4d v5 dataset...")
+
+        # ensure WIDS cache uses config-provided cache path if available
+        try:
+            cache_dir = getattr(config.dataset.stereo4d, "cache", None)
+            if cache_dir:
+                os.environ.setdefault("WIDS_CACHE", str(cache_dir))
+        except Exception:
+            pass
 
         self.dataset_label = config.dataset.stereo4d.name
         split = (
@@ -49,17 +82,35 @@ class Stereo4DWDS(StereoMotionBase):
         self.hfov = config.dataset.stereo4d.hfov
         self.max_frame_window = config.dataset.stereo4d.max_frame_window
         self.config = config
-        self.time_debug = time_debug
+
+        # color augmentation (train) or identity (valid)
+        if not valid:
+            aug_list = [
+                A.RandomBrightnessContrast(p=0.2),
+                A.HueSaturationValue(p=0.2),
+                A.ToGray(p=0.2),
+                A.ImageCompression(quality_lower=30, quality_upper=100, p=0.5),
+                A.OneOf(
+                    [
+                        A.MotionBlur(p=0.2),
+                        A.MedianBlur(blur_limit=3, p=0.1),
+                        A.Blur(blur_limit=3, p=0.1),
+                    ],
+                    p=0.2,
+                ),
+            ]
+            self.color_aug = A.Compose(aug_list)
+        else:
+            self.color_aug = A.NoOp()
 
         # webdataset setup
-        wds_dir = Path(config.dataset.stereo4d.path) / "wds" / split
+        wds_dir = Path(config.dataset.stereo4d.wds_dir) / split
         idx_json = wds_dir / "stereo4d-idx.json"
         map_json = wds_dir / "key_to_idx.json"
 
         print(f"loading wds index from {idx_json}...")
-        t0 = time.perf_counter()
         self.idx_ds = wids.ShardListDataset(str(idx_json), transformations=[])
-        print(f"loaded {len(self.idx_ds)} sequence samples in {time.perf_counter() - t0:.2f}s")
+        print(f"loaded {len(self.idx_ds)} sequence samples")
 
         with open(map_json) as f:
             self.key_to_idx = json.load(f)
@@ -120,39 +171,38 @@ class Stereo4DWDS(StereoMotionBase):
 
     def _open_vr_from_bytes(self, vbytes: bytes) -> VideoReader:
         """open a decord reader, spilling huge payloads to a tmpfile to bound peak ram."""
+        ctx = _get_decord_ctx()
         if len(vbytes) > self._spill_threshold_bytes:
             tf = tempfile.NamedTemporaryFile(suffix=".mp4", delete=True)
             tf.write(vbytes)
             tf.flush()
             # keep a reference so file doesn't disappear while vr is alive
-            vr = VideoReader(tf.name, ctx=cpu(0))
+            try:
+                vr = VideoReader(tf.name, ctx=ctx)
+            except Exception:
+                print("Failed to use GPU for Decord, falling back to CPU...")
+                vr = VideoReader(tf.name, ctx=cpu(0))
             vr._tmpfile = tf  # attach for lifecycle
             return vr
-        return VideoReader(io.BytesIO(vbytes), ctx=cpu(0))
+        try:
+            return VideoReader(io.BytesIO(vbytes), ctx=ctx)
+        except Exception:
+            print("Failed to use GPU for Decord, falling back to CPU...")
+            return VideoReader(io.BytesIO(vbytes), ctx=cpu(0))
 
     # ----------------------------- core loaders -----------------------------
 
     def _load_single_frame(self, seq: str, idx: int, sample=None, vbytes: bytes | None = None):
         """load only the specific frame needed."""  # (H, W, 3)
-        if self.time_debug:
-            t0 = time.perf_counter()
-
         sample = sample if sample is not None else self.idx_ds[self.key_to_idx[seq]]
         vbytes = vbytes if vbytes is not None else self._video_bytes_from_sample(sample)
-
         vr = self._open_vr_from_bytes(vbytes)
-        frame = vr[idx].asnumpy()              # (H, W, 3)
+        frame = _to_torch_cuda(vr[idx])              # (H, W, 3) torch tensor (GPU if available)
         del vr
-
-        if self.time_debug:
-            print(f"[TIME] single frame {seq}[{idx}]: {(time.perf_counter()-t0)*1000:.2f}ms")
         return frame
 
     def _load_single_frame_annotations(self, seq: str, idx: int, ann_data=None):
         """vectorized scatter for just one frame."""  # (T, 4)
-        if self.time_debug:
-            t0 = time.perf_counter()
-
         sample = self.idx_ds[self.key_to_idx[seq]] if ann_data is None else None
         ann = ann_data if ann_data is not None else np.load(sample[".ann.npz"], allow_pickle=True)
         pcs1 = optimized_pcs(
@@ -161,16 +211,10 @@ class Stereo4DWDS(StereoMotionBase):
             ann["track_coordinates"],
             np.array([idx], dtype=np.int32),
         )[:, 0, :].astype(np.float32)  # (T, 4)
-
-        if self.time_debug:
-            print(f"[TIME] ann frame {seq}[{idx}]: {(time.perf_counter()-t0)*1000:.2f}ms")
         return pcs1
 
     def _load_camera_data(self, seq: str, idx: int, ann_data=None, intrinsics=None):
         """load intrinsics (once per seq) and per-frame extrinsics."""  # ((3,3), (4,4))
-        if self.time_debug:
-            t0 = time.perf_counter()
-
         if ann_data is None or intrinsics is None:
             sample = self.idx_ds[self.key_to_idx[seq]]
             if intrinsics is None:
@@ -179,9 +223,6 @@ class Stereo4DWDS(StereoMotionBase):
                 ann_data = np.load(sample[".ann.npz"], allow_pickle=True)
 
         extrinsics = geom.inv(ann_data["camera2world"][idx])  # (4, 4)
-
-        if self.time_debug:
-            print(f"[TIME] cam {seq}[{idx}]: {(time.perf_counter()-t0)*1000:.2f}ms")
         return intrinsics, extrinsics
 
     # ------------------------------ public api ------------------------------
@@ -190,32 +231,30 @@ class Stereo4DWDS(StereoMotionBase):
         """
         loads only the exact data needed with minimal memory usage.  # (image: (H,W,3), world_pc_valid: (T,4))
         """
-        if self.time_debug:
-            total_start = time.perf_counter()
-            print(f"\n[TIME] get_frame_info({seq}, {idx})")
-
         sample = self.idx_ds[self.key_to_idx[seq]]
 
         # video
         vbytes = self._video_bytes_from_sample(sample)
-        img = self._load_single_frame(seq, idx, sample=sample, vbytes=vbytes)  # (H, W, 3)
+        img = self._load_single_frame(seq, idx, sample=sample, vbytes=vbytes)  # (H, W, 3) torch tensor
 
         # ann + intr once
         ann = np.load(sample[".ann.npz"], allow_pickle=True)
-        intrinsics = np.load(sample[".intr.npy"], allow_pickle=True)
-        world_pc = optimized_pcs(
-            ann["track_lengths"], ann["track_indices"], ann["track_coordinates"],
-            np.array([idx], dtype=np.int32),
-        )[:, 0, :].astype(np.float32)  # (T, 4)
-        extrinsics = geom.inv(ann["camera2world"][idx])  # (4, 4)
-
-        if self.time_debug:
-            print(f"[TIME] TOTAL get_frame_info: {(time.perf_counter() - total_start)*1000:.2f}ms")
+        # device follows decoded image
+        import torch
+        device = img.device
+        lengths = torch.from_numpy(ann["track_lengths"].astype(np.int32)).to(device)
+        track_indices = torch.from_numpy(ann["track_indices"].astype(np.int32)).to(device)
+        track_coordinates = torch.from_numpy(ann["track_coordinates"].astype(np.float32)).to(device)
+        world_pc_all = optimized_pcs_torch(lengths, track_indices, track_coordinates, torch.tensor([idx], dtype=torch.int32, device=device))  # (T, 1, 4)
+        world_pc = world_pc_all[:, 0, :]  # (T, 4)
+        intrinsics = torch.from_numpy(np.load(sample[".intr.npy"], allow_pickle=True).astype(np.float32)).to(device)
+        cam2world = torch.from_numpy(ann["camera2world"][idx].astype(np.float32)).to(device)
+        extrinsics = geom.inv(cam2world)  # (4, 4)
 
         return dict(
-            image=img,                              # (H, W, 3)
-            world_pc_valid=world_pc,                # (T, 4)
-            cam=(intrinsics, extrinsics),           # ((3,3), (4,4))
+            image=img,                              # (H, W, 3) torch tensor (GPU if available)
+            world_pc_valid=world_pc,                # (T, 4) torch
+            cam=(intrinsics, extrinsics),           # ((3,3), (4,4)) torch
             dm=None,
             instance=f"{seq}_{idx:05d}",
         )
@@ -224,78 +263,56 @@ class Stereo4DWDS(StereoMotionBase):
         """
         optimized batch loading of multiple frames from the same sequence.  # list of dicts
         """
-        if self.time_debug:
-            total_start = time.perf_counter()
-            print(f"\n[TIME] get_frame_infos({seq}, {idxs})")
-
         # pull sample once
-        t0 = time.perf_counter()
         sample = self.idx_ds[self.key_to_idx[seq]]
-        if self.time_debug:
-            print(f"[TIME] get sample: {(time.perf_counter() - t0)*1000:.2f}ms")
 
         # video bytes -> single VR
-        t0 = time.perf_counter()
         vbytes = self._video_bytes_from_sample(sample)
         vr = self._open_vr_from_bytes(vbytes)
-        if self.time_debug:
-            print(f"[TIME] open VR: {(time.perf_counter() - t0)*1000:.2f}ms")
 
         # batch decode with get_batch
-        t0 = time.perf_counter()
-        frames_nd = vr.get_batch(idxs).asnumpy()      # (F, H, W, 3)
+        frames_nd = _to_torch_cuda(vr.get_batch(idxs))      # (F, H, W, 3) torch tensor (GPU if available)
         del vr
-        if self.time_debug:
-            print(f"[TIME] decode {len(idxs)} frames: {(time.perf_counter() - t0)*1000:.2f}ms")
 
         # load ann + intr once
-        t0 = time.perf_counter()
         ann = np.load(sample[".ann.npz"], allow_pickle=True)
-        intrinsics = np.load(sample[".intr.npy"], allow_pickle=True)
-        if self.time_debug:
-            print(f"[TIME] load ann+intr: {(time.perf_counter() - t0)*1000:.2f}ms")
+        import torch
+        device = frames_nd.device
+        lengths = torch.from_numpy(ann["track_lengths"].astype(np.int32)).to(device)
+        track_indices = torch.from_numpy(ann["track_indices"].astype(np.int32)).to(device)
+        track_coordinates = torch.from_numpy(ann["track_coordinates"].astype(np.float32)).to(device)
+        intrinsics = torch.from_numpy(np.load(sample[".intr.npy"], allow_pickle=True).astype(np.float32)).to(device)
 
-        # pcs for selected frames
-        t0 = time.perf_counter()
-        frame_idxs = np.asarray(idxs, dtype=np.int32)
-        pcs_all = optimized_pcs(
-            ann["track_lengths"], ann["track_indices"], ann["track_coordinates"], frame_idxs
-        )  # (T, F, 4)
-        if self.time_debug:
-            print(f"[TIME] build pcs: {(time.perf_counter() - t0)*1000:.2f}ms")
+        # pcs for selected frames (torch)
+        frame_idxs = torch.tensor(idxs, dtype=torch.int32, device=device)
+        pcs_all = optimized_pcs_torch(lengths, track_indices, track_coordinates, frame_idxs)  # (T, F, 4)
 
         # extrinsics for selected frames
-        t0 = time.perf_counter()
-        extrinsics_list = [geom.inv(ann["camera2world"][i]) for i in idxs]  # list[(4,4)]
-        if self.time_debug:
-            print(f"[TIME] extrinsics: {(time.perf_counter() - t0)*1000:.2f}ms")
+        extrinsics_list = []
+        for i in idxs:
+            cam2world_i = torch.from_numpy(ann["camera2world"][i].astype(np.float32)).to(device)
+            extrinsics_list.append(geom.inv(cam2world_i))
 
         # package
-        t0 = time.perf_counter()
         results = []
         for j, fidx in enumerate(idxs):
             results.append(dict(
-                image=frames_nd[j],                  # (H, W, 3)
-                world_pc_valid=pcs_all[:, j, :],     # (T, 4)
+                image=frames_nd[j],                  # (H, W, 3) torch tensor (GPU if available)
+                world_pc_valid=pcs_all[:, j, :],     # (T, 4) torch
                 cam=(intrinsics, extrinsics_list[j]),
                 dm=None,
                 instance=f"{seq}_{fidx:05d}",
             ))
-        if self.time_debug:
-            print(f"[TIME] build results: {(time.perf_counter() - t0)*1000:.2f}ms")
-            print(f"[TIME] TOTAL get_frame_infos: {(time.perf_counter() - total_start)*1000:.2f}ms")
 
         return results
 
 
-import time, os
 import hydra
 from omegaconf import DictConfig, open_dict
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data._utils.collate import default_collate
-from tqdm import tqdm
 
 # --- user-controlled setting ------------------------------------------------
 TARGET_SAMPLES = 10  # override: NUM_SAMPLES=25 poetry run python -m loaders.stereo4dv5
@@ -313,9 +330,7 @@ def main(config: DictConfig):
         config.data.len = config.train.iterations * config.data.batch_size
         config.data.valid_len = config.data.valid_len * config.data.batch_size
 
-    time_debug = True
-
-    dataset = Stereo4DWDS(config, valid=False, time_debug=time_debug)
+    dataset = Stereo4DWDS(config, valid=False)
     dist = torch.distributed.is_initialized()
     world = torch.distributed.get_world_size() if dist else 1
     sampler = DistributedSampler(dataset) if dist else None
@@ -365,6 +380,7 @@ def naive_pcs(lengths, track_indices, track_coordinates, idxs):
     sel = np.stack([pcs[:, idx, :] for idx in idxs], axis=1)  # (T, Fsel, 4)
     return sel
 
+
 def optimized_pcs(lengths, track_indices, track_coordinates, idxs):
     """
     vectorized scatter into (tracks, len(idxs), 3) with a valid mask appended.  # (T, Fsel, 4)
@@ -404,4 +420,55 @@ def optimized_pcs(lengths, track_indices, track_coordinates, idxs):
     pcs = np.empty((T, F, 4), np.float32)                    # (T, F, 4)
     pcs[..., :3] = tracks
     pcs[..., 3] = (~np.isnan(tracks[..., 0])).astype(np.float32)
+    return pcs
+
+
+
+def optimized_pcs_torch(lengths: 'torch.Tensor', track_indices: 'torch.Tensor', track_coordinates: 'torch.Tensor', idxs: 'torch.Tensor'):
+    """
+    Torch equivalent of optimized_pcs. All inputs are torch tensors on same device.
+    lengths: (T,), int32; track_indices: (Nobs,), int32; track_coordinates: (Nobs,3), float32; idxs: (Fsel,), int32
+    Returns: (T, Fsel, 4) float32
+    """
+    import torch
+    device = track_indices.device
+    frame_idxs = idxs.to(torch.int32)  # (Fsel,)
+    col_idx_full = track_indices  # (Nobs,)
+    keep = torch.isin(col_idx_full, frame_idxs)  # (Nobs,)
+
+    if torch.any(keep):
+        obs_idx = torch.nonzero(keep, as_tuple=True)[0]  # (K,)
+        cum = lengths.cumsum(0)
+        row_s = torch.searchsorted(cum, obs_idx, right=True)  # (K,)
+
+        frames_kept = col_idx_full[keep]  # (K,)
+        max_frame = int(col_idx_full.max().item()) if col_idx_full.numel() > 0 else -1
+        Fsel = int(len(frame_idxs))
+        if (max_frame + 1) <= 8 * max(Fsel, 1):
+            frame2col = torch.full((max_frame + 1,), -1, dtype=torch.int32, device=device)
+            frame2col[frame_idxs] = torch.arange(Fsel, dtype=torch.int32, device=device)
+            col_s = frame2col[frames_kept]
+        else:
+            # fallback mapping via search in a dict-like manner
+            # create (frame_idx -> col) tensor and gather via matching
+            # This branch rarely triggers in practice for selected frames.
+            col_s = torch.empty_like(frames_kept)
+            for j, f in enumerate(frame_idxs):
+                col_s[frames_kept == f] = int(j)
+
+        coord_s = track_coordinates[keep].to(torch.float32)
+    else:
+        row_s = torch.empty((0,), dtype=torch.int64, device=device)
+        col_s = torch.empty((0,), dtype=torch.int64, device=device)
+        coord_s = torch.empty((0, 3), dtype=torch.float32, device=device)
+
+    T = int(lengths.numel())
+    F = int(frame_idxs.numel())
+    tracks = torch.full((T, F, 3), float('nan'), dtype=torch.float32, device=device)
+    if row_s.numel() > 0:
+        tracks[row_s.long(), col_s.long()] = coord_s
+
+    pcs = torch.empty((T, F, 4), dtype=torch.float32, device=device)
+    pcs[..., :3] = tracks
+    pcs[..., 3] = (~torch.isnan(tracks[..., 0])).to(torch.float32)
     return pcs

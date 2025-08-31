@@ -1,13 +1,13 @@
 # stereo4dv6.py
 
-import os, io, time
+from typing import NoReturn  # unused sentinel to avoid empty import block
 from pathlib import Path
 from typing import List, Dict, Tuple
 
-import cv2
 import numpy as np
 import pandas as pd
 from decord import VideoReader, cpu
+import albumentations as A
 
 from .stereo_motion_base import StereoMotionBase
 import utils.geometry as geom
@@ -66,8 +66,8 @@ class Stereo4D(StereoMotionBase):
     - intrinsics computed from hfov + width (memoized per seq)
     """
 
-    def __init__(self, config, valid: bool = False, time_debug: bool = False):
-        super().__init__(config, valid, time_debug)
+    def __init__(self, config, valid: bool = False):
+        super().__init__(config, valid)
         print("loading stereo4d dataset (direct-from-disk)...")
 
         self.dataset_label = config.dataset.stereo4d.name
@@ -76,7 +76,26 @@ class Stereo4D(StereoMotionBase):
         self.max_frame_window = config.dataset.stereo4d.max_frame_window
         
         self.config = config
-        self.time_debug = time_debug
+
+        # color augmentation (train) or identity (valid)
+        if not valid:
+            aug_list = [
+                A.RandomBrightnessContrast(p=0.2),
+                A.HueSaturationValue(p=0.2),
+                A.ToGray(p=0.2),
+                A.ImageCompression(quality_lower=30, quality_upper=100, p=0.5),
+                A.OneOf(
+                    [
+                        A.MotionBlur(p=0.2),
+                        A.MedianBlur(blur_limit=3, p=0.1),
+                        A.Blur(blur_limit=3, p=0.1),
+                    ],
+                    p=0.2,
+                ),
+            ]
+            self.color_aug = A.Compose(aug_list)
+        else:
+            self.color_aug = A.NoOp()
 
         # dirs
         self.left_mp4_dir = Path(config.dataset.stereo4d.lefteye_dir) / self.split
@@ -144,18 +163,12 @@ class Stereo4D(StereoMotionBase):
     # ----------------------------- core loaders -----------------------------
 
     def _load_single_frame(self, seq: str, idx: int) -> np.ndarray:
-        if self.time_debug:
-            t0 = time.perf_counter()
         vr = VideoReader(str(self.left_mp4_path(seq)), ctx=cpu(0))
         frame = vr[idx].asnumpy()  # (H, W, 3)
         del vr
-        if self.time_debug:
-            print(f"[TIME] single frame {seq}[{idx}]: {(time.perf_counter()-t0)*1000:.2f}ms")
         return frame  # (H, W, 3)
 
     def _load_single_frame_annotations(self, seq: str, idx: int) -> np.ndarray:
-        if self.time_debug:
-            t0 = time.perf_counter()
         ann = np.load(self.npz_path(seq), allow_pickle=True)
         pcs_all = _optimized_pcs(
             lengths=ann["track_lengths"],
@@ -164,8 +177,6 @@ class Stereo4D(StereoMotionBase):
             idxs=np.array([idx], dtype=np.int32),
         )  # (T, 1, 4)
         pcs = pcs_all[:, 0, :]  # (T, 4)
-        if self.time_debug:
-            print(f"[TIME] ann frame {seq}[{idx}]: {(time.perf_counter()-t0)*1000:.2f}ms")
         return pcs.astype(np.float32)  # (T, 4)
 
     def _get_intrinsics(self, seq: str) -> np.ndarray:
@@ -173,35 +184,24 @@ class Stereo4D(StereoMotionBase):
         if K is not None:
             return K  # (3, 3)
         vr = VideoReader(str(self.left_mp4_path(seq)), ctx=cpu(0))
-        h, w = vr[0].shape[0], vr[0].shape[1]
+        _, w = vr[0].shape[0], vr[0].shape[1]
         del vr
         K = _intrinsic_K(w, self.hfov)  # (3, 3)
         self._intrinsics_by_seq[seq] = K
         return K  # (3, 3)
 
     def _load_camera_data(self, seq: str, idx: int) -> Tuple[np.ndarray, np.ndarray]:
-        if self.time_debug:
-            t0 = time.perf_counter()
         K = self._get_intrinsics(seq)  # (3, 3)
         ann = np.load(self.npz_path(seq), allow_pickle=True)
         extr = geom.inv(ann["camera2world"][idx])  # (4, 4) or (3, 4) depending on your utils
-        if self.time_debug:
-            print(f"[TIME] cam {seq}[{idx}]: {(time.perf_counter()-t0)*1000:.2f}ms")
         return K, extr  # (3, 3), (4, 4)
 
     # ------------------------------ public api ------------------------------
 
     def get_frame_info(self, seq: str, idx: int) -> dict:
-        if self.time_debug:
-            t0 = time.perf_counter()
-            print(f"\n[TIME] get_frame_info({seq}, {idx})")
-
         img = self._load_single_frame(seq, idx)  # (H, W, 3)
         world_pc = self._load_single_frame_annotations(seq, idx)  # (T, 4)
         intr, extr = self._load_camera_data(seq, idx)  # (3, 3), (4, 4)
-
-        if self.time_debug:
-            print(f"[TIME] TOTAL get_frame_info: {(time.perf_counter()-t0)*1000:.2f}ms")
 
         return dict(
             image=img,                               # (H, W, 3)
@@ -212,57 +212,37 @@ class Stereo4D(StereoMotionBase):
         )
 
     def get_frame_infos(self, seq: str, idxs: List[int]) -> List[dict]:
-        if self.time_debug:
-            t0 = time.perf_counter()
-            print(f"\n[TIME] get_frame_infos({seq}, {idxs})")
-
         # open video once
-        t1 = time.perf_counter()
         vr = VideoReader(str(self.left_mp4_path(seq)), ctx=cpu(0))
-        if self.time_debug:
-            print(f"[TIME] create VR: {(time.perf_counter()-t1)*1000:.2f}ms")
 
         # batch load frames
         frames: List[np.ndarray] = []
-        t1 = time.perf_counter()
         for i in idxs:
             frames.append(vr[i].asnumpy())  # (H, W, 3)
-        if self.time_debug:
-            print(f"[TIME] read {len(idxs)} frames: {(time.perf_counter()-t1)*1000:.2f}ms")
         del vr
 
         # load ann once
-        t1 = time.perf_counter()
         ann = np.load(self.npz_path(seq), allow_pickle=True)
-        if self.time_debug:
-            print(f"[TIME] load ann: {(time.perf_counter()-t1)*1000:.2f}ms")
 
         # intrinsics once
         intr = self._get_intrinsics(seq)  # (3, 3)
 
         # annotations for selected frames
-        t1 = time.perf_counter()
         pcs_all = _optimized_pcs(
             lengths=ann["track_lengths"],
             track_indices=ann["track_indices"],
             track_coordinates=ann["track_coordinates"],
             idxs=np.asarray(idxs, dtype=np.int32),
         )  # (T, F, 4)
-        if self.time_debug:
-            print(f"[TIME] build pcs: {(time.perf_counter()-t1)*1000:.2f}ms")
 
         # extrinsics for selected frames
-        t1 = time.perf_counter()
         c2w = ann["camera2world"]
         extr_list = [geom.inv(c2w[i]) for i in idxs]  # list of (4, 4)
-        if self.time_debug:
-            print(f"[TIME] extrinsics: {(time.perf_counter()-t1)*1000:.2f}ms")
 
         # col lookup
         col_of_frame = {f: j for j, f in enumerate(idxs)}
 
         # package
-        t1 = time.perf_counter()
         out: List[dict] = []
         for j, fidx in enumerate(idxs):
             out.append(dict(
@@ -272,8 +252,5 @@ class Stereo4D(StereoMotionBase):
                 dm=None,
                 instance=f"{seq}_{fidx:05d}",
             ))
-        if self.time_debug:
-            print(f"[TIME] build results: {(time.perf_counter()-t1)*1000:.2f}ms")
-            print(f"[TIME] TOTAL get_frame_infos: {(time.perf_counter()-t0)*1000:.2f}ms")
 
         return out

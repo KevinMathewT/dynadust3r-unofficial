@@ -4,12 +4,13 @@ Date: 2025-08-17
 LinkedIn: https://www.linkedin.com/in/kevinmathewt/
 """
 
+import os
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
 
 from loaders.pointodyssey import PointOdyssey
-from loaders.stereo4d import Stereo4D
+from loaders.stereo4d import Stereo4D  # noqa: F401
 from loaders.stereo4d_wds import Stereo4DWDS
 
 LOADERS = {
@@ -24,7 +25,7 @@ def add_batch_size_wrapper(batch):
     
     return batch
 
-def get_loaders(config, num_workers_multiplier=1, time_debug=False, loader_kwargs=None):
+def get_loaders(config, num_workers_multiplier=1, loader_kwargs=None):
     """
     Create dataloaders for use with Hugging Face Accelerate.
     
@@ -38,14 +39,13 @@ def get_loaders(config, num_workers_multiplier=1, time_debug=False, loader_kwarg
     Args:
         config: Configuration object
         num_workers_multiplier: Multiplier for number of workers
-        time_debug: Whether to enable timing debug in the dataset
         loader_kwargs: Optional dict forwarded verbatim to DataLoader to allow
                         quick sweeps of parameters like prefetch_factor &
                         persistent_workers without touching this function.
     """
-    # Create datasets with time_debug parameter
-    train_dataset = LOADERS[config.data.loader](config, valid=False, time_debug=time_debug)
-    valid_dataset = LOADERS[config.data.loader](config, valid=True, time_debug=time_debug)
+    # Create datasets
+    train_dataset = LOADERS[config.data.loader](config, valid=False)
+    valid_dataset = LOADERS[config.data.loader](config, valid=True)
 
     # Calculate num_workers based on multiplier
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -95,8 +95,7 @@ def get_loaders(config, num_workers_multiplier=1, time_debug=False, loader_kwarg
         print(f"Batch size (before distribution): {config.data.batch_size}")
         print(f"num_workers: {num_workers} ({num_workers_multiplier} * {len(os.sched_getaffinity(0))})")
         print(f"persistent_workers: {persistent_workers} | prefetch_factor: {prefetch_factor}")
-        print(f"time_debug: {time_debug}")
-        print(f"Note: Accelerate will automatically distribute batches across GPUs")
+        print("Note: Accelerate will automatically distribute batches across GPUs")
 
     return train_loader, valid_loader
 
@@ -104,14 +103,16 @@ def get_loaders(config, num_workers_multiplier=1, time_debug=False, loader_kwarg
 # -------------------------------------------------------------
 #  dataloader benchmark – mirrors dynadust3r config handling
 # -------------------------------------------------------------
-import os, time, itertools
-import torch, hydra
+import os
+import time
+import torch
+import hydra
 from omegaconf import DictConfig, OmegaConf
 from hydra.core.hydra_config import HydraConfig
 from tqdm import tqdm                                                   # NEW
 
 from utils.train_utils import setup_distributed, AverageMeter
-from loaders import get_loaders           # keep import path same as your project
+# keep import path same as your project
 
 
 def get_cycled_batches(dataloader, total_iterations):
@@ -153,9 +154,6 @@ def main(config: DictConfig):
     persistent_options = [False, True]
 
     results = {}
-
-    # Enable time_debug for detailed timing analysis
-    time_debug = True
     
     for multiplier in multipliers_to_test:
         for pref in prefetch_values:
@@ -171,7 +169,7 @@ def main(config: DictConfig):
 
                 loader_kwargs = dict(prefetch_factor=pref, persistent_workers=persist)
                 train_loader, _ = get_loaders(config, num_workers_multiplier=multiplier,
-                                              time_debug=time_debug, loader_kwargs=loader_kwargs)
+                                              loader_kwargs=loader_kwargs)
 
                 # fixed 200 iterations, regardless of epoch boundaries
                 total_iterations = 20
@@ -234,7 +232,7 @@ def main(config: DictConfig):
         best_workers = int(b_mult * os.cpu_count() / 3)
         best_time = results[best_key]['avg']
         
-        print(f"\nBEST CONFIGURATION:")
+        print("\nBEST CONFIGURATION:")
         print(f"multiplier        : {b_mult}")
         print(f"num_workers       : {best_workers}")
         print(f"prefetch_factor   : {b_pref}")

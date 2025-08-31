@@ -106,40 +106,67 @@ def main(config: DictConfig):
 
     start_time = time.time()  # wall-clock timer
 
+    # manual grad accumulation setup
+    grad_acc = int(getattr(config.train, "grad_acc", 1))
+
     # main training loop
     for batch in batch_iter:
         current_epoch     = iteration // validation_frequency
         dataset_position  = (iteration % batches_per_epoch) + 1
 
-        outputs = model(batch)  # (depends on model)  # (..., ...)
+        # ensure grad_norm defined for logging even on micro-steps
+        grad_norm = torch.tensor(0.0, device=accelerator.device)
 
-        # loss in fp32 to avoid nans in some terms
-        unwrapped_model = accelerator.unwrap_model(model)
-        loss, loss_details = unwrapped_model.get_loss(batch, outputs)  # scalar tensor  # (1,)
+        micro_idx = iteration % max(grad_acc, 1)
+        is_last_micro = (micro_idx == grad_acc - 1)
 
-        if loss is None or not isinstance(loss, torch.Tensor):
-            loss = torch.zeros(1, requires_grad=True, device=accelerator.device)  # (1,)
-
-        # backward
-        accelerator.backward(loss)
-
-        # grad clip
-        if config.train.grad_clip > 0:
-            grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.train.grad_clip)
+        # forward + backward (avoid DDP sync on non-final micro-steps)
+        if grad_acc > 1 and not is_last_micro:
+            with accelerator.no_sync(model):
+                outputs = model(batch)  # (depends on model)  # (..., ...)
+                # loss in fp32 to avoid nans in some terms
+                unwrapped_model = accelerator.unwrap_model(model)
+                loss, loss_details = unwrapped_model.get_loss(batch, outputs)  # scalar tensor  # (1,)
+                if loss is None or not isinstance(loss, torch.Tensor):
+                    loss = torch.zeros(1, requires_grad=True, device=accelerator.device)  # (1,)
+                loss_to_backward = loss / grad_acc
+                accelerator.backward(loss_to_backward)
         else:
-            grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+            outputs = model(batch)  # (depends on model)  # (..., ...)
+            # loss in fp32 to avoid nans in some terms
+            unwrapped_model = accelerator.unwrap_model(model)
+            loss, loss_details = unwrapped_model.get_loss(batch, outputs)  # scalar tensor  # (1,)
+            if loss is None or not isinstance(loss, torch.Tensor):
+                loss = torch.zeros(1, requires_grad=True, device=accelerator.device)  # (1,)
+            loss_to_backward = loss / grad_acc if grad_acc > 1 else loss
+            accelerator.backward(loss_to_backward)
 
-        optimizer.step()
-        optimizer.zero_grad()
+        # detach outputs so the graph can be freed across micro-steps
+        with torch.no_grad():
+            if isinstance(outputs, torch.Tensor):
+                outputs = outputs.detach()
+            elif isinstance(outputs, (list, tuple)):
+                outputs = type(outputs)(o.detach() if torch.is_tensor(o) else o for o in outputs)
+            elif isinstance(outputs, dict):
+                outputs = {k: (v.detach() if torch.is_tensor(v) else v) for k, v in outputs.items()}
 
-        if accelerator.sync_gradients and scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step()
+        # step only on the last micro-step
+        if is_last_micro:
+            if config.train.grad_clip > 0:
+                grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.train.grad_clip)
+            else:
+                grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+
+            optimizer.step()
+            optimizer.zero_grad()
+
+            if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step()
 
         # metrics on-no-grad
         with torch.no_grad():
             unwrapped_model = accelerator.unwrap_model(model)
             batch_metrics = unwrapped_model.compute_metrics(batch, outputs)  # dict[str, float]
-
             for k, v in batch_metrics.items():
                 if k not in train_metrics:
                     train_metrics[k] = AverageMeter(k, ":.4f")

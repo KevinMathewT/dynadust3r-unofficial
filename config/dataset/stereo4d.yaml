@@ -1,5 +1,7 @@
 name: stereo4d
 path: /scratch/projects/fouheylab/km6748/stereo4d-data/
+wds_dir: ???
+cache: /scratch/projects/fouheylab/km6748/stereo4d-data/.cache
 lefteye_dir: /scratch/projects/fouheylab/km6748/stereo4d-data/lefteye-perspective
 meta_dir: /scratch/projects/fouheylab/km6748/stereo4d-data/meta
 train_split: train # train, test

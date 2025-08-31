@@ -11,14 +11,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .stereo_motion_base import StereoMotionBase
 import utils.geometry as geom
+import albumentations as A
 
 
 class PointOdyssey(StereoMotionBase):
-    def __init__(self, config, valid: bool = False, time_debug: bool = False):
+    def __init__(self, config, valid: bool = False):
         """
         pointodyssey dataset implementation
         """
-        super().__init__(config, valid, time_debug)
+        super().__init__(config, valid)
         print("loading pointodyssey dataset...")
 
         self.dataset_label = config.dataset.pointodyssey.name
@@ -33,6 +34,26 @@ class PointOdyssey(StereoMotionBase):
         split_dir = os.path.join(self.dataset_location, self.split)
         if not os.path.exists(split_dir):
             raise ValueError(f"dataset split directory not found: {split_dir}")
+
+        # color augmentation (train) or identity (valid)
+        if not valid:
+            aug_list = [
+                A.RandomBrightnessContrast(p=0.2),
+                A.HueSaturationValue(p=0.2),
+                A.ToGray(p=0.2),
+                A.ImageCompression(quality_lower=30, quality_upper=100, p=0.5),
+                A.OneOf(
+                    [
+                        A.MotionBlur(p=0.2),
+                        A.MedianBlur(blur_limit=3, p=0.1),
+                        A.Blur(blur_limit=3, p=0.1),
+                    ],
+                    p=0.2,
+                ),
+            ]
+            self.color_aug = A.Compose(aug_list)
+        else:
+            self.color_aug = A.NoOp()
 
         # collect sequences that have the expected structure
         for item in sorted(os.listdir(split_dir)):
