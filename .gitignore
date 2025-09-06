@@ -190,3 +190,5 @@ wandb/
 .python-version
 job_error_*
 job_output_*
+
+scratch/

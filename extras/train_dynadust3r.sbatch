@@ -1,7 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=dynadust3r
-#SBATCH --account=pr_96_general
-#SBATCH --time=48:00:00
+# #SBATCH --account=pr_96_general
+# #SBATCH --account=pr_96_tandon_advanced
+# #SBATCH --account=pr_96_tandon_priority
+#SBATCH --time=24:00:00
 #SBATCH --mem=750G                   # all ram on the node
 #SBATCH --gres=gpu:h100:4
 #SBATCH --cpus-per-task=64            # 16 CPUs/GPU; enough for 12 workers + overhead

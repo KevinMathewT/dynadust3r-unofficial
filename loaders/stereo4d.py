@@ -78,7 +78,7 @@ class Stereo4D(StereoMotionBase):
         self.config = config
 
         # color augmentation (train) or identity (valid)
-        if not valid:
+        if not valid and not getattr(config, "debug", False):
             aug_list = [
                 A.RandomBrightnessContrast(p=0.2),
                 A.HueSaturationValue(p=0.2),

@@ -7,6 +7,10 @@ head_type: dpt
 motion_head_type: dpt
 depth_mode: [exp, !!float -.inf, !!float .inf]
 conf_mode: [exp, 1, !!float .inf]
+motion_depth_mode: [linear, !!float -.inf, !!float .inf]
+motion_conf_mode: [exp, 1, !!float .inf]
+depth_post_mode: [linear, !!float -.inf, !!float .inf] # [exp, !!float -.inf, !!float .inf]
+motion_depth_post_mode: [linear, !!float -.inf, !!float .inf] # [exp, !!float -.inf, !!float .inf]
 freeze: none
 landscape_only: true
 patch_embed_cls: PatchEmbedDust3R

@@ -10,6 +10,7 @@ LinkedIn: https://www.linkedin.com/in/kevinmathewt/
 # --------------------------------------------------------
 # DynaDUSt3R model class - extends DUSt3R with motion prediction
 # --------------------------------------------------------
+
 # standard library
 import gc
 import io
@@ -36,6 +37,7 @@ import utils.geometry as geom
 from utils.rerun_viz import visualize_image, visualize_pm, visualize_sequence_from_pms
 from models.croco.croco import CroCoNet  # noqa: F401
 from models.dust3r.utils.heads import head_factory, motion_head_factory
+from models.dust3r.utils.heads.postprocess import reg_dense_depth
 from models.dust3r.utils.misc import (
     fill_default_args,
     freeze_all_params,
@@ -78,6 +80,10 @@ class DynaDUSt3R(
         motion_head_type="linear",
         depth_mode=("exp", -inf, inf),
         conf_mode=("exp", 1, inf),
+        motion_depth_mode=("linear", -inf, inf),
+        motion_conf_mode=("exp", 1, inf),
+        depth_post_mode=("linear", -inf, inf),
+        motion_depth_post_mode=("linear", -inf, inf),
         freeze="none",
         landscape_only=True,
         patch_embed_cls="PatchEmbedDust3R",  # PatchEmbedDust3R or ManyAR_PatchEmbed
@@ -95,6 +101,9 @@ class DynaDUSt3R(
         super().__init__(**croco_kwargs)
 
         # dust3r specific initialization
+        # postprocess modes for mapping head outputs in loss/metrics
+        self.depth_post_mode = depth_post_mode
+        self.motion_depth_post_mode = motion_depth_post_mode
         self.dec_blocks2 = deepcopy(self.dec_blocks)
         self.set_downstream_head(
             output_mode,
@@ -104,6 +113,8 @@ class DynaDUSt3R(
             landscape_only,
             depth_mode,
             conf_mode,
+            motion_depth_mode,
+            motion_conf_mode,
             **croco_kwargs,
         )
         self.set_freeze(freeze)
@@ -162,6 +173,8 @@ class DynaDUSt3R(
         landscape_only,
         depth_mode,
         conf_mode,
+        motion_depth_mode,
+        motion_conf_mode,
         patch_size,
         img_size,
         **kw,
@@ -176,6 +189,8 @@ class DynaDUSt3R(
         self.motion_head_type = motion_head_type
         self.depth_mode = depth_mode
         self.conf_mode = conf_mode
+        self.motion_depth_mode = motion_depth_mode
+        self.motion_conf_mode = motion_conf_mode
         # allocate point heads
         self.downstream_head1 = head_factory(
             head_type, output_mode, self, has_conf=bool(conf_mode)
@@ -196,14 +211,14 @@ class DynaDUSt3R(
             motion_head_type,
             motion_output_mode,
             self,
-            has_conf=bool(conf_mode),
+            has_conf=bool(motion_conf_mode),
             time_pos_emb_dim=self.time_pos_emb_dim,
         )
         self.motion_head2 = motion_head_factory(
             motion_head_type,
             motion_output_mode,
             self,
-            has_conf=bool(conf_mode),
+            has_conf=bool(motion_conf_mode),
             time_pos_emb_dim=self.time_pos_emb_dim,
         )
         # magic wrapper
@@ -450,30 +465,38 @@ class DynaDUSt3R(
                     2, [tok.float() for tok in dec_right], shape_right, query_times
                 )  # decout: list len=1+dec_depth, first (B,S,D_enc), rest (B,S,D_dec); dict: map_pred: (B,T,H,W,3); optional map_pred_conf: (B,T,H,W,1)
                 
-                # Organize motion predictions with dynamic keys
-                motion_pred = {}  # dict[str, Tensor]
-                
+                # Organize motion predictions with standardized keys
+                # Mid: l_to_t0, r_to_t0 (index-based)
+                # Others: l_to_r (t==1), r_to_l (t==0)
+                motion_pred = {}
+                times = query_times[0]
+                is_t0 = torch.isclose(times, torch.tensor(0.0, device=times.device), atol=1e-6, rtol=0.0)
+                is_t1 = torch.isclose(times, torch.tensor(1.0, device=times.device), atol=1e-6, rtol=0.0)
+
                 for t_idx in range(T):
-                    # Get the actual time value for this index
-                    t_val = query_times[0, t_idx].item()  # (float) Assuming all batches share query_times
-                    
-                    # Left view predicts motion to all times except 0
-                    if abs(t_val - 0.0) > 1e-6:  # (bool) Not at t=0
-                        key = f"l_to_{t_val:.3g}"  # (str) Format nicely (e.g., 0.35 instead of 0.350)
-                        motion_pred[key] = motion_left_all["map_pred"][:, t_idx]  # (B, H, W, 3)
+                    # left-based: special case for t==1.0 → l_to_r, else index key if not t==0
+                    if bool(is_t1[t_idx].item()):
+                        key = "l_to_r"
+                        motion_pred[key] = motion_left_all["map_pred"][:, t_idx]
                         if "map_pred_conf" in motion_left_all:
-                            motion_pred[f"{key}_conf"] = motion_left_all["map_pred_conf"][
-                                :, t_idx
-                            ]  # (B, H, W, 1)
-                    
-                    # Right view predicts motion to all times except 1
-                    if abs(t_val - 1.0) > 1e-6:  # (bool) Not at t=1
-                        key = f"r_to_{t_val:.3g}"  # (str)
-                        motion_pred[key] = motion_right_all["map_pred"][:, t_idx]  # (B, H, W, 3)
+                            motion_pred[f"{key}_conf"] = motion_left_all["map_pred_conf"][:, t_idx]
+                    elif not bool(is_t0[t_idx].item()):
+                        key = f"l_to_t{t_idx}"
+                        motion_pred[key] = motion_left_all["map_pred"][:, t_idx]
+                        if "map_pred_conf" in motion_left_all:
+                            motion_pred[f"{key}_conf"] = motion_left_all["map_pred_conf"][:, t_idx]
+
+                    # right-based: special case for t==0.0 → r_to_l, else index key if not t==1
+                    if bool(is_t0[t_idx].item()):
+                        key = "r_to_l"
+                        motion_pred[key] = motion_right_all["map_pred"][:, t_idx]
                         if "map_pred_conf" in motion_right_all:
-                            motion_pred[f"{key}_conf"] = motion_right_all["map_pred_conf"][
-                                :, t_idx
-                            ]  # (B, H, W, 1)
+                            motion_pred[f"{key}_conf"] = motion_right_all["map_pred_conf"][:, t_idx]
+                    elif not bool(is_t1[t_idx].item()):
+                        key = f"r_to_t{t_idx}"
+                        motion_pred[key] = motion_right_all["map_pred"][:, t_idx]
+                        if "map_pred_conf" in motion_right_all:
+                            motion_pred[f"{key}_conf"] = motion_right_all["map_pred_conf"][:, t_idx]
 
         # Rename right's 3D points to indicate they're in left's frame
         res_right["map_pred_in_left_frame"] = res_right.pop("map_pred")  # (B, H, W, 3)
@@ -552,8 +575,35 @@ class DynaDUSt3R(
         device = batch["left_pm"].device  # (torch.device)
         alpha = 0.2  # (float)
 
-        # Extract query time once
-        tq_mid = batch["query_times"][0, 0].item()  # (float)
+        # ------------------------------------------------------------------
+        # Apply post-depth mappings BEFORE anything else, as requested
+        # - depth_post_mode on raw point-head outputs
+        # - motion_depth_post_mode on (point + motion) sums
+        # ------------------------------------------------------------------
+        # Base predictions (B, H, W, 3)
+        left_pred_pp = reg_dense_depth(outputs["left_map_pred"], self.depth_post_mode)
+        right_pred_pp = reg_dense_depth(outputs["right_map_pred_in_left_frame"], self.depth_post_mode)
+
+        # Extract mid index (assumed at column 0) once
+        tq_mid_idx = 0
+
+        # Motion predictions (postprocessed sums)
+        # Note: we use the same keys as in the current loss config
+        # and only access those keys that are used below
+        l2m_key = f"l_to_t{tq_mid_idx}"
+        r2m_key = f"r_to_t{tq_mid_idx}"
+        l2r_key = "l_to_r"
+        r2l_key = "r_to_l"
+
+        # Helper to postprocess motion+point sums
+        def _pp_motion_sum(base_pc, motion_disp):
+            return reg_dense_depth(base_pc + motion_disp[..., :3], self.motion_depth_post_mode)
+
+        # Build motion-postprocessed predictions
+        pred_l2m_pp = _pp_motion_sum(outputs["left_map_pred"], outputs["motion_pred"][l2m_key])
+        pred_r2m_pp = _pp_motion_sum(outputs["right_map_pred_in_left_frame"], outputs["motion_pred"][r2m_key])
+        pred_l2r_pp = _pp_motion_sum(outputs["left_map_pred"], outputs["motion_pred"][l2r_key])
+        pred_r2l_pp = _pp_motion_sum(outputs["right_map_pred_in_left_frame"], outputs["motion_pred"][r2l_key])
 
         # Process everything in chunks to avoid large intermediate tensors
         total_loss = torch.tensor(0.0, device=device, requires_grad=True)  # ()
@@ -563,7 +613,7 @@ class DynaDUSt3R(
             {
                 "name": "left",
                 "gt": batch["left_pm"][..., :3],  # (B, H, W, 3)
-                "pred": outputs["left_map_pred"],  # (B, H, W, 3)
+                "pred": left_pred_pp,  # (B, H, W, 3) postprocessed
                 "valid": batch["left_pm"][..., 3] > 0,  # (B, H, W)
                 "conf": outputs.get("left_map_pred_conf", None),  # (B, H, W, 1) or None
                 "is_base": True
@@ -571,41 +621,41 @@ class DynaDUSt3R(
             {
                 "name": "right", 
                 "gt": batch["right_pm"][..., :3],  # (B, H, W, 3)
-                "pred": outputs["right_map_pred_in_left_frame"],  # (B, H, W, 3)
+                "pred": right_pred_pp,  # (B, H, W, 3) postprocessed
                 "valid": batch["right_pm"][..., 3] > 0,  # (B, H, W)
                 "conf": outputs.get("right_map_pred_conf", None),  # (B, H, W, 1) or None
                 "is_base": True
             },
             {
                 "name": "l2m",
-                "gt": batch["left_pm"][..., :3] + batch["motion_gt"]["l2m"][..., :3],  # (B, H, W, 3)
-                "pred": outputs["left_map_pred"] + outputs["motion_pred"][f"l_to_{tq_mid:.3g}"][..., :3],  # (B, H, W, 3)
-                "valid": (batch["left_pm"][..., 3] > 0) & (batch["motion_gt"]["l2m"][..., 3] > 0),  # (B, H, W)
-                "conf": outputs["motion_pred"].get(f"l_to_{tq_mid:.3g}_conf", None),  # (B, H, W, 1) or None
+                "gt": batch["left_pm"][..., :3] + batch["motion_gt"]["l2m"][..., :3],
+                "pred": pred_l2m_pp,
+                "valid": (batch["left_pm"][..., 3] > 0) & (batch["motion_gt"]["l2m"][..., 3] > 0),
+                "conf": outputs["motion_pred"].get(f"l_to_t{tq_mid_idx}_conf", None),
                 "is_base": False
             },
             {
                 "name": "r2m",
-                "gt": batch["right_pm"][..., :3] + batch["motion_gt"]["r2m"][..., :3],  # (B, H, W, 3)
-                "pred": outputs["right_map_pred_in_left_frame"] + outputs["motion_pred"][f"r_to_{tq_mid:.3g}"][..., :3],  # (B, H, W, 3)
-                "valid": (batch["right_pm"][..., 3] > 0) & (batch["motion_gt"]["r2m"][..., 3] > 0),  # (B, H, W)
-                "conf": outputs["motion_pred"].get(f"r_to_{tq_mid:.3g}_conf", None),  # (B, H, W, 1) or None
+                "gt": batch["right_pm"][..., :3] + batch["motion_gt"]["r2m"][..., :3],
+                "pred": pred_r2m_pp,
+                "valid": (batch["right_pm"][..., 3] > 0) & (batch["motion_gt"]["r2m"][..., 3] > 0),
+                "conf": outputs["motion_pred"].get(f"r_to_t{tq_mid_idx}_conf", None),
                 "is_base": False
             },
             {
                 "name": "l2r",
-                "gt": batch["left_pm"][..., :3] + batch["motion_gt"]["l2r"][..., :3],  # (B, H, W, 3)
-                "pred": outputs["left_map_pred"] + outputs["motion_pred"]["l_to_1"][..., :3],  # (B, H, W, 3)
-                "valid": (batch["left_pm"][..., 3] > 0) & (batch["motion_gt"]["l2r"][..., 3] > 0),  # (B, H, W)
-                "conf": outputs["motion_pred"].get("l_to_1_conf", None),  # (B, H, W, 1) or None
+                "gt": batch["left_pm"][..., :3] + batch["motion_gt"]["l2r"][..., :3],
+                "pred": pred_l2r_pp,
+                "valid": (batch["left_pm"][..., 3] > 0) & (batch["motion_gt"]["l2r"][..., 3] > 0),
+                "conf": outputs["motion_pred"].get("l_to_r_conf", None),
                 "is_base": False
             },
             {
                 "name": "r2l",
-                "gt": batch["right_pm"][..., :3] + batch["motion_gt"]["r2l"][..., :3],  # (B, H, W, 3)
-                "pred": outputs["right_map_pred_in_left_frame"] + outputs["motion_pred"]["r_to_0"][..., :3],  # (B, H, W, 3)
-                "valid": (batch["right_pm"][..., 3] > 0) & (batch["motion_gt"]["r2l"][..., 3] > 0),  # (B, H, W)
-                "conf": outputs["motion_pred"].get("r_to_0_conf", None),  # (B, H, W, 1) or None
+                "gt": batch["right_pm"][..., :3] + batch["motion_gt"]["r2l"][..., :3],
+                "pred": pred_r2l_pp,
+                "valid": (batch["right_pm"][..., 3] > 0) & (batch["motion_gt"]["r2l"][..., 3] > 0),
+                "conf": outputs["motion_pred"].get("r_to_l_conf", None),
                 "is_base": False
             }
         ]  # (list[len=6])
@@ -623,10 +673,10 @@ class DynaDUSt3R(
                 gt_left_pc, gt_right_pc, valid_left, valid_right
             )
 
-        # Pred normalization (needs gradients)
+        # Pred normalization (needs gradients) — use postprocessed base PCs
         pred_scale = self._compute_norm_factor_fixed(  # (B,1,1,1)
-            outputs["left_map_pred"],
-            outputs["right_map_pred_in_left_frame"],
+            left_pred_pp,
+            right_pred_pp,
             valid_left, valid_right
         )
 
@@ -767,10 +817,15 @@ class DynaDUSt3R(
             )
 
             pred_scale = None
+            left_pred_pp = None
+            right_pred_pp = None
             if "left_map_pred" in outputs and "right_map_pred_in_left_frame" in outputs:
+                # Postprocess base predictions before computing pred_scale
+                left_pred_pp = reg_dense_depth(outputs["left_map_pred"], self.depth_post_mode)
+                right_pred_pp = reg_dense_depth(outputs["right_map_pred_in_left_frame"], self.depth_post_mode)
                 pred_scale = self._compute_norm_factor_fixed(
-                    outputs["left_map_pred"],
-                    outputs["right_map_pred_in_left_frame"],
+                    left_pred_pp,
+                    right_pred_pp,
                     valid_left,
                     valid_right,
                 )
@@ -780,10 +835,10 @@ class DynaDUSt3R(
         # ================================================================
         if (
             pred_scale is not None
-            and "left_map_pred" in outputs
+            and left_pred_pp is not None
             and valid_left.sum().item() > 0
         ):
-            left_pred_n = outputs["left_map_pred"] / pred_scale
+            left_pred_n = left_pred_pp / pred_scale
             left_gt_n = batch["left_pm"][..., :3] / gt_scale
             metrics["left_3d_error"] = torch.norm(
                 left_pred_n[valid_left] - left_gt_n[valid_left],
@@ -792,10 +847,10 @@ class DynaDUSt3R(
 
         if (
             pred_scale is not None
-            and "right_map_pred_in_left_frame" in outputs
+            and right_pred_pp is not None
             and valid_right.sum().item() > 0
         ):
-            right_pred_n = outputs["right_map_pred_in_left_frame"] / pred_scale
+            right_pred_n = right_pred_pp / pred_scale
             right_gt_n = batch["right_pm"][..., :3] / gt_scale
             metrics["right_3d_error"] = torch.norm(
                 right_pred_n[valid_right] - right_gt_n[valid_right],
@@ -813,38 +868,35 @@ class DynaDUSt3R(
         if "motion_pred" not in outputs or "motion_gt" not in batch:
             return metrics  # nothing to add
 
-        tq_mid = (
-            batch["query_times"][0, 0]  # (B,T)
-            if batch["query_times"].dim() == 2
-            else batch["query_times"][0]  # (T,)
-        ).item()
+        # Use index-based keys consistent with forward() and get_loss()
+        tq_mid_idx = 0
 
         # Construct targets as base + GT motion (same as in loss computation)
         dir_cfg = {
             "l2m": {
-                "pred_key": f"l_to_{tq_mid:.3g}",
-                "src_pts": outputs.get("left_map_pred"),
+                "pred_key": f"l_to_t{tq_mid_idx}",
+                "src_pts_raw": outputs.get("left_map_pred"),
                 "tgt_pts": batch["left_pm"][..., :3] + batch["motion_gt"]["l2m"][..., :3],
                 "base_valid": valid_left,
                 "motion_valid": batch["motion_gt"]["l2m"][..., 3] > 0,
             },
             "r2m": {
-                "pred_key": f"r_to_{tq_mid:.3g}",
-                "src_pts": outputs.get("right_map_pred_in_left_frame"),
+                "pred_key": f"r_to_t{tq_mid_idx}",
+                "src_pts_raw": outputs.get("right_map_pred_in_left_frame"),
                 "tgt_pts": batch["right_pm"][..., :3] + batch["motion_gt"]["r2m"][..., :3],
                 "base_valid": valid_right,
                 "motion_valid": batch["motion_gt"]["r2m"][..., 3] > 0,
             },
             "l2r": {
-                "pred_key": "l_to_1",
-                "src_pts": outputs.get("left_map_pred"),
+                "pred_key": "l_to_r",
+                "src_pts_raw": outputs.get("left_map_pred"),
                 "tgt_pts": batch["left_pm"][..., :3] + batch["motion_gt"]["l2r"][..., :3],
                 "base_valid": valid_left,
                 "motion_valid": batch["motion_gt"]["l2r"][..., 3] > 0,
             },
             "r2l": {
-                "pred_key": "r_to_0",
-                "src_pts": outputs.get("right_map_pred_in_left_frame"),
+                "pred_key": "r_to_l",
+                "src_pts_raw": outputs.get("right_map_pred_in_left_frame"),
                 "tgt_pts": batch["right_pm"][..., :3] + batch["motion_gt"]["r2l"][..., :3],
                 "base_valid": valid_right,
                 "motion_valid": batch["motion_gt"]["r2l"][..., 3] > 0,
@@ -855,13 +907,13 @@ class DynaDUSt3R(
         for name, cfg in dir_cfg.items():
             if cfg["pred_key"] not in outputs["motion_pred"]:
                 continue  # prediction absent
-            if cfg["src_pts"] is None:
+            if cfg["src_pts_raw"] is None:
                 continue  # base prediction absent
 
             # (B, H, W, 3)
             pred_disp = outputs["motion_pred"][cfg["pred_key"]]
-            # translated cloud
-            pts_pred = cfg["src_pts"] + pred_disp
+            # sum raw base + motion and postprocess with motion_depth_post_mode
+            pts_pred_pp = reg_dense_depth(cfg["src_pts_raw"] + pred_disp, self.motion_depth_post_mode)
             # intersection validity
             valid = cfg["base_valid"] & cfg["motion_valid"]
 
@@ -869,7 +921,7 @@ class DynaDUSt3R(
                 continue  # no valid GT for this direction
 
             # scale-normalized error (matching get_loss normalization)
-            pts_pred_n = pts_pred / pred_scale
+            pts_pred_n = pts_pred_pp / pred_scale
             tgt_pts_n = cfg["tgt_pts"] / gt_scale
 
             err = torch.norm(
@@ -887,7 +939,17 @@ class DynaDUSt3R(
 
     def save_visualizations(self, batch, outputs, base_name, i=0, *args, **kwargs):
         from utils.viz import save_visualizations as save_viz
-        save_viz(batch, outputs, base_name, i=i, *args, **kwargs)
+        # pass depth post modes so viz applies same mapping as loss/metrics
+        save_viz(
+            batch,
+            outputs,
+            base_name,
+            i=i,
+            depth_post_mode=self.depth_post_mode,
+            motion_depth_post_mode=self.motion_depth_post_mode,
+            *args,
+            **kwargs,
+        )
 
     def save_checkpoint(self, state, is_best, filename):
         """

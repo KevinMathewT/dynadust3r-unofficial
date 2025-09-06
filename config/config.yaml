@@ -22,23 +22,23 @@ sched: null
 
 train:
   validation_frequency: 2000  # Combined validation frequency (replaces both epoch_frequency and valid.interval)
-  iterations: 98000  # Total number of training iterations
+  iterations: 98000           # Total number of training iterations
   grad_clip: 0
-  grad_acc: 2  # Gradient accumulation steps (1 = no accumulation)
+  grad_acc: 2                 # Gradient accumulation steps (1 = no accumulation)
 
 valid:
-  save: 
+  save:
     save_best: True
     best_metric: loss
     lower_is_better: True
-    keep_top_k: 20          # retain top-20 checkpoints
+    keep_top_k: 20
     output_dir: weights/
 
 data:
   loader: stereo4d # [stereo4d, pointodyssey]
-  len: ??? # Will be calculated in Python: iterations * batch_size | ???
-  valid_len: 1000 # Will be calculated in Python: this * batch_size | 300
-  size: 512 # image size | also change in model/dynadust3r.yaml
+  len: ???         # Will be calculated in Python: iterations * batch_size | ???
+  valid_len: 1000  # Will be calculated in Python: this * batch_size | 300
+  size: 512        # image size | also change in model/dynadust3r.yaml
   crop: True
   batch_size: 4
   num_workers: 16
@@ -47,3 +47,14 @@ data:
 logging:
   use_wandb: True
   wandb_interval: 5
+
+infer:
+  checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-08-28/14-08-33/checkpoints/best_loss_1.640394_iter_49000_epoch_25.pth
+  input_dir: /scratch/km6748/vision-experiments/scratch/paper
+  output_dir: /scratch/km6748/vision-experiments/scratch/paper/results
+  gif_glob: "*.gif"
+  device: auto  # auto|cuda|cpu
+
+  # === filtering knobs ===
+  motion_conf_top_percentile: 0.25   # keep top p fraction by confidence (0..1); 0.25 => top 25%
+  mask_motion_top_percentile: 0.25   # among those, keep top p fraction by |motion| (0..1); 0.01 => top 1%

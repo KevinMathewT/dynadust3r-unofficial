@@ -1,457 +1,333 @@
-"""
-Author: Kevin Mathew T
-Date: 2025-08-17
-LinkedIn: https://www.linkedin.com/in/kevinmathewt/
-"""
-
-import torch
 import numpy as np
-import matplotlib.cm as cm
+import torch
 import cv2
+import matplotlib.cm as cm
 import wandb
 
 from utils.geometry import cam_pc_to_world_pc, world_pc_to_cam_pc
-import utils.rerun_viz as rerun_viz  # rerun-based visualizations (moved from loaders/utils/viz.py)
+from models.dust3r.utils.heads.postprocess import reg_dense_depth
 
-def _normalize_pc_pair_np(pc1, pc2, valid1, valid2):
+# =====================
+# Utility helpers
+# =====================
+
+def _to_np(x):
+    """Torch tensor -> numpy (no grad, on CPU)."""
+    return x.detach().cpu().numpy()
+
+
+def _norm01(x: np.ndarray) -> np.ndarray:
+    """Normalize array to [0,1] over finite entries; return zeros if none finite."""
+    m = np.isfinite(x)
+    if not np.any(m):
+        return np.zeros_like(x, dtype=np.float32)
+    vmin = np.nanmin(x)
+    vmax = np.nanmax(x)
+    return (x - vmin) / (vmax - vmin + 1e-6)
+
+
+def make_depth_and_disp_imgs(pc_left: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
-    joint scale = mean‖p‖ all *valid* points in the two clouds.
-    returns a scalar.
+    Visualize depth & disparity from LEFT-CAMERA 3D coordinates.
+    pc_left: (H, W, 3) 3D points in LEFT camera frame
+    valid  : (H, W) boolean mask
+    Returns 8-bit RGB images.
     """
-    pc1_valid = pc1[valid1]          # (N1, 3)
-    pc2_valid = pc2[valid2]          # (N2, 3)
+    depth = pc_left[..., 2].astype(np.float32)
+    disp  = 1.0 / np.clip(depth, 1e-6, None)
 
-    if pc1_valid.size + pc2_valid.size == 0:
-        return 1.0
+    depth = depth.copy(); depth[~valid] = np.nan
+    disp  = disp.copy();  disp[~valid]  = np.nan
 
-    all_dis = np.linalg.norm(np.concatenate((pc1_valid, pc2_valid), axis=0), axis=-1)
-    return np.maximum(np.mean(all_dis), 1e-8)                      # scalar
+    d01 = _norm01(depth)
+    q01 = _norm01(disp)
 
-
-# helper -----------------------------------------------------------
-def _make_depth_and_disp_imgs_np(pc: np.ndarray,
-                                 valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    pc    : (h, w, 3) xyz in left/right camera frame
-    valid : (h, w) boolean mask from gt indicating valid points
-
-    returns
-        depth_img : (h, w, 3) uint8, prism colormap
-        disp_img  : (h, w, 3) uint8, turbo colormap
-    """
-    # print(f"DEBUG: _make_depth_and_disp_imgs_np - pc shape: {pc.shape}, valid shape: {valid.shape}")
-    depth = pc[..., 2]            # (h, w)  z-component depth
-    disp  = 1.0 / np.clip(depth, a_min=1e-6, a_max=None)       # (h, w)  disparity
-
-    depth[~valid] = np.nan
-    disp[ ~valid] = np.nan
-
-    # normalise 0‒1 on valid region
-    def _norm(x: np.ndarray) -> np.ndarray:      # (h, w)
-        vmin = np.nanmin(x)
-        vmax = np.nanmax(x)
-        return (x - vmin) / (vmax - vmin + 1e-6)
-
-    depth_n   = _norm(depth)           # (h, w)
-    disp_n    = _norm(disp )           # (h, w)
-
-    depth_rgb = (cm.prism(depth_n)[..., :3] * 255).astype(np.uint8)  # (h, w, 3)
-    disp_rgb  = (cm.turbo(disp_n )[..., :3] * 255).astype(np.uint8)  # (h, w, 3)
+    depth_rgb = (cm.prism(d01)[..., :3] * 255).astype(np.uint8)
+    disp_rgb  = (cm.turbo(q01)[..., :3] * 255).astype(np.uint8)
     return depth_rgb, disp_rgb
 
 
-def _conf_to_gray_img_np(conf: np.ndarray,
-                         valid: np.ndarray | None = None) -> np.ndarray:
-    """
-    conf  : (H, W)  confidence ∈ [1, ∞)
-    valid : (H, W)  optional mask; invalid → nan
-    maps 1 → black,   large → white,   returns (H, W, 3) uint8
-    """
-    # print(f"DEBUG: _conf_to_gray_img_np - conf shape: {conf.shape if conf is not None else 'None'}, valid shape: {valid.shape if valid is not None else 'None'}")
+def conf_to_gray_img(conf: np.ndarray | None, valid: np.ndarray | None = None) -> np.ndarray | None:
+    """Map confidence (≥1) to grayscale: 1→black, large→white. Returns RGB uint8 or None."""
     if conf is None:
         return None
-    conf = conf.astype(np.float32).copy()
+    c = conf.astype(np.float32).copy()
     if valid is not None:
-        conf[~valid] = np.nan
-
-    # normalise so that 1 → 0,  max → 1  (logically black→white)
-    c_min, c_max = 1.0, np.nanmax(conf)
-    norm = (conf - c_min) / (c_max - c_min + 1e-6)     # (H, W)
-    norm = np.clip(norm, 0, 1)
-
-    gray_rgb = (cm.gray(norm)[..., :3] * 255).astype(np.uint8)  # (H, W, 3)
-    return gray_rgb
+        c[~valid] = np.nan
+    c_min, c_max = 1.0, np.nanmax(c) if np.isfinite(c).any() else 1.0
+    norm = np.clip((c - c_min) / (c_max - c_min + 1e-6), 0, 1)
+    return (cm.gray(norm)[..., :3] * 255).astype(np.uint8)
 
 
-def project_3d_to_2d_vec(points: np.ndarray, source_cam: tuple, proj_cam: tuple) -> np.ndarray:
+def project_left3d_to_uv(points_left: np.ndarray,
+                         left_cam: tuple,
+                         proj_cam: tuple) -> np.ndarray:
     """
-    Vectorized projection of 3D points to 2D UV.
-
-    Args:
-        points (np.ndarray): (N, 3) 3D points in source frame.
-        source_cam (tuple): (intrinsics, extrinsics) for source.
-        proj_cam (tuple): (intrinsics, extrinsics) for projection.
-
-    Returns:
-        np.ndarray: (N, 2) UV coordinates, nan where invalid.
+    Project 3D points expressed in the LEFT camera frame into a projection camera's image plane.
+    Returns (N,2) pixel coords with NaNs where depth<=0.
     """
-    intrinsics_proj, _ = proj_cam
+    K_proj, E_proj = proj_cam
+    K_left, E_left = left_cam
 
-    is_same_cam = np.allclose(source_cam[0], proj_cam[0]) and np.allclose(source_cam[1], proj_cam[1])
-    # print(f"DEBUG: project_3d_to_2d_vec - points shape: {points.shape}, source_cam same as proj_cam: {is_same_cam}")
-
-    if is_same_cam:
-        uvw = (intrinsics_proj @ points.T).T
+    # Fast path if projecting to the LEFT camera itself
+    same_cam = np.allclose(K_proj, K_left) and np.allclose(E_proj, E_left)
+    if same_cam:
+        cam_pts = points_left  # already in left cam frame
     else:
-        pts_world = cam_pc_to_world_pc(points, source_cam)
-        pts_proj = world_pc_to_cam_pc(pts_world, proj_cam)
-        uvw = (intrinsics_proj @ pts_proj.T).T
-    # print(f"DEBUG: project_3d_to_2d_vec - uvw shape: {uvw.shape}, min z: {np.min(uvw[:, 2]) if uvw.size > 0 else 'N/A'}, max z: {np.max(uvw[:, 2]) if uvw.size > 0 else 'N/A'}")
+        world = cam_pc_to_world_pc(points_left, left_cam)
+        cam_pts = world_pc_to_cam_pc(world, proj_cam)
 
-    mask = uvw[:, 2] > 1e-6
-    # print(f"DEBUG: project_3d_to_2d_vec - mask shape: {mask.shape}, num valid: {np.sum(mask)}")
-    uv = np.full((len(points), 2), np.nan)
+    uvw = (K_proj @ cam_pts.T).T  # (N,3)
+    z = uvw[:, 2]
+    mask = z > 1e-6
+    uv = np.full((len(points_left), 2), np.nan, dtype=np.float32)
     if np.any(mask):
-        # print(f"DEBUG: project_3d_to_2d_vec - uvw[mask, :2] shape: {uvw[mask, :2].shape}, uvw[mask, 2, None] shape: {uvw[mask, 2, None].shape}")
-        uv[mask] = uvw[mask, :2] / uvw[mask, 2, None]
+        uv[mask] = uvw[mask, :2] / z[mask, None]
     return uv
 
 
-def draw_motion_on_image(image: np.ndarray, pc: np.ndarray, npc: np.ndarray, valid: np.ndarray,
-                         source_cam: tuple, proj_cam: tuple) -> np.ndarray:
+def draw_motion(image: np.ndarray,
+                base_left: np.ndarray,
+                next_left: np.ndarray,
+                valid: np.ndarray,
+                left_cam: tuple,
+                proj_cam: tuple,
+                thickness: int = 1) -> np.ndarray:
     """
-    Draws fluorescent green lines on the image representing motions from pc to npc.
-
-    Args:
-        image (np.ndarray): (H, W, 3) uint8 base image.
-        pc (np.ndarray): (H, W, 3) base points.
-        npc (np.ndarray): (H, W, 3) next points.
-        valid (np.ndarray): (H, W) boolean validity mask.
-        source_cam (tuple): Camera for point coordinates.
-        proj_cam (tuple): Camera for projection (image's camera).
-
-    Returns:
-        np.ndarray: Image with drawn lines.
+    Draw motion vectors on `image`, projecting BOTH endpoints into the SAME `proj_cam` plane.
+    - base_left / next_left: (H,W,3) in LEFT camera frame
+    - valid: (H,W) boolean mask for pixels to draw
+    - image: (H,W,3) uint8 canvas corresponding to `proj_cam`'s image
     """
-    # print(f"DEBUG: draw_motion_on_image - image shape: {image.shape}, pc shape: {pc.shape}, npc shape: {npc.shape}, valid shape: {valid.shape}")
-    img_draw = image.copy()
-    h, w = img_draw.shape[:2]
+    out = image.copy()
+    H, W = out.shape[:2]
 
     v_idx, u_idx = np.where(valid)
-    # print(f"DEBUG: draw_motion_on_image - num valid points: {len(v_idx)}")
     if len(v_idx) == 0:
-        return img_draw
+        return out
 
-    p = pc[v_idx, u_idx]  # (N, 3)
-    n = npc[v_idx, u_idx]  # (N, 3)
-    # print(f"DEBUG: draw_motion_on_image - p shape: {p.shape}, n shape: {n.shape}")
-    
-    # Debug: Check motion magnitudes
-    motion = n - p
-    motion_magnitudes = np.linalg.norm(motion, axis=-1)
-    if len(motion_magnitudes) > 0:
-        large_motions = motion_magnitudes > 10.0  # Flag motions larger than 10 units
-        if large_motions.any():
-            print(f"WARNING: Large motions detected! Count: {large_motions.sum()}/{len(motion_magnitudes)}")
-            print(f"Motion stats - Min: {motion_magnitudes.min():.3f}, Max: {motion_magnitudes.max():.3f}, Mean: {motion_magnitudes.mean():.3f}")
+    p = base_left[v_idx, u_idx]  # (N,3) in LEFT frame
+    n = next_left[v_idx, u_idx]  # (N,3) in LEFT frame
 
-    uv_p = project_3d_to_2d_vec(p, source_cam, proj_cam)  # (N, 2)
-    uv_n = project_3d_to_2d_vec(n, source_cam, proj_cam)  # (N, 2)
-    # print(f"DEBUG: draw_motion_on_image - uv_p shape: {uv_p.shape}, uv_n shape: {uv_n.shape}")
+    uv_p = project_left3d_to_uv(p, left_cam, proj_cam)
+    uv_n = project_left3d_to_uv(n, left_cam, proj_cam)
 
-    mask_valid = np.isfinite(uv_p).all(axis=1) & np.isfinite(uv_n).all(axis=1)
-    # print(f"DEBUG: draw_motion_on_image - num valid projections: {np.sum(mask_valid)}")
-    if not np.any(mask_valid):
-        return img_draw
+    good = np.isfinite(uv_p).all(1) & np.isfinite(uv_n).all(1)
+    if not np.any(good):
+        return out
 
-    uv_p = uv_p[mask_valid]
-    uv_n = uv_n[mask_valid]
+    uv_p = uv_p[good]
+    uv_n = uv_n[good]
 
-    mask_bounds_p = (uv_p[:, 0] >= 0) & (uv_p[:, 0] < w) & (uv_p[:, 1] >= 0) & (uv_p[:, 1] < h)
-    mask_bounds_n = (uv_n[:, 0] >= 0) & (uv_n[:, 0] < w) & (uv_n[:, 1] >= 0) & (uv_n[:, 1] < h)
-    mask_bounds = mask_bounds_p & mask_bounds_n
-    # print(f"DEBUG: draw_motion_on_image - num in bounds: {np.sum(mask_bounds)}")
-    if not np.any(mask_bounds):
-        return img_draw
+    inb_p = (uv_p[:, 0] >= 0) & (uv_p[:, 0] < W) & (uv_p[:, 1] >= 0) & (uv_p[:, 1] < H)
+    inb_n = (uv_n[:, 0] >= 0) & (uv_n[:, 0] < W) & (uv_n[:, 1] >= 0) & (uv_n[:, 1] < H)
+    inb = inb_p & inb_n
+    if not np.any(inb):
+        return out
 
-    uv_p_valid = uv_p[mask_bounds].round().astype(int)
-    uv_n_valid = uv_n[mask_bounds].round().astype(int)
+    uv_p = uv_p[inb].round().astype(int)
+    uv_n = uv_n[inb].round().astype(int)
 
-    for i in range(len(uv_p_valid)):
-        pt1 = (uv_p_valid[i, 0], uv_p_valid[i, 1])
-        pt2 = (uv_n_valid[i, 0], uv_n_valid[i, 1])
-        cv2.line(img_draw, pt1, pt2, (0, 255, 0), thickness=1)
-
-    return img_draw
+    for (x1, y1), (x2, y2) in zip(uv_p, uv_n):
+        cv2.line(out, (x1, y1), (x2, y2), (0, 255, 0), thickness=thickness)
+    return out
 
 
-def save_visualizations(batch, outputs, base_name, i=0, *args, **kwargs):
-    # Extract all tensors to numpy early where possible
+# =====================
+# Main visualization entry
+# =====================
 
-    # Images to numpy
-    left_img = batch["left_image"][i].permute(1, 2, 0).detach().cpu().numpy()
-    mid_img = batch["mid_image"][i].permute(1, 2, 0).detach().cpu().numpy()
-    right_img = batch["right_image"][i].permute(1, 2, 0).detach().cpu().numpy()
-    # print(f"DEBUG: save_visualizations - left_img shape: {left_img.shape}, mid_img shape: {mid_img.shape}, right_img shape: {right_img.shape}")
+def save_visualizations(batch, outputs, base_name: str, i: int = 0,
+                        depth_post_mode=None, motion_depth_post_mode=None):
+    """
+    Assumptions (enforced by the caller):
+    - All point/motion map VALUES are in the LEFT camera frame.
+    - Grid locations for left/right maps are pixels from the left/right images respectively.
+    - Validity is indicated by channel 3 (>0) for *_pm and motion_gt maps.
+    """
+    # ---- Images (de-normalize from [-1,1] to uint8) ----
+    def _unnorm_img(t):
+        return ((_to_np(t).transpose(1, 2, 0) + 1) / 2 * 255).astype(np.uint8)
 
-    # Cameras to numpy
-    intrinsic_left_np = batch["cam"][0][i].detach().cpu().numpy()
-    extrinsic_left_np = batch["cam"][1][i].detach().cpu().numpy()
-    intrinsic_mid_np = batch["cam_mid"][0][i].detach().cpu().numpy()
-    extrinsic_mid_np = batch["cam_mid"][1][i].detach().cpu().numpy()
-    intrinsic_right_np = batch["cam_right"][0][i].detach().cpu().numpy()
-    extrinsic_right_np = batch["cam_right"][1][i].detach().cpu().numpy()
+    left_img  = _unnorm_img(batch["left_image"][i])
+    mid_img   = _unnorm_img(batch["mid_image"][i])
+    right_img = _unnorm_img(batch["right_image"][i])
 
-    left_cam = (intrinsic_left_np, extrinsic_left_np)
-    mid_cam = (intrinsic_mid_np, extrinsic_mid_np)
-    right_cam = (intrinsic_right_np, extrinsic_right_np)
-    # print(f"DEBUG: save_visualizations - left_cam intrinsics shape: {intrinsic_left_np.shape}, extrinsics shape: {extrinsic_left_np.shape}")
+    # ---- Cameras ----
+    left_cam  = (_to_np(batch["cam"][0][i]),       _to_np(batch["cam"][1][i]))
+    mid_cam   = (_to_np(batch["cam_mid"][0][i]),   _to_np(batch["cam_mid"][1][i]))
+    right_cam = (_to_np(batch["cam_right"][0][i]), _to_np(batch["cam_right"][1][i]))
 
-    # Extract base point clouds and validity masks to numpy
-    gt_left_pc_np = batch["left_pm"][i, ..., :3].detach().cpu().numpy()
-    gt_right_pc_np = batch["right_pm"][i, ..., :3].detach().cpu().numpy()
-    valid_left_np = (batch["left_pm"][i, ..., 3] > 0).detach().cpu().numpy()
-    valid_right_np = (batch["right_pm"][i, ..., 3] > 0).detach().cpu().numpy()
-    # print(f"DEBUG: save_visualizations - gt_left_pc_np shape: {gt_left_pc_np.shape}, valid_left_np shape: {valid_left_np.shape}")
-    
-    # Debug: Check for points at origin
-    left_at_origin = np.all(gt_left_pc_np == 0, axis=-1) & valid_left_np
-    right_at_origin = np.all(gt_right_pc_np == 0, axis=-1) & valid_right_np
-    if left_at_origin.any() or right_at_origin.any():
-        print(f"WARNING: Found valid GT points at origin - Left: {left_at_origin.sum()}, Right: {right_at_origin.sum()}")
-        print(f"Total valid points - Left: {valid_left_np.sum()}, Right: {valid_right_np.sum()}")
-    
-    pred_left_pc_np = outputs["left_map_pred"][i].detach().cpu().numpy()
-    pred_right_pc_np = outputs["right_map_pred_in_left_frame"][i].detach().cpu().numpy()
-    # print(f"DEBUG: save_visualizations - pred_left_pc_np shape: {pred_left_pc_np.shape}")
+    # ---- Base point maps (LEFT-frame values) & valid masks ----
+    gt_left_pc   = _to_np(batch["left_pm"][i, ..., :3])
+    gt_right_pc  = _to_np(batch["right_pm"][i, ..., :3])  # values already in LEFT frame
+    valid_left   = _to_np(batch["left_pm"][i, ..., 3] > 0)
+    valid_right  = _to_np(batch["right_pm"][i, ..., 3] > 0)
 
-    # Create next point clouds by adding motion and convert to numpy
-    # GT next PCs
-    gt_l2m_pc_np = (batch["left_pm"][i, ..., :3] + batch["motion_gt"]["l2m"][i, ..., :3]).detach().cpu().numpy()
-    gt_r2m_pc_np = (batch["right_pm"][i, ..., :3] + batch["motion_gt"]["r2m"][i, ..., :3]).detach().cpu().numpy()
-    gt_l2r_pc_np = (batch["left_pm"][i, ..., :3] + batch["motion_gt"]["l2r"][i, ..., :3]).detach().cpu().numpy()
-    gt_r2l_pc_np = (batch["right_pm"][i, ..., :3] + batch["motion_gt"]["r2l"][i, ..., :3]).detach().cpu().numpy()
-    # print(f"DEBUG: save_visualizations - gt_l2m_pc_np shape: {gt_l2m_pc_np.shape}")
-    
-    # Motion validity masks to numpy
-    valid_l2m_np = (valid_left_np & (batch["motion_gt"]["l2m"][i, ..., 3] > 0).detach().cpu().numpy())
-    valid_r2m_np = (valid_right_np & (batch["motion_gt"]["r2m"][i, ..., 3] > 0).detach().cpu().numpy())
-    valid_l2r_np = (valid_left_np & (batch["motion_gt"]["l2r"][i, ..., 3] > 0).detach().cpu().numpy())
-    valid_r2l_np = (valid_right_np & (batch["motion_gt"]["r2l"][i, ..., 3] > 0).detach().cpu().numpy())
-    # print(f"DEBUG: save_visualizations - valid_l2m_np shape: {valid_l2m_np.shape}, num valid: {np.sum(valid_l2m_np)}")
-    
-    # Pred next PCs to numpy
-    tq_mid = batch["query_times"][i, 0].item()
-    pred_l2m_pc_np = (outputs["left_map_pred"][i] + outputs["motion_pred"][f"l_to_{tq_mid:.3g}"][i, ..., :3]).detach().cpu().numpy()
-    pred_r2m_pc_np = (outputs["right_map_pred_in_left_frame"][i] + outputs["motion_pred"][f"r_to_{tq_mid:.3g}"][i, ..., :3]).detach().cpu().numpy()
-    pred_l2r_pc_np = (outputs["left_map_pred"][i] + outputs["motion_pred"]["l_to_1"][i, ..., :3]).detach().cpu().numpy()
-    pred_r2l_pc_np = (outputs["right_map_pred_in_left_frame"][i] + outputs["motion_pred"]["r_to_0"][i, ..., :3]).detach().cpu().numpy()
-    # print(f"DEBUG: save_visualizations - pred_l2m_pc_np shape: {pred_l2m_pc_np.shape}")
-    
-    # ---------- confidence maps -----------------------------------------------
-    k_l2m, k_r2m, k_l2r, k_r2l = (
-        f"l_to_{tq_mid:.3g}", f"r_to_{tq_mid:.3g}", "l_to_1", "r_to_0"
-    )
+    pred_left_pc  = _to_np(outputs["left_map_pred"][i])
+    pred_right_pc = _to_np(outputs["right_map_pred_in_left_frame"][i])
 
-    # per‑pixel confidence for maps to numpy
-    conf_left_pred_np  = outputs.get("left_map_pred_conf",  None)
-    conf_right_pred_np = outputs.get("right_map_pred_conf", None)
-    if conf_left_pred_np is not None:
-        conf_left_pred_np = conf_left_pred_np[i]
-        if conf_left_pred_np.ndim == 3 and conf_left_pred_np.shape[-1] == 1:
-            conf_left_pred_np = conf_left_pred_np[..., 0]  # (H, W)
-        conf_left_pred_np = conf_left_pred_np.detach().cpu().numpy()
-    if conf_right_pred_np is not None:
-        conf_right_pred_np = conf_right_pred_np[i]
-        if conf_right_pred_np.ndim == 3 and conf_right_pred_np.shape[-1] == 1:
-            conf_right_pred_np = conf_right_pred_np[..., 0]  # (H, W)
-        conf_right_pred_np = conf_right_pred_np.detach().cpu().numpy()
-    # print(f"DEBUG: save_visualizations - conf_left_pred_np shape: {conf_left_pred_np.shape if conf_left_pred_np is not None else 'None'}")
+    # Apply post-processing if provided
+    if depth_post_mode is not None:
+        pred_left_pc = _to_np(reg_dense_depth(torch.tensor(pred_left_pc), depth_post_mode))
+        pred_right_pc = _to_np(reg_dense_depth(torch.tensor(pred_right_pc), depth_post_mode))
 
-    # per‑pixel confidence for motions to numpy
-    motion_pred = outputs["motion_pred"]
-    def _extract_conf_np(key):
-        arr = motion_pred.get(f"{key}_conf")
+    # ---- Motions (LEFT-frame displacements) & next point maps ----
+    def _gt_motion(name):
+        mot = _to_np(batch["motion_gt"][name][i])  # (H,W,4)
+        return mot[..., :3], mot[..., 3] > 0
+
+    gt_l2m, m_valid_l2m = _gt_motion("l2m")
+    gt_r2m, m_valid_r2m = _gt_motion("r2m")
+    gt_l2r, m_valid_l2r = _gt_motion("l2r")
+    gt_r2l, m_valid_r2l = _gt_motion("r2l")
+
+    # next = base + motion (all in LEFT frame)
+    gt_l2m_pc = gt_left_pc  + gt_l2m
+    gt_r2m_pc = gt_right_pc + gt_r2m
+    gt_l2r_pc = gt_left_pc  + gt_l2r
+    gt_r2l_pc = gt_right_pc + gt_r2l
+
+    # motion valid = base valid & motion valid
+    v_l2m = valid_left  & m_valid_l2m
+    v_r2m = valid_right & m_valid_r2m
+    v_l2r = valid_left  & m_valid_l2r
+    v_r2l = valid_right & m_valid_r2l
+
+    # Pred motions (LEFT-frame) and next points
+    mp = outputs["motion_pred"]
+    pred_l2m_pc = _to_np(outputs["left_map_pred"][i] + mp["l_to_t0"][i, ..., :3])
+    pred_r2m_pc = _to_np(outputs["right_map_pred_in_left_frame"][i] + mp["r_to_t0"][i, ..., :3])
+    pred_l2r_pc = _to_np(outputs["left_map_pred"][i] + mp["l_to_r"][i, ..., :3])
+    pred_r2l_pc = _to_np(outputs["right_map_pred_in_left_frame"][i] + mp["r_to_l"][i, ..., :3])
+
+    # Apply motion post-processing if provided
+    if motion_depth_post_mode is not None:
+        pred_l2m_pc = _to_np(reg_dense_depth(torch.tensor(pred_l2m_pc), motion_depth_post_mode))
+        pred_r2m_pc = _to_np(reg_dense_depth(torch.tensor(pred_r2m_pc), motion_depth_post_mode))
+        pred_l2r_pc = _to_np(reg_dense_depth(torch.tensor(pred_l2r_pc), motion_depth_post_mode))
+        pred_r2l_pc = _to_np(reg_dense_depth(torch.tensor(pred_r2l_pc), motion_depth_post_mode))
+
+    # ---- Depth/Disparity images (LEFT-frame Z) ----
+    gt_left_depth,  gt_left_disp  = make_depth_and_disp_imgs(gt_left_pc,  valid_left)
+    gt_right_depth, gt_right_disp = make_depth_and_disp_imgs(gt_right_pc, valid_right)
+    pr_left_depth,  pr_left_disp  = make_depth_and_disp_imgs(pred_left_pc,  valid_left)
+    pr_right_depth, pr_right_disp = make_depth_and_disp_imgs(pred_right_pc, valid_right)
+
+    gt_l2m_depth, gt_l2m_disp = make_depth_and_disp_imgs(gt_l2m_pc, v_l2m)
+    gt_r2m_depth, gt_r2m_disp = make_depth_and_disp_imgs(gt_r2m_pc, v_r2m)
+    gt_l2r_depth, gt_l2r_disp = make_depth_and_disp_imgs(gt_l2r_pc, v_l2r)
+    gt_r2l_depth, gt_r2l_disp = make_depth_and_disp_imgs(gt_r2l_pc, v_r2l)
+
+    pr_l2m_depth, pr_l2m_disp = make_depth_and_disp_imgs(pred_l2m_pc, v_l2m)
+    pr_r2m_depth, pr_r2m_disp = make_depth_and_disp_imgs(pred_r2m_pc, v_r2m)
+    pr_l2r_depth, pr_l2r_disp = make_depth_and_disp_imgs(pred_l2r_pc, v_l2r)
+    pr_r2l_depth, pr_r2l_disp = make_depth_and_disp_imgs(pred_r2l_pc, v_r2l)
+
+    # ---- Motion line overlays (draw BOTH endpoints in SAME plane) ----
+    # Left canvas (project to LEFT camera)
+    gt_l2m_lines_left  = draw_motion(left_img, gt_left_pc,  gt_l2m_pc,  v_l2m, left_cam, left_cam)
+    gt_l2r_lines_left  = draw_motion(left_img, gt_left_pc,  gt_l2r_pc,  v_l2r, left_cam, left_cam)
+    pr_l2m_lines_left  = draw_motion(left_img, pred_left_pc, pred_l2m_pc, v_l2m, left_cam, left_cam)
+    pr_l2r_lines_left  = draw_motion(left_img, pred_left_pc, pred_l2r_pc, v_l2r, left_cam, left_cam)
+
+    # Right canvas (project to RIGHT camera)
+    gt_r2m_lines_right = draw_motion(right_img, gt_right_pc, gt_r2m_pc, v_r2m, left_cam, right_cam)
+    gt_r2l_lines_right = draw_motion(right_img, gt_right_pc, gt_r2l_pc, v_r2l, left_cam, right_cam)
+    pr_r2m_lines_right = draw_motion(right_img, pred_right_pc, pred_r2m_pc, v_r2m, left_cam, right_cam)
+    pr_r2l_lines_right = draw_motion(right_img, pred_right_pc, pred_r2l_pc, v_r2l, left_cam, right_cam)
+
+    # ---- Confidences (optional) ----
+    def _maybe_squeeze(hw_or_hwc):
+        if hw_or_hwc is None:
+            return None
+        a = hw_or_hwc
+        return a[..., 0] if (a.ndim == 3 and a.shape[-1] == 1) else a
+
+    conf_left  = _maybe_squeeze(outputs.get("left_map_pred_conf", None))
+    conf_right = _maybe_squeeze(outputs.get("right_map_pred_conf", None))
+    if conf_left is not None:
+        conf_left  = _to_np(conf_left[i])
+    if conf_right is not None:
+        conf_right = _to_np(conf_right[i])
+
+    def _pred_conf(key):
+        arr = outputs["motion_pred"].get(f"{key}_conf")
         if arr is None:
             return None
-        arr = arr[i]
-        if arr.ndim == 3 and arr.shape[-1] == 1:
-            arr = arr[..., 0]  # (H, W)
-        return arr.detach().cpu().numpy()
+        return _to_np(_maybe_squeeze(arr[i]))
 
-    conf_motion_l2m_pred_np = _extract_conf_np(k_l2m)
-    conf_motion_r2m_pred_np = _extract_conf_np(k_r2m)
-    conf_motion_l2r_pred_np = _extract_conf_np(k_l2r)
-    conf_motion_r2l_pred_np = _extract_conf_np(k_r2l)
-    # print(f"DEBUG: save_visualizations - conf_motion_l2m_pred_np shape: {conf_motion_l2m_pred_np.shape if conf_motion_l2m_pred_np is not None else 'None'}")
-    # ---------------------------------------------------------------------------
+    conf_l2m = _pred_conf("l_to_t0")
+    conf_r2m = _pred_conf("r_to_t0")
+    conf_l2r = _pred_conf("l_to_r")
+    conf_r2l = _pred_conf("r_to_l")
 
-    # Joint normalization of base point clouds
-    gt_base_scale = _normalize_pc_pair_np(gt_left_pc_np, gt_right_pc_np, valid_left_np, valid_right_np)
-    pred_base_scale = _normalize_pc_pair_np(pred_left_pc_np, pred_right_pc_np, valid_left_np, valid_right_np)
-    # print(f"DEBUG: save_visualizations - gt_base_scale: {gt_base_scale}, pred_base_scale: {pred_base_scale}")
-    
-    # Compute multiplier to bring pred to GT scale
-    multiplier = gt_base_scale / pred_base_scale
-    # print(f"DEBUG: save_visualizations - multiplier: {multiplier}")
-    
-    # Apply scaling: GT untouched, pred scaled by multiplier
-    gt_left_norm_np = gt_left_pc_np
-    gt_right_norm_np = gt_right_pc_np
-    gt_l2m_norm_np = gt_l2m_pc_np
-    gt_r2m_norm_np = gt_r2m_pc_np
-    gt_l2r_norm_np = gt_l2r_pc_np
-    gt_r2l_norm_np = gt_r2l_pc_np
-    
-    pred_left_norm_np = pred_left_pc_np * multiplier
-    pred_right_norm_np = pred_right_pc_np * multiplier
-    pred_l2m_norm_np = pred_l2m_pc_np * multiplier
-    pred_r2m_norm_np = pred_r2m_pc_np * multiplier
-    pred_l2r_norm_np = pred_l2r_pc_np * multiplier
-    pred_r2l_norm_np = pred_r2l_pc_np * multiplier
-
-     # 4 × (depth, disparity) visualisations ----------------------------
-    gt_left_depth_img,  gt_left_disp_img  = _make_depth_and_disp_imgs_np(gt_left_norm_np,  valid_left_np)
-    gt_right_depth_img, gt_right_disp_img = _make_depth_and_disp_imgs_np(gt_right_norm_np, valid_right_np)
-    pr_left_depth_img,  pr_left_disp_img  = _make_depth_and_disp_imgs_np(pred_left_norm_np, valid_left_np)
-    pr_right_depth_img, pr_right_disp_img = _make_depth_and_disp_imgs_np(pred_right_norm_np, valid_right_np)
-    # print(f"DEBUG: save_visualizations - gt_left_depth_img shape: {gt_left_depth_img.shape}")
-
-    # ---------- confidence visualisations (greyscale) ---------------------------
     conf_imgs = {}
+    if conf_left is not None:
+        conf_imgs["conf_left"]  = conf_to_gray_img(conf_left,  valid_left)
+    if conf_right is not None:
+        conf_imgs["conf_right"] = conf_to_gray_img(conf_right, valid_right)
+    if conf_l2m is not None:
+        conf_imgs["conf_l2m"] = conf_to_gray_img(conf_l2m, v_l2m)
+    if conf_r2m is not None:
+        conf_imgs["conf_r2m"] = conf_to_gray_img(conf_r2m, v_r2m)
+    if conf_l2r is not None:
+        conf_imgs["conf_l2r"] = conf_to_gray_img(conf_l2r, v_l2r)
+    if conf_r2l is not None:
+        conf_imgs["conf_r2l"] = conf_to_gray_img(conf_r2l, v_r2l)
 
-    if conf_left_pred_np is not None:
-        conf_imgs["conf_left"]  = _conf_to_gray_img_np(conf_left_pred_np,  valid_left_np)
-    if conf_right_pred_np is not None:
-        conf_imgs["conf_right"] = _conf_to_gray_img_np(conf_right_pred_np, valid_right_np)
-
-    motion_masks_np = (valid_l2m_np, valid_r2m_np, valid_l2r_np, valid_r2l_np)
-    for name, conf_map, vmask in zip(
-        ("conf_l2m", "conf_r2m", "conf_l2r", "conf_r2l"),
-        (conf_motion_l2m_pred_np, conf_motion_r2m_pred_np,
-         conf_motion_l2r_pred_np,  conf_motion_r2l_pred_np),
-        motion_masks_np,
-    ):
-        if conf_map is not None:
-            conf_imgs[name] = _conf_to_gray_img_np(conf_map, vmask)
-    # print(f"DEBUG: save_visualizations - num conf_imgs: {len(conf_imgs)}")
-    # ---------------------------------------------------------------------------
-
-    # Unnormalize images for visualization
-    left_img_unnorm = ((left_img + 1) / 2 * 255).astype(np.uint8)
-    mid_img_unnorm = ((mid_img + 1) / 2 * 255).astype(np.uint8)
-    right_img_unnorm = ((right_img + 1) / 2 * 255).astype(np.uint8)
-    # print(f"DEBUG: save_visualizations - left_img_unnorm shape: {left_img_unnorm.shape}")
-
-    # Motion line visualizations
-    motion_line_imgs = {}
-
-    # GT
-    motion_line_imgs["gt_l2m"] = draw_motion_on_image(left_img_unnorm, gt_left_norm_np, gt_l2m_norm_np, valid_l2m_np, left_cam, left_cam)
-    motion_line_imgs["gt_l2r"] = draw_motion_on_image(left_img_unnorm, gt_left_norm_np, gt_l2r_norm_np, valid_l2r_np, left_cam, left_cam)
-    motion_line_imgs["gt_r2m"] = draw_motion_on_image(right_img_unnorm, gt_right_norm_np, gt_r2m_norm_np, valid_r2m_np, left_cam, right_cam)
-    motion_line_imgs["gt_r2l"] = draw_motion_on_image(right_img_unnorm, gt_right_norm_np, gt_r2l_norm_np, valid_r2l_np, left_cam, right_cam)
-
-    # Pred
-    motion_line_imgs["pred_l2m"] = draw_motion_on_image(left_img_unnorm, pred_left_norm_np, pred_l2m_norm_np, valid_l2m_np, left_cam, left_cam)
-    motion_line_imgs["pred_l2r"] = draw_motion_on_image(left_img_unnorm, pred_left_norm_np, pred_l2r_norm_np, valid_l2r_np, left_cam, left_cam)
-    motion_line_imgs["pred_r2m"] = draw_motion_on_image(right_img_unnorm, pred_right_norm_np, pred_r2m_norm_np, valid_r2m_np, left_cam, right_cam)
-    motion_line_imgs["pred_r2l"] = draw_motion_on_image(right_img_unnorm, pred_right_norm_np, pred_r2l_norm_np, valid_r2l_np, left_cam, right_cam)
-    # print(f"DEBUG: save_visualizations - example motion_line_img shape: {motion_line_imgs['gt_l2m'].shape if 'gt_l2m' in motion_line_imgs else 'N/A'}")
-
+    # ---- Log to Weights & Biases ----
     base = f"{base_name}_i{i}"
-    # global k; base += f"_k{k}"; k+=1; print(base);
+    log = {
+        f"{base}/left_img/input":  wandb.Image(left_img,  caption="left input"),
+        f"{base}/mid_img/input":   wandb.Image(mid_img,   caption="mid input"),
+        f"{base}/right_img/input": wandb.Image(right_img, caption="right input"),
 
-    log_dict = {
-        # input images
-        f"{base}/left_img/input"   : wandb.Image(left_img_unnorm,  caption="left input"),
-        f"{base}/mid_img/input"    : wandb.Image(mid_img_unnorm,   caption="mid input"),
-        f"{base}/right_img/input"  : wandb.Image(right_img_unnorm, caption="right input"),
+        # Base depth/disp (LEFT-frame Z)
+        f"{base}/left_depth/gt":   wandb.Image(gt_left_depth,  caption="GT Left Depth (left-frame)"),
+        f"{base}/right_depth/gt":  wandb.Image(gt_right_depth, caption="GT Right Depth (left-frame)"),
+        f"{base}/left_depth/pred": wandb.Image(pr_left_depth,  caption="Pred Left Depth (left-frame)"),
+        f"{base}/right_depth/pred":wandb.Image(pr_right_depth, caption="Pred Right Depth (left-frame)"),
 
-        # depth
-        f"{base}/left_depth/gt"  : wandb.Image(gt_left_depth_img,  caption="GT Left Depth"),
-        f"{base}/right_depth/gt" : wandb.Image(gt_right_depth_img, caption="GT Right Depth"),
-        f"{base}/left_depth/pred"  : wandb.Image(pr_left_depth_img,  caption="Pred Left Depth"),
-        f"{base}/right_depth/pred" : wandb.Image(pr_right_depth_img, caption="Pred Right Depth"),
+        f"{base}/left_disp/gt":    wandb.Image(gt_left_disp,  caption="GT Left Disp (1/z left-frame)"),
+        f"{base}/right_disp/gt":   wandb.Image(gt_right_disp, caption="GT Right Disp (1/z left-frame)"),
+        f"{base}/left_disp/pred":  wandb.Image(pr_left_disp,  caption="Pred Left Disp (1/z left-frame)"),
+        f"{base}/right_disp/pred": wandb.Image(pr_right_disp, caption="Pred Right Disp (1/z left-frame)"),
 
-        # disparity
-        f"{base}/left_disp/gt"  : wandb.Image(gt_left_disp_img,  caption="GT Left Disp"),
-        f"{base}/right_disp/gt" : wandb.Image(gt_right_disp_img, caption="GT Right Disp"),
-        f"{base}/left_disp/pred"  : wandb.Image(pr_left_disp_img,  caption="Pred Left Disp"),
-        f"{base}/right_disp/pred" : wandb.Image(pr_right_disp_img, caption="Pred Right Disp"),
+        # Next depths/disps (LEFT-frame Z)
+        f"{base}/l2m_depth/gt":    wandb.Image(gt_l2m_depth, caption="GT L2M Depth (left-frame)"),
+        f"{base}/r2m_depth/gt":    wandb.Image(gt_r2m_depth, caption="GT R2M Depth (left-frame)"),
+        f"{base}/l2r_depth/gt":    wandb.Image(gt_l2r_depth, caption="GT L2R Depth (left-frame)"),
+        f"{base}/r2l_depth/gt":    wandb.Image(gt_r2l_depth, caption="GT R2L Depth (left-frame)"),
 
-        # motion lines
-        f"{base}/l2m_motion/gt"  : wandb.Image(motion_line_imgs["gt_l2m"],  caption="GT L2M Motion"),
-        f"{base}/l2r_motion/gt"  : wandb.Image(motion_line_imgs["gt_l2r"],  caption="GT L2R Motion"),
-        f"{base}/r2m_motion/gt"  : wandb.Image(motion_line_imgs["gt_r2m"],  caption="GT R2M Motion"),
-        f"{base}/r2l_motion/gt"  : wandb.Image(motion_line_imgs["gt_r2l"],  caption="GT R2L Motion"),
-        f"{base}/l2m_motion/pred": wandb.Image(motion_line_imgs["pred_l2m"], caption="Pred L2M Motion"),
-        f"{base}/l2r_motion/pred": wandb.Image(motion_line_imgs["pred_l2r"], caption="Pred L2R Motion"),
-        f"{base}/r2m_motion/pred": wandb.Image(motion_line_imgs["pred_r2m"], caption="Pred R2M Motion"),
-        f"{base}/r2l_motion/pred": wandb.Image(motion_line_imgs["pred_r2l"], caption="Pred R2L Motion"),
+        f"{base}/l2m_depth/pred":  wandb.Image(pr_l2m_depth, caption="Pred L2M Depth (left-frame)"),
+        f"{base}/r2m_depth/pred":  wandb.Image(pr_r2m_depth, caption="Pred R2M Depth (left-frame)"),
+        f"{base}/l2r_depth/pred":  wandb.Image(pr_l2r_depth, caption="Pred L2R Depth (left-frame)"),
+        f"{base}/r2l_depth/pred":  wandb.Image(pr_r2l_depth, caption="Pred R2L Depth (left-frame)"),
+
+        f"{base}/l2m_disp/gt":     wandb.Image(gt_l2m_disp, caption="GT L2M Disp (1/z left-frame)"),
+        f"{base}/r2m_disp/gt":     wandb.Image(gt_r2m_disp, caption="GT R2M Disp (1/z left-frame)"),
+        f"{base}/l2r_disp/gt":     wandb.Image(gt_l2r_disp, caption="GT L2R Disp (1/z left-frame)"),
+        f"{base}/r2l_disp/gt":     wandb.Image(gt_r2l_disp, caption="GT R2L Disp (1/z left-frame)"),
+
+        f"{base}/l2m_disp/pred":   wandb.Image(pr_l2m_disp, caption="Pred L2M Disp (1/z left-frame)"),
+        f"{base}/r2m_disp/pred":   wandb.Image(pr_r2m_disp, caption="Pred R2M Disp (1/z left-frame)"),
+        f"{base}/l2r_disp/pred":   wandb.Image(pr_l2r_disp, caption="Pred L2R Disp (1/z left-frame)"),
+        f"{base}/r2l_disp/pred":   wandb.Image(pr_r2l_disp, caption="Pred R2L Disp (1/z left-frame)"),
+
+        # Motion overlays (same-plane projections)
+        f"{base}/l2m_motion/gt_left_canvas":  wandb.Image(gt_l2m_lines_left,  caption="GT L2M (drawn on LEFT plane)"),
+        f"{base}/l2r_motion/gt_left_canvas":  wandb.Image(gt_l2r_lines_left,  caption="GT L2R (drawn on LEFT plane)"),
+        f"{base}/l2m_motion/pred_left_canvas": wandb.Image(pr_l2m_lines_left, caption="Pred L2M (drawn on LEFT plane)"),
+        f"{base}/l2r_motion/pred_left_canvas": wandb.Image(pr_l2r_lines_left, caption="Pred L2R (drawn on LEFT plane)"),
+
+        f"{base}/r2m_motion/gt_right_canvas": wandb.Image(gt_r2m_lines_right, caption="GT R2M (drawn on RIGHT plane)"),
+        f"{base}/r2l_motion/gt_right_canvas": wandb.Image(gt_r2l_lines_right, caption="GT R2L (drawn on RIGHT plane)"),
+        f"{base}/r2m_motion/pred_right_canvas":wandb.Image(pr_r2m_lines_right, caption="Pred R2M (drawn on RIGHT plane)"),
+        f"{base}/r2l_motion/pred_right_canvas":wandb.Image(pr_r2l_lines_right, caption="Pred R2L (drawn on RIGHT plane)"),
     }
 
+    for k, img in conf_imgs.items():
+        log[f"{base}/conf/{k}"] = wandb.Image(img, caption=k)
 
-    # add confidence maps if available
-    for key, img in conf_imgs.items():
-        log_dict[f"{base}/conf/{key}"] = wandb.Image(img, caption=f"Conf {key.upper()}")
-
-    wandb.log(log_dict, commit=True)
-
-    # Extract GT motions to numpy
-    gt_l2m_motion_np = batch["motion_gt"]["l2m"][i].detach().cpu().numpy()
-    gt_r2m_motion_np = batch["motion_gt"]["r2m"][i].detach().cpu().numpy()
-    gt_l2r_motion_np = batch["motion_gt"]["l2r"][i].detach().cpu().numpy()
-    gt_r2l_motion_np = batch["motion_gt"]["r2l"][i].detach().cpu().numpy()
-
-    # Zero motion template (H, W, 4) with validity=0
-    zero_motion = np.zeros_like(gt_l2m_motion_np)
-    
-    # GT visualization sequence
-    pms_gt = [
-        gt_left_norm_np, gt_l2m_norm_np,
-        gt_right_norm_np, gt_r2m_norm_np,
-        gt_left_norm_np, gt_l2r_norm_np,
-        gt_right_norm_np, gt_r2l_norm_np
-    ]
-    motion_map_gt = np.stack([
-        gt_l2m_motion_np,
-        zero_motion,
-        gt_r2m_motion_np,
-        zero_motion,
-        gt_l2r_motion_np,
-        zero_motion,
-        gt_r2l_motion_np
-    ], axis=0)
-    image_seq_gt = [
-        left_img_unnorm, mid_img_unnorm,
-        right_img_unnorm, mid_img_unnorm,
-        left_img_unnorm, right_img_unnorm,
-        right_img_unnorm, left_img_unnorm
-    ]
-    # If you want rerun-based sequence viz, use utils.rerun_viz:
-    # rerun_viz.visualize_sequence_from_pms(pms_gt, motion_map_gt, image_seq_gt, name=f"{base}/gt_motions", save=False)
-    
-    # Pred visualization sequence (add GT validity to pred motions since pred motions are :3)
-    pred_l2m_motion_np = np.concatenate((outputs["motion_pred"][k_l2m][i].detach().cpu().numpy(), gt_l2m_motion_np[..., 3:]), axis=-1)
-    pred_r2m_motion_np = np.concatenate((outputs["motion_pred"][k_r2m][i].detach().cpu().numpy(), gt_r2m_motion_np[..., 3:]), axis=-1)
-    pred_l2r_motion_np = np.concatenate((outputs["motion_pred"]["l_to_1"][i].detach().cpu().numpy(), gt_l2r_motion_np[..., 3:]), axis=-1)
-    pred_r2l_motion_np = np.concatenate((outputs["motion_pred"]["r_to_0"][i].detach().cpu().numpy(), gt_r2l_motion_np[..., 3:]), axis=-1)
-    
-    pms_pred = [
-        pred_left_norm_np, pred_l2m_norm_np,
-        pred_right_norm_np, pred_r2m_norm_np,
-        pred_left_norm_np, pred_l2r_norm_np,
-        pred_right_norm_np, pred_r2l_norm_np
-    ]
-    motion_map_pred = np.stack([
-        pred_l2m_motion_np,
-        zero_motion,
-        pred_r2m_motion_np,
-        zero_motion,
-        pred_l2r_motion_np,
-        zero_motion,
-        pred_r2l_motion_np
-    ], axis=0)
-    image_seq_pred = image_seq_gt  # Same images for coloring
-    # rerun_viz.visualize_sequence_from_pms(pms_pred, motion_map_pred, image_seq_pred, name=f"{base}/pred_motions", save=False)
+    wandb.log(log, commit=True)

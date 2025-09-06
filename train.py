@@ -50,13 +50,16 @@ def main(config: DictConfig):
 
     if config.debug:
         # overfitting experiment on tiny debug dataset
-        config.data.len                   = config.train.iterations * config.data.batch_size * world_size
-        config.data.valid_len             = config.data.valid_len * config.data.batch_size * world_size
-        # config.data.len                   = 4
-        # config.data.valid_len             = 4
-        # config.data.batch_size            = 4
+        # config.data.len                   = config.train.iterations * config.data.batch_size * world_size
+        # config.data.valid_len             = config.data.valid_len * config.data.batch_size * world_size
+        # train_viz_interval                = 250
+        config.data.len                   = 4
+        config.data.valid_len             = 4
+        config.data.batch_size            = 4
         config.train.validation_frequency = 40
-        train_viz_interval                = 250
+        train_viz_interval                = 5
+        # Make overfitting easier in debug
+        # config.train.grad_acc             = 1
     else:
         # align dataset sizes with training plan
         config.data.len                   = config.train.iterations * config.data.batch_size * world_size
@@ -127,8 +130,10 @@ def main(config: DictConfig):
                 # loss in fp32 to avoid nans in some terms
                 unwrapped_model = accelerator.unwrap_model(model)
                 loss, loss_details = unwrapped_model.get_loss(batch, outputs)  # scalar tensor  # (1,)
-                if loss is None or not isinstance(loss, torch.Tensor):
-                    loss = torch.zeros(1, requires_grad=True, device=accelerator.device)  # (1,)
+                if loss is None:
+                    loss = torch.zeros((), device=accelerator.device)
+                elif not isinstance(loss, torch.Tensor):
+                    loss = torch.as_tensor(loss, device=accelerator.device)
                 loss_to_backward = loss / grad_acc
                 accelerator.backward(loss_to_backward)
         else:
@@ -136,19 +141,25 @@ def main(config: DictConfig):
             # loss in fp32 to avoid nans in some terms
             unwrapped_model = accelerator.unwrap_model(model)
             loss, loss_details = unwrapped_model.get_loss(batch, outputs)  # scalar tensor  # (1,)
-            if loss is None or not isinstance(loss, torch.Tensor):
-                loss = torch.zeros(1, requires_grad=True, device=accelerator.device)  # (1,)
+            if loss is None:
+                loss = torch.zeros((), device=accelerator.device)
+            elif not isinstance(loss, torch.Tensor):
+                loss = torch.as_tensor(loss, device=accelerator.device)
             loss_to_backward = loss / grad_acc if grad_acc > 1 else loss
             accelerator.backward(loss_to_backward)
 
         # detach outputs so the graph can be freed across micro-steps
         with torch.no_grad():
-            if isinstance(outputs, torch.Tensor):
-                outputs = outputs.detach()
-            elif isinstance(outputs, (list, tuple)):
-                outputs = type(outputs)(o.detach() if torch.is_tensor(o) else o for o in outputs)
-            elif isinstance(outputs, dict):
-                outputs = {k: (v.detach() if torch.is_tensor(v) else v) for k, v in outputs.items()}
+            def _detach_tree(x):
+                if torch.is_tensor(x):
+                    return x.detach()
+                if isinstance(x, dict):
+                    return {k: _detach_tree(v) for k, v in x.items()}
+                if isinstance(x, (list, tuple)):
+                    seq = [_detach_tree(v) for v in x]
+                    return type(x)(seq)
+                return x
+            outputs = _detach_tree(outputs)
 
         # step only on the last micro-step
         if is_last_micro:
@@ -241,8 +252,10 @@ def main(config: DictConfig):
                     unwrapped_model = accelerator.unwrap_model(model)
                     val_loss, val_loss_details = unwrapped_model.get_loss(val_batch, val_outputs)  # (1,)
 
-                    if val_loss is None or not isinstance(val_loss, torch.Tensor):
-                        val_loss = torch.zeros(1, device=accelerator.device)  # (1,)
+                    if val_loss is None:
+                        val_loss = torch.zeros((), device=accelerator.device)
+                    elif not isinstance(val_loss, torch.Tensor):
+                        val_loss = torch.as_tensor(val_loss, device=accelerator.device)
 
                     val_batch_metrics = unwrapped_model.compute_metrics(val_batch, val_outputs)
 
