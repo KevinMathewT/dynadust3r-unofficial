@@ -3,6 +3,8 @@ import torch
 import cv2
 import matplotlib.cm as cm
 import wandb
+import os
+from pathlib import Path
 
 from utils.geometry import cam_pc_to_world_pc, world_pc_to_cam_pc
 from models.dust3r.utils.heads.postprocess import reg_dense_depth
@@ -138,8 +140,19 @@ def draw_motion(image: np.ndarray,
 # =====================
 
 def save_visualizations(batch, outputs, base_name: str, i: int = 0,
-                        depth_post_mode=None, motion_depth_post_mode=None):
+                        depth_post_mode=None, motion_depth_post_mode=None, save_dir=None):
     """
+    Save visualization images either to Weights & Biases or to a local directory.
+    
+    Args:
+        batch: Input batch containing images, point maps, and camera data
+        outputs: Model outputs containing predictions
+        base_name: Base name for saved files
+        i: Batch index to visualize (default: 0)
+        depth_post_mode: Post-processing mode for depth maps
+        motion_depth_post_mode: Post-processing mode for motion depth maps
+        save_dir: Optional directory path to save images locally. If None, uses wandb logging.
+    
     Assumptions (enforced by the caller):
     - All point/motion map VALUES are in the LEFT camera frame.
     - Grid locations for left/right maps are pixels from the left/right images respectively.
@@ -276,58 +289,126 @@ def save_visualizations(batch, outputs, base_name: str, i: int = 0,
     if conf_r2l is not None:
         conf_imgs["conf_r2l"] = conf_to_gray_img(conf_r2l, v_r2l)
 
-    # ---- Log to Weights & Biases ----
+    # ---- Save visualizations ----
     base = f"{base_name}_i{i}"
-    log = {
-        f"{base}/left_img/input":  wandb.Image(left_img,  caption="left input"),
-        f"{base}/mid_img/input":   wandb.Image(mid_img,   caption="mid input"),
-        f"{base}/right_img/input": wandb.Image(right_img, caption="right input"),
+    
+    if save_dir is not None:
+        # Save to local directory
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        def _save_img(img_array, filename):
+            """Save numpy array as image file."""
+            # Convert RGB to BGR for OpenCV
+            img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(save_path / f"{filename}.png"), img_bgr)
+        
+        # Save input images
+        _save_img(left_img, f"{base}_left_input")
+        _save_img(mid_img, f"{base}_mid_input")
+        _save_img(right_img, f"{base}_right_input")
+        
+        # Save base depth/disp images
+        _save_img(gt_left_depth, f"{base}_left_depth_gt")
+        _save_img(gt_right_depth, f"{base}_right_depth_gt")
+        _save_img(pr_left_depth, f"{base}_left_depth_pred")
+        _save_img(pr_right_depth, f"{base}_right_depth_pred")
+        
+        _save_img(gt_left_disp, f"{base}_left_disp_gt")
+        _save_img(gt_right_disp, f"{base}_right_disp_gt")
+        _save_img(pr_left_disp, f"{base}_left_disp_pred")
+        _save_img(pr_right_disp, f"{base}_right_disp_pred")
+        
+        # Save motion depth/disp images
+        _save_img(gt_l2m_depth, f"{base}_l2m_depth_gt")
+        _save_img(gt_r2m_depth, f"{base}_r2m_depth_gt")
+        _save_img(gt_l2r_depth, f"{base}_l2r_depth_gt")
+        _save_img(gt_r2l_depth, f"{base}_r2l_depth_gt")
+        
+        _save_img(pr_l2m_depth, f"{base}_l2m_depth_pred")
+        _save_img(pr_r2m_depth, f"{base}_r2m_depth_pred")
+        _save_img(pr_l2r_depth, f"{base}_l2r_depth_pred")
+        _save_img(pr_r2l_depth, f"{base}_r2l_depth_pred")
+        
+        _save_img(gt_l2m_disp, f"{base}_l2m_disp_gt")
+        _save_img(gt_r2m_disp, f"{base}_r2m_disp_gt")
+        _save_img(gt_l2r_disp, f"{base}_l2r_disp_gt")
+        _save_img(gt_r2l_disp, f"{base}_r2l_disp_gt")
+        
+        _save_img(pr_l2m_disp, f"{base}_l2m_disp_pred")
+        _save_img(pr_r2m_disp, f"{base}_r2m_disp_pred")
+        _save_img(pr_l2r_disp, f"{base}_l2r_disp_pred")
+        _save_img(pr_r2l_disp, f"{base}_r2l_disp_pred")
+        
+        # Save motion overlay images
+        _save_img(gt_l2m_lines_left, f"{base}_l2m_motion_gt_left_canvas")
+        _save_img(gt_l2r_lines_left, f"{base}_l2r_motion_gt_left_canvas")
+        _save_img(pr_l2m_lines_left, f"{base}_l2m_motion_pred_left_canvas")
+        _save_img(pr_l2r_lines_left, f"{base}_l2r_motion_pred_left_canvas")
+        
+        _save_img(gt_r2m_lines_right, f"{base}_r2m_motion_gt_right_canvas")
+        _save_img(gt_r2l_lines_right, f"{base}_r2l_motion_gt_right_canvas")
+        _save_img(pr_r2m_lines_right, f"{base}_r2m_motion_pred_right_canvas")
+        _save_img(pr_r2l_lines_right, f"{base}_r2l_motion_pred_right_canvas")
+        
+        # Save confidence images
+        for k, img in conf_imgs.items():
+            _save_img(img, f"{base}_conf_{k}")
+            
+        print(f"Saved {len(conf_imgs) + 24} visualization images to {save_path}")
+    
+    else:
+        # Use wandb logging as fallback
+        log = {
+            f"{base}/left_img/input":  wandb.Image(left_img,  caption="left input"),
+            f"{base}/mid_img/input":   wandb.Image(mid_img,   caption="mid input"),
+            f"{base}/right_img/input": wandb.Image(right_img, caption="right input"),
 
-        # Base depth/disp (LEFT-frame Z)
-        f"{base}/left_depth/gt":   wandb.Image(gt_left_depth,  caption="GT Left Depth (left-frame)"),
-        f"{base}/right_depth/gt":  wandb.Image(gt_right_depth, caption="GT Right Depth (left-frame)"),
-        f"{base}/left_depth/pred": wandb.Image(pr_left_depth,  caption="Pred Left Depth (left-frame)"),
-        f"{base}/right_depth/pred":wandb.Image(pr_right_depth, caption="Pred Right Depth (left-frame)"),
+            # Base depth/disp (LEFT-frame Z)
+            f"{base}/left_depth/gt":   wandb.Image(gt_left_depth,  caption="GT Left Depth (left-frame)"),
+            f"{base}/right_depth/gt":  wandb.Image(gt_right_depth, caption="GT Right Depth (left-frame)"),
+            f"{base}/left_depth/pred": wandb.Image(pr_left_depth,  caption="Pred Left Depth (left-frame)"),
+            f"{base}/right_depth/pred":wandb.Image(pr_right_depth, caption="Pred Right Depth (left-frame)"),
 
-        f"{base}/left_disp/gt":    wandb.Image(gt_left_disp,  caption="GT Left Disp (1/z left-frame)"),
-        f"{base}/right_disp/gt":   wandb.Image(gt_right_disp, caption="GT Right Disp (1/z left-frame)"),
-        f"{base}/left_disp/pred":  wandb.Image(pr_left_disp,  caption="Pred Left Disp (1/z left-frame)"),
-        f"{base}/right_disp/pred": wandb.Image(pr_right_disp, caption="Pred Right Disp (1/z left-frame)"),
+            f"{base}/left_disp/gt":    wandb.Image(gt_left_disp,  caption="GT Left Disp (1/z left-frame)"),
+            f"{base}/right_disp/gt":   wandb.Image(gt_right_disp, caption="GT Right Disp (1/z left-frame)"),
+            f"{base}/left_disp/pred":  wandb.Image(pr_left_disp,  caption="Pred Left Disp (1/z left-frame)"),
+            f"{base}/right_disp/pred": wandb.Image(pr_right_disp, caption="Pred Right Disp (1/z left-frame)"),
 
-        # Next depths/disps (LEFT-frame Z)
-        f"{base}/l2m_depth/gt":    wandb.Image(gt_l2m_depth, caption="GT L2M Depth (left-frame)"),
-        f"{base}/r2m_depth/gt":    wandb.Image(gt_r2m_depth, caption="GT R2M Depth (left-frame)"),
-        f"{base}/l2r_depth/gt":    wandb.Image(gt_l2r_depth, caption="GT L2R Depth (left-frame)"),
-        f"{base}/r2l_depth/gt":    wandb.Image(gt_r2l_depth, caption="GT R2L Depth (left-frame)"),
+            # Next depths/disps (LEFT-frame Z)
+            f"{base}/l2m_depth/gt":    wandb.Image(gt_l2m_depth, caption="GT L2M Depth (left-frame)"),
+            f"{base}/r2m_depth/gt":    wandb.Image(gt_r2m_depth, caption="GT R2M Depth (left-frame)"),
+            f"{base}/l2r_depth/gt":    wandb.Image(gt_l2r_depth, caption="GT L2R Depth (left-frame)"),
+            f"{base}/r2l_depth/gt":    wandb.Image(gt_r2l_depth, caption="GT R2L Depth (left-frame)"),
 
-        f"{base}/l2m_depth/pred":  wandb.Image(pr_l2m_depth, caption="Pred L2M Depth (left-frame)"),
-        f"{base}/r2m_depth/pred":  wandb.Image(pr_r2m_depth, caption="Pred R2M Depth (left-frame)"),
-        f"{base}/l2r_depth/pred":  wandb.Image(pr_l2r_depth, caption="Pred L2R Depth (left-frame)"),
-        f"{base}/r2l_depth/pred":  wandb.Image(pr_r2l_depth, caption="Pred R2L Depth (left-frame)"),
+            f"{base}/l2m_depth/pred":  wandb.Image(pr_l2m_depth, caption="Pred L2M Depth (left-frame)"),
+            f"{base}/r2m_depth/pred":  wandb.Image(pr_r2m_depth, caption="Pred R2M Depth (left-frame)"),
+            f"{base}/l2r_depth/pred":  wandb.Image(pr_l2r_depth, caption="Pred L2R Depth (left-frame)"),
+            f"{base}/r2l_depth/pred":  wandb.Image(pr_r2l_depth, caption="Pred R2L Depth (left-frame)"),
 
-        f"{base}/l2m_disp/gt":     wandb.Image(gt_l2m_disp, caption="GT L2M Disp (1/z left-frame)"),
-        f"{base}/r2m_disp/gt":     wandb.Image(gt_r2m_disp, caption="GT R2M Disp (1/z left-frame)"),
-        f"{base}/l2r_disp/gt":     wandb.Image(gt_l2r_disp, caption="GT L2R Disp (1/z left-frame)"),
-        f"{base}/r2l_disp/gt":     wandb.Image(gt_r2l_disp, caption="GT R2L Disp (1/z left-frame)"),
+            f"{base}/l2m_disp/gt":     wandb.Image(gt_l2m_disp, caption="GT L2M Disp (1/z left-frame)"),
+            f"{base}/r2m_disp/gt":     wandb.Image(gt_r2m_disp, caption="GT R2M Disp (1/z left-frame)"),
+            f"{base}/l2r_disp/gt":     wandb.Image(gt_l2r_disp, caption="GT L2R Disp (1/z left-frame)"),
+            f"{base}/r2l_disp/gt":     wandb.Image(gt_r2l_disp, caption="GT R2L Disp (1/z left-frame)"),
 
-        f"{base}/l2m_disp/pred":   wandb.Image(pr_l2m_disp, caption="Pred L2M Disp (1/z left-frame)"),
-        f"{base}/r2m_disp/pred":   wandb.Image(pr_r2m_disp, caption="Pred R2M Disp (1/z left-frame)"),
-        f"{base}/l2r_disp/pred":   wandb.Image(pr_l2r_disp, caption="Pred L2R Disp (1/z left-frame)"),
-        f"{base}/r2l_disp/pred":   wandb.Image(pr_r2l_disp, caption="Pred R2L Disp (1/z left-frame)"),
+            f"{base}/l2m_disp/pred":   wandb.Image(pr_l2m_disp, caption="Pred L2M Disp (1/z left-frame)"),
+            f"{base}/r2m_disp/pred":   wandb.Image(pr_r2m_disp, caption="Pred R2M Disp (1/z left-frame)"),
+            f"{base}/l2r_disp/pred":   wandb.Image(pr_l2r_disp, caption="Pred L2R Disp (1/z left-frame)"),
+            f"{base}/r2l_disp/pred":   wandb.Image(pr_r2l_disp, caption="Pred R2L Disp (1/z left-frame)"),
 
-        # Motion overlays (same-plane projections)
-        f"{base}/l2m_motion/gt_left_canvas":  wandb.Image(gt_l2m_lines_left,  caption="GT L2M (drawn on LEFT plane)"),
-        f"{base}/l2r_motion/gt_left_canvas":  wandb.Image(gt_l2r_lines_left,  caption="GT L2R (drawn on LEFT plane)"),
-        f"{base}/l2m_motion/pred_left_canvas": wandb.Image(pr_l2m_lines_left, caption="Pred L2M (drawn on LEFT plane)"),
-        f"{base}/l2r_motion/pred_left_canvas": wandb.Image(pr_l2r_lines_left, caption="Pred L2R (drawn on LEFT plane)"),
+            # Motion overlays (same-plane projections)
+            f"{base}/l2m_motion/gt_left_canvas":  wandb.Image(gt_l2m_lines_left,  caption="GT L2M (drawn on LEFT plane)"),
+            f"{base}/l2r_motion/gt_left_canvas":  wandb.Image(gt_l2r_lines_left,  caption="GT L2R (drawn on LEFT plane)"),
+            f"{base}/l2m_motion/pred_left_canvas": wandb.Image(pr_l2m_lines_left, caption="Pred L2M (drawn on LEFT plane)"),
+            f"{base}/l2r_motion/pred_left_canvas": wandb.Image(pr_l2r_lines_left, caption="Pred L2R (drawn on LEFT plane)"),
 
-        f"{base}/r2m_motion/gt_right_canvas": wandb.Image(gt_r2m_lines_right, caption="GT R2M (drawn on RIGHT plane)"),
-        f"{base}/r2l_motion/gt_right_canvas": wandb.Image(gt_r2l_lines_right, caption="GT R2L (drawn on RIGHT plane)"),
-        f"{base}/r2m_motion/pred_right_canvas":wandb.Image(pr_r2m_lines_right, caption="Pred R2M (drawn on RIGHT plane)"),
-        f"{base}/r2l_motion/pred_right_canvas":wandb.Image(pr_r2l_lines_right, caption="Pred R2L (drawn on RIGHT plane)"),
-    }
+            f"{base}/r2m_motion/gt_right_canvas": wandb.Image(gt_r2m_lines_right, caption="GT R2M (drawn on RIGHT plane)"),
+            f"{base}/r2l_motion/gt_right_canvas": wandb.Image(gt_r2l_lines_right, caption="GT R2L (drawn on RIGHT plane)"),
+            f"{base}/r2m_motion/pred_right_canvas":wandb.Image(pr_r2m_lines_right, caption="Pred R2M (drawn on RIGHT plane)"),
+            f"{base}/r2l_motion/pred_right_canvas":wandb.Image(pr_r2l_lines_right, caption="Pred R2L (drawn on RIGHT plane)"),
+        }
 
-    for k, img in conf_imgs.items():
-        log[f"{base}/conf/{k}"] = wandb.Image(img, caption=k)
+        for k, img in conf_imgs.items():
+            log[f"{base}/conf/{k}"] = wandb.Image(img, caption=k)
 
-    wandb.log(log, commit=True)
+        wandb.log(log, commit=True)

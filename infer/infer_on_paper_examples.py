@@ -225,18 +225,33 @@ def main(cfg: DictConfig):
             # --- Build viz batch -------------------------------------------------
             print("[note] No GT available. GT depth/disparity panels will show the model’s own point maps.")
 
-            # Map base preds to exp space for visualization consistency
+            # Map predictions using model's configured postprocess modes
             from models.dust3r.utils.heads.postprocess import reg_dense_depth
-            left_pred  = reg_dense_depth(outputs["left_map_pred"], ("exp", -float("inf"), float("inf"))).detach()
-            right_pred = reg_dense_depth(outputs["right_map_pred_in_left_frame"], ("exp", -float("inf"), float("inf"))).detach()
+            mref = model.module if hasattr(model, "module") else model
+            depth_post_mode = getattr(mref, "depth_post_mode", ("exp", -float("inf"), float("inf")))
+            motion_depth_post_mode = getattr(mref, "motion_depth_post_mode", ("linear", -float("inf"), float("inf")))
+
+            left_pred  = reg_dense_depth(outputs["left_map_pred"], depth_post_mode).detach()
+            right_pred = reg_dense_depth(outputs["right_map_pred_in_left_frame"], depth_post_mode).detach()
             B, h, w, _ = left_pred.shape
             ones = torch.ones((B, h, w, 1), dtype=left_pred.dtype, device=left_pred.device)
 
+            # Compute an estimated mid-time point map from base + predicted motion at mid index
+            mp = outputs.get("motion_pred", {})
+            tq_mid_idx = 0
+            l2m_key = f"l_to_t{tq_mid_idx}"
+            r2m_key = f"r_to_t{tq_mid_idx}"
+            mid_pred = None
+            if l2m_key in mp:
+                mid_pred = reg_dense_depth(outputs["left_map_pred"] + mp[l2m_key][..., :3], motion_depth_post_mode).detach()
+            elif r2m_key in mp:
+                mid_pred = reg_dense_depth(outputs["right_map_pred_in_left_frame"] + mp[r2m_key][..., :3], motion_depth_post_mode).detach()
+            else:
+                mid_pred = torch.zeros_like(left_pred)
+
             left_pm  = torch.cat([left_pred,  ones], dim=-1)  # (B,H,W,4)
             right_pm = torch.cat([right_pred, ones], dim=-1)  # (B,H,W,4)
-            mid_pm   = torch.zeros_like(left_pm)
-
-            mp = outputs.get("motion_pred", {})
+            mid_pm   = torch.cat([mid_pred,  ones], dim=-1)   # (B,H,W,4)
 
             def _make_mask_for_key(base_key: str) -> torch.Tensor:
                 """
@@ -281,11 +296,11 @@ def main(cfg: DictConfig):
 
                 return final_mask.unsqueeze(-1).to(dtype=left_pred.dtype)
 
-            tkey_mid = _fmt_t(t_mid)
-            k_l2m = f"l_to_{tkey_mid}"
-            k_r2m = f"r_to_{tkey_mid}"
-            k_l2r = "l_to_1"
-            k_r2l = "r_to_0"
+            # Use DynaDUSt3R's motion key scheme
+            k_l2m = l2m_key           # "l_to_t0"
+            k_r2m = r2m_key           # "r_to_t0"
+            k_l2r = "l_to_r"
+            k_r2l = "r_to_l"
 
             v_l2m = _make_mask_for_key(k_l2m)
             v_r2m = _make_mask_for_key(k_r2m)
@@ -322,7 +337,14 @@ def main(cfg: DictConfig):
             }
 
             base_name = gif_stem
-            save_visualizations(viz_batch, outputs, base_name, save_dir=str(per_gif_dir))
+            save_visualizations(
+                viz_batch,
+                outputs,
+                base_name,
+                save_dir=str(per_gif_dir),
+                depth_post_mode=depth_post_mode,
+                motion_depth_post_mode=motion_depth_post_mode,
+            )
             print(f"Saved visualizations to: {per_gif_dir}")
 
         except Exception as e:

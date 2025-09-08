@@ -690,7 +690,7 @@ class DynaDUSt3R(
             #         print(f"[conf-multi] {cfg['name']} conf has C={cfg['conf'].shape[-1]} channels")  # (B, H, W, C)
 
             # Compute single loss component
-            loss_comp = self._compute_single_loss_fixed(  # ()
+            loss_comp, comp_stats = self._compute_single_loss_fixed(  # ()
                 cfg["gt"], cfg["pred"], cfg["valid"], cfg["conf"],
                 gt_scale, pred_scale, alpha, device
             )
@@ -698,7 +698,7 @@ class DynaDUSt3R(
             # Accumulate loss
             total_loss = total_loss + loss_comp  # ()
 
-            # Store details - FIXED to match unoptimized naming
+            # Store details - FIXED to match unoptimized naming and extended stats
             if cfg["conf"] is not None:  # ()
                 # (float)
                 loss_details[f"{cfg['name']}_conf"] = loss_comp.item()
@@ -707,6 +707,14 @@ class DynaDUSt3R(
             else:
                 loss_details[f"{cfg['name']}_conf"] = 0.0  # (float)
                 loss_details[f"{cfg['name']}_l2"] = loss_comp.item()  # (float)
+
+            # Extended statistics for L2 and confidence losses
+            loss_details[f"{cfg['name']}_l2_mean"] = float(comp_stats.get("l2_mean", 0.0))
+            loss_details[f"{cfg['name']}_l2_median"] = float(comp_stats.get("l2_median", 0.0))
+            loss_details[f"{cfg['name']}_l2_var"] = float(comp_stats.get("l2_var", 0.0))
+            loss_details[f"{cfg['name']}_conf_mean"] = float(comp_stats.get("conf_mean", 0.0))
+            loss_details[f"{cfg['name']}_conf_median"] = float(comp_stats.get("conf_median", 0.0))
+            loss_details[f"{cfg['name']}_conf_var"] = float(comp_stats.get("conf_var", 0.0))
 
             # Explicitly delete intermediate tensors if not base PC
             if not cfg["is_base"]:  # ()
@@ -762,7 +770,15 @@ class DynaDUSt3R(
         Key fix: Only return confidence loss when available, otherwise return 0.
         """
         if not valid_mask.any():  # ()
-            return torch.tensor(0.0, device=pred_pc.device)  # ()
+            stats = {
+                "l2_mean": 0.0,
+                "l2_median": 0.0,
+                "l2_var": 0.0,
+                "conf_mean": 0.0,
+                "conf_median": 0.0,
+                "conf_var": 0.0,
+            }
+            return torch.tensor(0.0, device=pred_pc.device), stats  # ()
  
         # Normalize full PCs first (like unoptimized)
         gt_pc_norm = gt_pc / gt_scale  # (B, H, W, 3)
@@ -773,6 +789,16 @@ class DynaDUSt3R(
  
         # Extract valid distances
         l2_dist_valid = l2_dist[valid_mask]  # (N,)
+
+        # L2 statistics
+        if l2_dist_valid.numel() > 0:
+            l2_mean = l2_dist_valid.mean().item()
+            l2_median = l2_dist_valid.median().item()
+            l2_var = l2_dist_valid.var(unbiased=False).item()
+        else:
+            l2_mean = 0.0
+            l2_median = 0.0
+            l2_var = 0.0
  
         # CRITICAL FIX: Match unoptimized behavior
         if conf is not None:  # ()
@@ -785,12 +811,33 @@ class DynaDUSt3R(
             assert l2_dist_valid.ndim == 1 and conf_valid.ndim == 1
  
             # Compute confidence loss (no clamping to match unoptimized exactly)
-            loss = (l2_dist_valid * conf_valid - alpha * torch.log(conf_valid)).mean()  # ()
+            conf_loss_vec = (l2_dist_valid * conf_valid - alpha * torch.log(conf_valid))  # (N,)
+            loss = conf_loss_vec.mean()  # ()
+            if conf_loss_vec.numel() > 0:
+                conf_mean = conf_loss_vec.mean().item()
+                conf_median = conf_loss_vec.median().item()
+                conf_var = conf_loss_vec.var(unbiased=False).item()
+            else:
+                conf_mean = 0.0
+                conf_median = 0.0
+                conf_var = 0.0
         else:
             # Return 0 when no confidence (matching unoptimized bug/feature)
             loss = torch.tensor(0.0, device=pred_pc.device)  # ()
+            conf_mean = 0.0
+            conf_median = 0.0
+            conf_var = 0.0
  
-        return loss  # ()
+        stats = {
+            "l2_mean": l2_mean,
+            "l2_median": l2_median,
+            "l2_var": l2_var,
+            "conf_mean": conf_mean,
+            "conf_median": conf_median,
+            "conf_var": conf_var,
+        }
+
+        return loss, stats  # ()
 
     # ---------------------------------------------------------------------
     #  UPDATED: compute_metrics – static error + *point-cloud* motion error

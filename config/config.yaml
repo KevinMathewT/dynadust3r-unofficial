@@ -49,12 +49,12 @@ logging:
   wandb_interval: 5
 
 infer:
-  checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-08-28/14-08-33/checkpoints/best_loss_1.640394_iter_49000_epoch_25.pth
+  checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-09-06/13-04-31/checkpoints/best_loss_1.511061_iter_98000_epoch_49.pth
   input_dir: /scratch/km6748/vision-experiments/scratch/paper
   output_dir: /scratch/km6748/vision-experiments/scratch/paper/results
   gif_glob: "*.gif"
   device: auto  # auto|cuda|cpu
 
   # === filtering knobs ===
-  motion_conf_top_percentile: 0.25   # keep top p fraction by confidence (0..1); 0.25 => top 25%
-  mask_motion_top_percentile: 0.25   # among those, keep top p fraction by |motion| (0..1); 0.01 => top 1%
+  motion_conf_top_percentile: 1.0   # keep top p fraction by confidence (0..1); 0.25 => top 25%
+  mask_motion_top_percentile: 1.0   # among those, keep top p fraction by |motion| (0..1); 0.01 => top 1%
