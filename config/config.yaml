@@ -9,7 +9,7 @@ defaults:
 
 seed: 2
 
-debug: False
+debug: True
 
 # Scheduler configuration
 # To disable scheduler: sched: null
@@ -57,4 +57,4 @@ infer:
 
   # === filtering knobs ===
   motion_conf_top_percentile: 1.0   # keep top p fraction by confidence (0..1); 0.25 => top 25%
-  mask_motion_top_percentile: 1.0   # among those, keep top p fraction by |motion| (0..1); 0.01 => top 1%
+  mask_motion_top_percentile: 0.05   # among those, keep top p fraction by |motion| (0..1); 0.01 => top 1%

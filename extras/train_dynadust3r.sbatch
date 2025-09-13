@@ -17,4 +17,4 @@ cd /scratch/km6748/vision-experiments/
 $(poetry env activate)
 
 # one process per gpu
-accelerate launch -m train dataset.stereo4d.wds_dir=/scratch/projects/fouheylab/km6748/stereo4d-data/wds
+accelerate launch -m train dataset.stereo4d.wds_dir=/scratch/projects/fouheylab/km6748/stereo4d-data/wds debug=False

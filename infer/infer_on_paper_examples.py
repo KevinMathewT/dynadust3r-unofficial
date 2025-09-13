@@ -123,7 +123,14 @@ def _images_same_size_or_resize(frames: np.ndarray) -> np.ndarray:
 def main(cfg: DictConfig):
     if save_visualizations is None:
         raise ImportError("save_visualizations(...) could not be imported.")
-
+    
+    # Clear output directory if it exists
+    output_dir = Path(cfg.infer.output_dir)
+    if output_dir.exists():
+        import shutil
+        print(f"Clearing existing output directory: {output_dir}")
+        shutil.rmtree(output_dir)
+        
     # Resolve device
     dev_cfg = str(cfg.infer.device).lower()
     device = torch.device("cuda" if (dev_cfg == "cuda" and torch.cuda.is_available()) else "cpu")

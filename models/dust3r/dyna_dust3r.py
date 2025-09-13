@@ -800,7 +800,7 @@ class DynaDUSt3R(
             l2_median = 0.0
             l2_var = 0.0
  
-        # CRITICAL FIX: Match unoptimized behavior
+        # CRITICAL: If confidence is provided, compute conf-weighted loss; otherwise use pure L2
         if conf is not None:  # ()
             # Extract valid confidence values
             conf_valid = conf[valid_mask].squeeze(-1)  # (N,)
@@ -822,8 +822,11 @@ class DynaDUSt3R(
                 conf_median = 0.0
                 conf_var = 0.0
         else:
-            # Return 0 when no confidence (matching unoptimized bug/feature)
-            loss = torch.tensor(0.0, device=pred_pc.device)  # ()
+            # Pure L2 objective when confidence is disabled
+            if l2_dist_valid.numel() > 0:
+                loss = l2_dist_valid.mean()
+            else:
+                loss = torch.tensor(0.0, device=pred_pc.device)
             conf_mean = 0.0
             conf_median = 0.0
             conf_var = 0.0

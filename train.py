@@ -53,13 +53,13 @@ def main(config: DictConfig):
         # config.data.len                   = config.train.iterations * config.data.batch_size * world_size
         # config.data.valid_len             = config.data.valid_len * config.data.batch_size * world_size
         # train_viz_interval                = 250
+        
+        config.train.grad_acc             = 1
         config.data.len                   = 4
         config.data.valid_len             = 4
         config.data.batch_size            = 4
         config.train.validation_frequency = 40
         train_viz_interval                = 5
-        # Make overfitting easier in debug
-        # config.train.grad_acc             = 1
     else:
         # align dataset sizes with training plan
         config.data.len                   = config.train.iterations * config.data.batch_size * world_size
