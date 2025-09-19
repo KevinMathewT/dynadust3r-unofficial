@@ -1,7 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=s4d_preproc_cpu
-#SBATCH --account=pr_96_general
-#SBATCH --time=08:00:00
+# #SBATCH --account=pr_96_general
+# #SBATCH --account=pr_96_tandon_advanced
+#SBATCH --account=pr_96_tandon_priority
+#SBATCH --time=16:00:00
 #SBATCH --mem=200G
 #SBATCH --cpus-per-task=32
 #SBATCH --requeue

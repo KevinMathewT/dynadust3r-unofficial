@@ -4,6 +4,10 @@
 Author: Kevin Mathew T
 Date: 2025-08-17
 LinkedIn: https://www.linkedin.com/in/kevinmathewt/
+
+execute:
+    - poetry run accelerate launch -m train
+    - poetry run accelerate launch -m train dataset.stereo4d.wds_dir=/scratch/projects/fouheylab/km6748/stereo4d-data/wds debug=False 
 """
 
 # -------------------------------------------------------------
@@ -86,7 +90,7 @@ def main(config: DictConfig):
 
     model                      = get_model(config, accelerator.device)
     train_loader, valid_loader = get_loaders(config)
-    optimizer                  = get_optimizer(model.parameters(), config)
+    optimizer                  = get_optimizer(model, config)
 
     model, optimizer, train_loader, valid_loader = accelerator.prepare(
         model, optimizer, train_loader, valid_loader

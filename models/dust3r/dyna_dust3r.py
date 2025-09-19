@@ -56,10 +56,6 @@ assert version.parse(hf_version_number) >= version.parse("0.22.0"), (
 )
 
 
-def load_model(model_path, device, verbose=True):
-    pass
-
-
 class DynaDUSt3R(
     CroCoNet,
     huggingface_hub.PyTorchModelHubMixin,
@@ -123,9 +119,23 @@ class DynaDUSt3R(
         self.k = 0
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, **kw):
+    def from_pretrained(cls, pretrained_model_name_or_path, device="cpu", strict=False, **kw):
         if os.path.isfile(pretrained_model_name_or_path):
-            return load_model(pretrained_model_name_or_path, device="cpu")
+            ckpt = torch.load(pretrained_model_name_or_path, map_location=device, weights_only=False)
+            state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+            
+            model_kwargs = {}
+            if isinstance(ckpt, dict) and "config" in ckpt and isinstance(ckpt["config"], dict):
+                cfg = ckpt["config"]
+                if "model" in cfg and isinstance(cfg["model"], dict):
+                    model_kwargs = dict(cfg["model"])
+                    model_kwargs.pop("name", None)
+
+            model = cls(**model_kwargs) if model_kwargs else cls()
+            model.load_state_dict(state_dict, strict=strict)
+            model.to(device)
+            model.eval()
+            return model
         else:
             try:
                 model = super(DynaDUSt3R, cls).from_pretrained(
