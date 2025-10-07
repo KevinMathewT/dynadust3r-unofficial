@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from decord import VideoReader, cpu
 import albumentations as A
+import torch
 
 from .stereo_motion_base import StereoMotionBase
 import utils.geometry as geom
@@ -83,7 +84,7 @@ class Stereo4D(StereoMotionBase):
                 A.RandomBrightnessContrast(p=0.2),
                 A.HueSaturationValue(p=0.2),
                 A.ToGray(p=0.2),
-                A.ImageCompression(quality_lower=30, quality_upper=100, p=0.5),
+                A.ImageCompression(quality_range=(30, 100), p=0.5),
                 A.OneOf(
                     [
                         A.MotionBlur(p=0.2),
@@ -204,9 +205,9 @@ class Stereo4D(StereoMotionBase):
         intr, extr = self._load_camera_data(seq, idx)  # (3, 3), (4, 4)
 
         return dict(
-            image=img,                               # (H, W, 3)
-            world_pc_valid=world_pc,                 # (T, 4)
-            cam=(intr, extr),                        # ((3,3), (4,4))
+            image=torch.from_numpy(img),                     # (H, W, 3)
+            world_pc_valid=torch.from_numpy(world_pc),       # (T, 4)
+            cam=(torch.from_numpy(intr), torch.from_numpy(extr)),  # ((3,3), (4,4))
             dm=None,
             instance=f"{seq}_{idx:05d}",
         )
@@ -220,12 +221,14 @@ class Stereo4D(StereoMotionBase):
         for i in idxs:
             frames.append(vr[i].asnumpy())  # (H, W, 3)
         del vr
+        frames = [torch.from_numpy(f) for f in frames]
 
         # load ann once
         ann = np.load(self.npz_path(seq), allow_pickle=True)
 
         # intrinsics once
         intr = self._get_intrinsics(seq)  # (3, 3)
+        intr = torch.from_numpy(intr.astype(np.float32))
 
         # annotations for selected frames
         pcs_all = _optimized_pcs(
@@ -238,6 +241,7 @@ class Stereo4D(StereoMotionBase):
         # extrinsics for selected frames
         c2w = ann["camera2world"]
         extr_list = [geom.inv(c2w[i]) for i in idxs]  # list of (4, 4)
+        extr_list = [torch.from_numpy(e.astype(np.float32)) for e in extr_list]
 
         # col lookup
         col_of_frame = {f: j for j, f in enumerate(idxs)}
@@ -247,7 +251,9 @@ class Stereo4D(StereoMotionBase):
         for j, fidx in enumerate(idxs):
             out.append(dict(
                 image=frames[j],                                    # (H, W, 3)
-                world_pc_valid=pcs_all[:, col_of_frame[fidx], :],   # (T, 4)
+                world_pc_valid=torch.from_numpy(
+                    pcs_all[:, col_of_frame[fidx], :].astype(np.float32)
+                ),                                                  # (T, 4)
                 cam=(intr, extr_list[j]),                           # ((3,3), (4,4))
                 dm=None,
                 instance=f"{seq}_{fidx:05d}",

@@ -1,6 +1,6 @@
 defaults:
   - model: dynadust3r
-  - optim: adam
+  - optim: adamw
   # - sched: cosine
   - criterion: unified  # unified criterion with single normalization (was: conf)
   - dataset/pointodyssey@dataset.pointodyssey
@@ -49,7 +49,9 @@ logging:
   wandb_interval: 5
 
 infer:
-  checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-09-14/13-03-43/checkpoints/best_loss_1.051338_iter_18000_epoch_9.pth
+  # checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-09-28/06-01-28/checkpoints/best_loss_1.482034_iter_84000_epoch_42.pth
+  # checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-09-14/13-03-43/checkpoints/best_loss_1.521715_iter_70000_epoch_35.pth
+  checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-10-01/14-57-07/checkpoints/best_loss_0.482816_iter_92000_epoch_46.pth
   input_dir: /scratch/km6748/vision-experiments/scratch/paper
   output_dir: /scratch/km6748/vision-experiments/scratch/paper/results
   gif_glob: "*.gif"
@@ -58,3 +60,10 @@ infer:
   # === filtering knobs ===
   motion_conf_top_percentile: 1.0   # keep top p fraction by confidence (0..1); 0.25 => top 25%
   mask_motion_top_percentile: 0.05   # among those, keep top p fraction by |motion| (0..1); 0.01 => top 1%
+
+eval:
+  adt:
+    root_dir: /scratch/projects/fouheylab/km6748/adt/tapvid3d_adt_every_30_frames
+    save_dir: ./adt_eval_out
+    limit: null        # or an int
+    max_depth: 70.0

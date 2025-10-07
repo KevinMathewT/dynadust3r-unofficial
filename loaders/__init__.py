@@ -5,25 +5,23 @@ LinkedIn: https://www.linkedin.com/in/kevinmathewt/
 """
 
 import os
+import numpy as np
+
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
 
 from loaders.pointodyssey import PointOdyssey
 from loaders.stereo4d import Stereo4D  # noqa: F401
-from loaders.stereo4d_wds import Stereo4DWDS
+# from loaders.stereo4d_wds import Stereo4DWDS
+from loaders.stereo4d_stream import Stereo4DWDSStream
 
 LOADERS = {
     "pointodyssey": PointOdyssey,
     # "stereo4d": Stereo4D,
-    "stereo4d": Stereo4DWDS,
+    # "stereo4d": Stereo4DWDS,
+    "stereo4d": Stereo4DWDSStream,
 }
-
-def add_batch_size_wrapper(batch):
-    batch = default_collate(batch)
-    batch['batch_size'] = len(batch['left_pm'])  # or use any other tensor in the batch
-    
-    return batch
 
 def get_loaders(config, num_workers_multiplier=1, loader_kwargs=None):
     """
@@ -54,18 +52,18 @@ def get_loaders(config, num_workers_multiplier=1, loader_kwargs=None):
     # ensure dict so that .get works even if None passed
     loader_kwargs = loader_kwargs or {}
 
-    # derive final values (dict overrides the auto‑defaults when supplied)
+    # derive final values (dict overrides the auto-defaults when supplied)
     persistent_workers = True # loader_kwargs.get('persistent_workers', True if num_workers > 0 else False)
-    prefetch_factor    = loader_kwargs.get('prefetch_factor', 8 if num_workers > 0 else None)
+    prefetch_factor    = loader_kwargs.get('prefetch_factor', 2 if num_workers > 0 else None)
 
     # Create dataloaders with FULL batch size
     # Accelerate will automatically handle splitting across GPUs
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.data.batch_size,  # Use full batch size
-        shuffle=True,  # Always shuffle for training
+        shuffle=False,  # Always shuffle for training
         num_workers=num_workers,
-        collate_fn=add_batch_size_wrapper,
+        collate_fn=train_dataset.custom_collate_fn,
         pin_memory=True,  # Recommended for GPU training
         persistent_workers=persistent_workers,  # Keeps workers alive between epochs
         prefetch_factor=prefetch_factor,  # Prefetch batches for better performance
@@ -76,7 +74,7 @@ def get_loaders(config, num_workers_multiplier=1, loader_kwargs=None):
         batch_size=config.data.batch_size * 4,  # Use full batch size
         shuffle=False,  # Never shuffle validation
         num_workers=num_workers,
-        collate_fn=add_batch_size_wrapper,
+        collate_fn=valid_dataset.custom_collate_fn,
         pin_memory=True,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor * 2,  # Prefetch batches for better performance

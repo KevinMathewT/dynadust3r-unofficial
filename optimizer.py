@@ -6,6 +6,7 @@ LinkedIn: https://www.linkedin.com/in/kevinmathewt/
 
 import math
 import json
+import os
 from torch.optim import Adam, AdamW, SGD, RMSprop
 from torch.optim.lr_scheduler import (
     StepLR, ExponentialLR, ReduceLROnPlateau,
@@ -141,12 +142,14 @@ def get_parameter_groups(model, weight_decay, layer_decay=1.0, skip_list=(), no_
             parameter_group_vars[group_name] = {
                 "weight_decay": this_weight_decay,
                 "params": [],
-                "lr_scale": scale
+                "lr_scale": scale,
+                "names": []
             }
 
         parameter_group_vars[group_name]["params"].append(param)
+        parameter_group_vars[group_name]["names"].append(name)
         parameter_group_names[group_name]["params"].append(name)
-    print("Param groups = %s" % json.dumps(parameter_group_names, indent=2))
+    # print("Param groups = %s" % json.dumps(parameter_group_names, indent=2))
     return list(parameter_group_vars.values())
 
 
@@ -178,7 +181,42 @@ def get_optimizer(model, config):
     opt_config.pop("skip_list", None)
     opt_config.pop("no_lr_scale_list", None)
 
-    return OPTIMIZERS[name.lower()](param_groups, **opt_config)
+    opt = OPTIMIZERS[name.lower()](param_groups, **opt_config)
+
+    # Write debug info about param groups once on rank 0
+    try:
+        rank = int(os.environ.get("RANK", "0"))
+    except Exception:
+        rank = 0
+    if rank == 0:
+        try:
+            debug = {
+                "num_groups": len(param_groups),
+                "mask_token_group": None,
+                "groups": []
+            }
+            for idx, g in enumerate(param_groups):
+                names = g.get("names", [])
+                has_mask = any(n == "mask_token" or n.endswith(".mask_token") for n in names)
+                if has_mask and debug["mask_token_group"] is None:
+                    debug["mask_token_group"] = {
+                        "index": idx,
+                        "weight_decay": g.get("weight_decay"),
+                        "lr_scale": g.get("lr_scale", 1.0)
+                    }
+                debug["groups"].append({
+                    "index": idx,
+                    "weight_decay": g.get("weight_decay"),
+                    "lr_scale": g.get("lr_scale", 1.0),
+                    "has_mask_token": has_mask,
+                    "num_names": len(names)
+                })
+            with open("param_groups_debug.json", "w") as f:
+                json.dump(debug, f, indent=2)
+        except Exception:
+            pass
+
+    return opt
 
 
 def get_scheduler(optimizer, config, loader):

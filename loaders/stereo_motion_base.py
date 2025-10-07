@@ -9,6 +9,7 @@ from PIL import Image
 
 import torch
 from torch.utils.data import Dataset
+from torch.utils.data._utils.collate import default_collate
 
 # import utils.geometry as geo
 # import utils.geometry as geo_motion
@@ -358,3 +359,10 @@ class StereoMotionBase(Dataset):
         Raises:
             NotImplementedError: This method must be overridden by child classes
         """
+
+    def custom_collate_fn(self, batch):
+        """
+        Custom collate function to add batch size to the batch.
+        """
+        b = default_collate(batch)
+        return b

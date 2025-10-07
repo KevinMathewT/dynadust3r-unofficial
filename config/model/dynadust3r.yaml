@@ -13,7 +13,7 @@ depth_post_mode: [linear, !!float -.inf, !!float .inf] # [exp, !!float -.inf, !!
 motion_depth_post_mode: [linear, !!float -.inf, !!float .inf] # [exp, !!float -.inf, !!float .inf]
 freeze: none
 landscape_only: true
-patch_embed_cls: PatchEmbedDust3R
+patch_embed_cls: ManyAR_PatchEmbed
 time_pos_emb_dim: 256
 
 # CroCo kwargs

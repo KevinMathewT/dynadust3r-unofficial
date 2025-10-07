@@ -89,7 +89,7 @@ class Stereo4DWDS(StereoMotionBase):
                 A.RandomBrightnessContrast(p=0.2),
                 A.HueSaturationValue(p=0.2),
                 A.ToGray(p=0.2),
-                A.ImageCompression(quality_lower=30, quality_upper=100, p=0.5),
+                A.ImageCompression(quality_range=(30, 100), p=0.5),
                 A.OneOf(
                     [
                         A.MotionBlur(p=0.2),

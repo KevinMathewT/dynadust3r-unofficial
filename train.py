@@ -79,7 +79,10 @@ def main(config: DictConfig):
     # allow params skipped in some forwards
     ddp_kwargs   = DistributedDataParallelKwargs(find_unused_parameters=True)
     init_kwargs  = InitProcessGroupKwargs(timeout=timedelta(minutes=60))
-    accelerator  = Accelerator(kwargs_handlers=[ddp_kwargs, init_kwargs])
+    accelerator  = Accelerator(
+        kwargs_handlers=[ddp_kwargs, init_kwargs],
+        split_batches=True,
+    )
 
     # wandb
     if config.logging.use_wandb and accelerator.is_local_main_process:
@@ -88,15 +91,26 @@ def main(config: DictConfig):
     if accelerator.is_local_main_process:
         create_symlink_for_wids_cache()
 
+    accelerator.print("Loading model...")
     model                      = get_model(config, accelerator.device)
+    print(model)
+    accelerator.print("Model loaded successfully!")
+    
     train_loader, valid_loader = get_loaders(config)
+    
+    accelerator.print("Getting optimizer...")
     optimizer                  = get_optimizer(model, config)
+    accelerator.print("Optimizer created!")
 
+    accelerator.print("Preparing model, optimizer, and dataloaders with accelerator...")
     model, optimizer, train_loader, valid_loader = accelerator.prepare(
         model, optimizer, train_loader, valid_loader
     )
+    accelerator.print("Accelerator preparation completed!")
 
+    accelerator.print("Getting scheduler...")
     scheduler = get_scheduler(optimizer, config, train_loader)
+    accelerator.print("Scheduler created!")
 
     # training setup
     model.train()
@@ -107,6 +121,7 @@ def main(config: DictConfig):
     validation_frequency  = config.train.validation_frequency
     batches_per_epoch     = len(train_loader)
 
+    accelerator.print("Creating batch generator...")
     batch_generator = get_cycled_batches(train_loader, accelerator, total_iterations)
     batch_iter      = batch_generator
     iteration       = 0
@@ -116,8 +131,14 @@ def main(config: DictConfig):
     # manual grad accumulation setup
     grad_acc = int(getattr(config.train, "grad_acc", 1))
 
+    accelerator.print("Starting main training loop...")
+    accelerator.print("Attempting to load first batch...")
+    
     # main training loop
     for batch in batch_iter:
+        if iteration == 0:
+            accelerator.print("First batch loaded successfully! Starting training iterations...")
+            
         current_epoch     = iteration // validation_frequency
         dataset_position  = (iteration % batches_per_epoch) + 1
 
@@ -182,12 +203,13 @@ def main(config: DictConfig):
         with torch.no_grad():
             unwrapped_model = accelerator.unwrap_model(model)
             batch_metrics = unwrapped_model.compute_metrics(batch, outputs)  # dict[str, float]
+            local_bs = batch["left_image"].size(0)
             for k, v in batch_metrics.items():
                 if k not in train_metrics:
                     train_metrics[k] = AverageMeter(k, ":.4f")
-                train_metrics[k].update(v, batch["batch_size"])
+                train_metrics[k].update(v, local_bs)
 
-        train_losses.update(loss.item(), batch["batch_size"])
+        train_losses.update(loss.item(), local_bs)
 
         if (iteration % 5 == 0 or iteration == total_iterations - 1):
             elapsed   = time.time() - start_time
@@ -263,12 +285,13 @@ def main(config: DictConfig):
 
                     val_batch_metrics = unwrapped_model.compute_metrics(val_batch, val_outputs)
 
+                    v_local_bs = val_batch["left_image"].size(0)
                     for k, v in val_batch_metrics.items():
                         if k not in val_metrics:
                             val_metrics[k] = AverageMeter(k, ":.4f")
-                        val_metrics[k].update(v, val_batch["batch_size"])
+                        val_metrics[k].update(v, v_local_bs)
 
-                    val_losses.update(val_loss.item(), val_batch["batch_size"])
+                    val_losses.update(val_loss.item(), v_local_bs)
 
                     if val_batch_idx % config.logging.wandb_interval == 0 and accelerator.is_local_main_process:
                         wandb_logger.log_validation_batch(

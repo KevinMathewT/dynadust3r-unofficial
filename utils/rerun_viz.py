@@ -7,6 +7,7 @@ LinkedIn: https://www.linkedin.com/in/kevinmathewt/
 import rerun as rr
 import numpy as np
 from scipy.spatial.transform import Rotation
+from rerun.blueprint import Blueprint, Horizontal, Spatial2DView, Spatial3DView
 
 from PIL import Image
 
@@ -270,14 +271,14 @@ def visualize_pm(pm, image=None, cam=None, valid=True, name="pm", pc_in_cam_coor
         - If `colors` is provided, uses that for coloring.
         - Else if `image` and `cam` are provided, projects the point cloud into image space for colorization.
         - Logs the point cloud and camera information to rerun for visualization.
-        - If `pc_in_cam_coords` is False, transforms the point cloud using extrinsics.
+        - If `pc_in_cam_coords` is False, transforms world coordinates to camera coordinates using extrinsics.
     """
     rr.init(name)
     if save and path is not None:
         rr.save(path)  # must be called before the first log
         print(f"Saved visualization to {path}.")
     rr.connect_tcp("127.0.0.1:9876")
-
+    
     # normalize pm to array with time dim
     if isinstance(pm, list):
         pm = np.stack(pm, axis=0)  # (T, H, W, C)
@@ -484,6 +485,201 @@ def test_rerun():
 
     rr.disconnect()
 
+
+def visualize_pm_image_linked(
+    pm, image=None, cam=None, motion=None,
+    name="pm_image_linked", valid=True, save=False, path=None, cam_anchor=None, pm_cam=None
+):
+    """
+    World frame := LEFT camera frame.
+
+    Inputs per time t:
+      pm[t]     : (H,W,3/4) XYZ in a camera frame (specified by pm_cam[t]) at the t-th image's pixel locations
+      image[t]  : (H,W,3)   uint8 RGB for that view (optional)
+      cam[t]    : (K_t, E_w2c_t) if available; E_w2c is world->cam in dataset world.
+                  We remap to the anchor frame as world:
+                        - E_world->cam_t = E_w2c_t @ inv(E_anchor)
+      pm_cam[t] : (K_pm_t, E_w2c_pm_t) camera whose coordinates the pm[t] is expressed in.
+                  If None, pm[t] is assumed already in world (= anchor) frame.
+      motion    : (T-1,H,W,3/4) or list of (H,W,3/4); motion in the SAME frame as pm[t] for segment t->t+1
+    """
+
+    import numpy as np
+    import rerun as rr
+    from rerun.blueprint import Blueprint, Horizontal, Spatial2DView, Spatial3DView
+
+    # --------- small helpers ---------
+    def to_seq(x):
+        if x is None: return [None]
+        if isinstance(x, list): return x
+        a = np.asarray(x)
+        if a.ndim == 3: return [a]
+        return list(a)
+
+    def image_intrinsics_from(img, fallback_like=None):
+        if img is not None:
+            H, W = img.shape[:2]
+        elif fallback_like is not None:
+            H, W = fallback_like.shape[:2]
+        else:
+            H, W = 512, 512
+        fx = float(W); fy = float(W)
+        cx = W / 2.0; cy = H / 2.0
+        return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+
+    def decompose_extrinsics(E):
+        """E is 4x4 world->camera. Return (translation, quaternion[wxyz])."""
+        R = E[:3, :3]
+        t = E[:3, 3]
+        # Rerun expects quaternion [x,y,z,w]
+        qw = np.sqrt(max(0.0, 1 + R[0, 0] + R[1, 1] + R[2, 2])) / 2.0
+        qx = (R[2, 1] - R[1, 2]) / (4 * qw + 1e-9)
+        qy = (R[0, 2] - R[2, 0]) / (4 * qw + 1e-9)
+        qz = (R[1, 0] - R[0, 1]) / (4 * qw + 1e-9)
+        return t.astype(np.float32), np.array([qx, qy, qz, qw], dtype=np.float32)
+
+    def E_world_to_cam_from_anchor(E_anchor, camt):
+        """Compute E_world->cam_t using a chosen anchor extrinsic E_anchor."""
+        if E_anchor is None or camt is None or not isinstance(camt, tuple) or len(camt) != 2 or camt[1] is None:
+            return None
+        Et = camt[1]
+        try:
+            return (Et @ np.linalg.inv(E_anchor)).astype(np.float32)
+        except np.linalg.LinAlgError:
+            return None
+
+    def get_E(cam_tuple):
+        if cam_tuple is None or not isinstance(cam_tuple, tuple) or len(cam_tuple) != 2:
+            return None
+        return cam_tuple[1]
+
+    # --------- normalize inputs ---------
+    pm_seq = to_seq(pm)
+    im_seq = to_seq(image)
+    cam_seq = to_seq(cam) if isinstance(cam, list) else ([cam] if cam is not None else [None])
+    pm_cam_seq = to_seq(pm_cam) if (pm_cam is not None) else [None]
+
+    if motion is None:
+        mot_seq = []
+    elif isinstance(motion, list):
+        mot_seq = motion
+    else:
+        m = np.asarray(motion)
+        mot_seq = [m] if m.ndim == 3 else list(m)
+
+    T = max(len(pm_seq), len(im_seq))
+    pm_seq = (pm_seq * T)[:T]
+    im_seq = (im_seq * T)[:T]
+    cam_seq = (cam_seq * T)[:T]
+    pm_cam_seq = (pm_cam_seq * T)[:T]
+    mot_seq = mot_seq[: max(0, T - 1)]
+
+    # --------- Rerun setup ---------
+    blueprint = Blueprint(
+        Horizontal(
+            Spatial3DView(origin=f"/{name}", name="3D (Left Frame)"),
+            Spatial2DView(origin=f"/{name}/image", name="Image"),
+        )
+    )
+    rr.init(name, spawn=True, default_blueprint=blueprint)
+    if save and path:
+        rr.save(path)  # before first log
+
+    # Choose anchor extrinsic (world definition)
+    E_anchor = None
+    if cam_anchor is not None and isinstance(cam_anchor, tuple) and len(cam_anchor) == 2 and cam_anchor[1] is not None:
+        E_anchor = cam_anchor[1]
+    else:
+        if cam_seq and isinstance(cam_seq[0], tuple) and len(cam_seq[0]) == 2 and cam_seq[0][1] is not None:
+            E_anchor = cam_seq[0][1]
+
+    for t in range(T):
+        rr.set_time_sequence("time", t)
+
+        pm_t = pm_seq[t]
+        im_t = im_seq[t]
+        cam_t = cam_seq[t] if (cam_seq[t] and isinstance(cam_seq[t], tuple) and len(cam_seq[t]) == 2) else None
+        pm_cam_t = pm_cam_seq[t] if (pm_cam_seq[t] and isinstance(pm_cam_seq[t], tuple) and len(pm_cam_seq[t]) == 2) else None
+
+        if pm_t is None:
+            continue
+
+        H, W, C = pm_t.shape
+        flat = pm_t.reshape(-1, C)
+        has_valid = C >= 4
+        valid_mask = (flat[:, 3] > 0) if (has_valid and valid) else np.ones((flat.shape[0],), bool)
+
+        # Points in the PM's own camera frame
+        pts_cam = flat[valid_mask][:, :3].astype(np.float32)
+
+        # Build transform from PM camera frame -> world(anchor) frame
+        M_R = np.eye(3, dtype=np.float32)
+        M_t = np.zeros(3, dtype=np.float32)
+        if (E_anchor is not None) and (pm_cam_t is not None) and (get_E(pm_cam_t) is not None):
+            E_pm = get_E(pm_cam_t)
+            try:
+                M = (E_anchor @ np.linalg.inv(E_pm)).astype(np.float32)   # world(anchor) <- PM_cam
+                M_R = M[:3, :3]
+                M_t = M[:3, 3]
+            except np.linalg.LinAlgError:
+                pass
+
+        # Transform PM points to world(anchor)
+        positions = (pts_cam @ M_R.T) + M_t
+
+        # Colors from image if present
+        colors3d = None
+        if im_t is not None:
+            img_flat = im_t.reshape(-1, 3)
+            colors3d = (img_flat[valid_mask].astype(np.float32) / 255.0)
+
+        # Intrinsics: prefer provided; else synthesize
+        K = cam_t[0] if cam_t is not None else None
+        if K is None:
+            K = image_intrinsics_from(im_t, fallback_like=pm_t)
+
+        # EXTRINSICS for the image camera at this time from the chosen anchor
+        E_w2c = E_world_to_cam_from_anchor(E_anchor, cam_t)
+        if E_w2c is None:
+            E_w2c = np.eye(4, dtype=np.float32)
+            if t > 0:
+                E_w2c[0, 3] = 0.1 * float(t)
+
+        # Rerun expects camera-to-world, so invert the world-to-camera transform
+        E_c2w = geo.inv(E_w2c)
+        tr, quat = decompose_extrinsics(E_c2w)
+        rr.log(
+            f"/{name}/image",
+            rr.Transform3D(
+                translation=tr.astype(np.float32),
+                rotation=rr.Quaternion(xyzw=quat.astype(np.float32)),
+            ),
+        )
+        if im_t is not None:
+            rr.log(f"/{name}/image", rr.Image(im_t))
+        rr.log(f"/{name}/image", rr.Pinhole(image_from_camera=K))
+
+        # Log points (in world)
+        rr.log(f"/{name}/points", rr.Points3D(positions=positions, colors=colors3d))
+
+        # 3D motion overlay (motion is in the same frame as pm_t)
+        if t < len(mot_seq) and mot_seq[t] is not None:
+            m = np.asarray(mot_seq[t])
+            if m.ndim == 3 and m.shape[:2] == (H, W) and m.shape[-1] >= 3:
+                mflat = m.reshape(-1, m.shape[-1])
+                m_valid = (mflat[:, 3] > 0) if (m.shape[-1] >= 4 and valid) else np.ones((mflat.shape[0],), bool)
+                keep = valid_mask & m_valid
+
+                # src in world; rotate motion into world (no translation)
+                src_cam = flat[keep][:, :3].astype(np.float32)
+                src_world = (src_cam @ M_R.T) + M_t
+                mot_cam = mflat[keep][:, :3].astype(np.float32)
+                mot_world = mot_cam @ M_R.T
+                dst_world = src_world + mot_world
+
+                if src_world.size:
+                    lines = np.stack([src_world, dst_world], axis=1)
+                    rr.log(f"/{name}/motion", rr.LineStrips3D(strips=lines, radii=0.001))
 
 if __name__ == "__main__":
     test_rerun()

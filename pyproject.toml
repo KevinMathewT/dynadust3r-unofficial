@@ -59,6 +59,8 @@ modulegraph = "^0.19.6"
 vulture = "^2.14"
 pydeps = "^3.0.1"
 albumentations = "^2.0.8"
+kornia = "^0.8.1"
+jaxcam = "^0.3.0"
 
 [build-system]
 requires = ["poetry-core"]

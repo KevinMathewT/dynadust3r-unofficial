@@ -1,646 +1,1040 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Fast Stereo4D → WebDataset preprocessor (sequence-level samples).
+Pre-sample and pack Stereo4D into WebDataset shards.
 
-Design:
-- Discovery: CSV-based filter or scan-all, no decode; metadata-only width probe.
-- Writing: per-process exclusive ShardWriter with unique shard patterns.
-- Indexing: barrier then index all shards, build key→idx map.
-- Optional verification & small benchmark; configurable via env toggles.
+Changes in this version:
+- "Producers write directly": a small pool of writer workers open their own
+  WebDataset ShardWriter (unique pattern per worker) and write samples directly
+  to disk (no central JoinableQueue / single writer bottleneck).
+- Shard naming stays compatible with your globbing: if the base pattern is
+  'stereo4d-%06d.tar', workers produce 'stereo4d-w00-%06d.tar', 'stereo4d-w01-%06d.tar', etc.,
+  so 'stereo4d-*.tar' still finds everything for verify / wds2idx.
 
-Run examples:
-  Quick local:
-    PRE_S4D_TEST_N=16 PRE_S4D_NUM_WORKERS=16 PRE_S4D_WRITE_MODE=per_process \
-    poetry run python -m extras.preprocess_stereo4d dataset.stereo4d.wds_dir=/scratch/projects/fouheylab/km6748/stereo4d-data/wds-full
+All original functionality is preserved:
+- Filesystem discovery, minimal batched scanning for counts, presampling with
+  frame-window constraint, JPEG/NPY encoding in workers,
+  optional parallel verification, and optional DALI index generation.
 
-  High-throughput (Slurm; a100/h100):
-    srun --partition=stake_a100_2 --nodes=1 --ntasks=1 --cpus-per-task=160 \
-         --mem=0 --gres=gpu:a100:1 --time=24:00:00 bash -lc '
-      export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
-      PRE_S4D_USE_ALL_VIDEOS=1 PRE_S4D_SPLIT=train \
-      PRE_S4D_NUM_WORKERS=${SLURM_CPUS_PER_TASK:-$(nproc)} PRE_S4D_DECORD_GPU=1 \
-      PRE_S4D_WRITE_MODE=per_process PRE_S4D_MAX_SHARD_SIZE_GB=50 PRE_S4D_MAX_SAMPLES_PER_SHARD=8000 \
-      PRE_S4D_CLOSE_EACH=0 PRE_S4D_VERIFY_N=0 \
-      poetry run python -m extras.preprocess_stereo4d dataset.stereo4d.wds_dir=/scratch/projects/fouheylab/km6748/stereo4d-data/wds-full
-    '
-    # Swap to H100 if desired:
-    #   --partition=stake_h100_1 --cpus-per-task=96 --gres=gpu:h100:1
-    # CPU-only (no GPU decode): drop --gres and set PRE_S4D_DECORD_GPU=0
-    # Tip: if dataset is on shared FS, copy to /scratch first for max I/O.
+Environment
+- Uses cfg.dataset.stereo4d.cache as WIDS_CACHE.
 
-Toggles (env):
-  PRE_S4D_USE_ALL_VIDEOS=0/1, PRE_S4D_SPLIT=train|test,
-  PRE_S4D_NUM_WORKERS, PRE_S4D_TEST_N, PRE_S4D_VERIFY_N,
-  PRE_S4D_MAX_SHARD_SIZE_GB, PRE_S4D_MAX_SAMPLES_PER_SHARD,
-  PRE_S4D_WRITE_MODE=per_process|single_writer,
-  PRE_S4D_CLOSE_EACH=0/1 (per-process close per sample),
-  PRE_S4D_DECORD_GPU=0/1
+Debug run:
+poetry run python -m extras.preprocess_stereo4d \
+  +preproc.split=train \
+  dataset.stereo4d.wds_dir=/scratch/projects/fouheylab/km6748/stereo4d-data/wds/train \
+  +preproc.debug=false +preproc.num_triplets=10000 \
+  +preproc.verify=true +preproc.verify_max_samples=10000 \
+  +preproc.num_workers=32 \
+  +preproc.image_format=npy \
+  +preproc.shard_size_gb=8.0 +preproc.samples_per_shard=5000 \
+  +preproc.clean_output=true
+
+poetry run python -m extras.preprocess_stereo4d \
+  +preproc.split=test \
+  dataset.stereo4d.wds_dir=/scratch/projects/fouheylab/km6748/stereo4d-data/wds/test \
+  +preproc.debug=false +preproc.num_triplets=1000 \
+  +preproc.verify=true +preproc.verify_max_samples=1000 \
+  +preproc.num_workers=16 \
+  +preproc.image_format=npy \
+  +preproc.shard_size_gb=8.0 +preproc.samples_per_shard=5000 \
+  +preproc.clean_output=true
+
+Full save:
+poetry run python -m extras.preprocess_stereo4d \
+  +preproc.split=train \
+  dataset.stereo4d.wds_dir=/scratch/projects/fouheylab/km6748/stereo4d-data/wds-full/train \
+  +preproc.debug=false +preproc.num_triplets=1568000 \
+  +preproc.verify=false \
+  +preproc.num_workers=64 \
+  +preproc.image_format=npy \
+  +preproc.shard_size_gb=8.0 +preproc.samples_per_shard=20000
+  +preproc.clean_output=true
+
+
+poetry run python -m extras.preprocess_stereo4d \
+  +preproc.split=test \
+  dataset.stereo4d.wds_dir=/scratch/projects/fouheylab/km6748/stereo4d-data/wds-full/test \
+  +preproc.debug=false +preproc.num_triplets=16000 \
+  +preproc.verify=false \
+  +preproc.num_workers=64 \
+  +preproc.image_format=npy \
+  +preproc.shard_size_gb=8.0 +preproc.samples_per_shard=20000
+  +preproc.clean_output=true
 """
 
 from __future__ import annotations
 
-import os, io, math, json, time, logging, tempfile, shutil, contextlib
+import os, sys, io, json, math, time, random, shutil, tarfile, logging, tempfile, subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple, Iterable, Optional, Any
 
-import numpy as np
-import pandas as pd
-import cv2
-from tqdm import tqdm
-import hydra
-from omegaconf import DictConfig
-
-from multiprocessing import Pool
+from joblib import Parallel, delayed
 import multiprocessing as mp
-import queue
+from multiprocessing import Process, cpu_count, RLock
+from concurrent.futures import ProcessPoolExecutor
+
+from bisect import bisect_left
+import numpy as np
+import pandas as pd  # (not strictly required; kept for future extensions)
+from PIL import Image
+from tqdm import tqdm
 
 import webdataset as wds
 from decord import VideoReader, cpu as decord_cpu
 
-# ----------------------------------------------------------------------------
-# Configurable defaults
-# ----------------------------------------------------------------------------
-ALLOW_PICKLE            = True
-SPLIT                   = "train"
-USE_ALL_VIDEOS          = False
-NUM_WORKERS             = 32
-TEST_N                  = None          # subset for export (None = all)
-VERIFY_N                = 0             # number of seqs to verify (0 = skip)
-MAX_SHARD_SIZE_GB       = 50
-MAX_SAMPLES_PER_SHARD   = 8_000
-WRITE_MODE              = "per_process"  # per_process | single_writer
-CLOSE_EACH_SAMPLE       = False         # only for per_process; safest but slower
-DECORD_GPU              = True
-SPILL_THRESHOLD_BYTES   = 128 << 20     # for verify
-CLEAN_SHARDS            = True          # remove existing stereo4d-*.tar & fragments on rerun
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
-logging.basicConfig(level=logging.WARNING)
+# ensure tqdm output from multiple processes is synchronized
+try:
+    tqdm.set_lock(RLock())
+except Exception:
+    pass
 
+# -----------------------------------------------------------------------------#
+# Utility: geometry helpers (no external deps)
+# -----------------------------------------------------------------------------#
 
-# ----------------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------------
-def _parse_bool_env(val: str | None, default: bool) -> bool:
-    if val is None:
-        return default
-    return val.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+def _intrinsic_K(width: int, hfov_deg: float) -> np.ndarray:
+    fx = width * 0.5 / np.tan(np.deg2rad(hfov_deg) * 0.5)
+    return np.array([[fx, 0, width / 2],
+                     [0, fx, width / 2],
+                     [0,  0,          1]], dtype=np.float32)
 
+def _safe_inv_pose(mat: np.ndarray) -> np.ndarray:
+    """Invert 3x4 or 4x4 camera-to-world matrix to get extrinsics (world-to-camera)."""
+    if mat.shape == (4, 4):
+        return np.linalg.inv(mat).astype(np.float32)
+    if mat.shape == (3, 4):
+        pad = np.eye(4, dtype=np.float32)
+        pad[:3, :4] = mat.astype(np.float32)
+        return np.linalg.inv(pad).astype(np.float32)
+    raise ValueError(f"Unexpected pose shape {mat.shape}")
 
-def _apply_env_overrides():
-    global USE_ALL_VIDEOS, DECORD_GPU, WRITE_MODE, NUM_WORKERS, TEST_N, SPLIT
-    global MAX_SHARD_SIZE_GB, MAX_SAMPLES_PER_SHARD, CLOSE_EACH_SAMPLE, VERIFY_N, CLEAN_SHARDS
-    USE_ALL_VIDEOS = _parse_bool_env(os.environ.get("PRE_S4D_USE_ALL_VIDEOS"), USE_ALL_VIDEOS)
-    DECORD_GPU = _parse_bool_env(os.environ.get("PRE_S4D_DECORD_GPU"), DECORD_GPU)
-    CLOSE_EACH_SAMPLE = _parse_bool_env(os.environ.get("PRE_S4D_CLOSE_EACH"), CLOSE_EACH_SAMPLE)
-    CLEAN_SHARDS = _parse_bool_env(os.environ.get("PRE_S4D_CLEAN_SHARDS"), CLEAN_SHARDS)
-    if os.environ.get("PRE_S4D_SPLIT"): SPLIT = os.environ["PRE_S4D_SPLIT"]
-    if os.environ.get("PRE_S4D_WRITE_MODE"): WRITE_MODE = os.environ["PRE_S4D_WRITE_MODE"]
-    if os.environ.get("PRE_S4D_NUM_WORKERS"):
-        with contextlib.suppress(Exception):
-            NUM_WORKERS = int(os.environ["PRE_S4D_NUM_WORKERS"]) 
-    if os.environ.get("PRE_S4D_TEST_N"):
-        with contextlib.suppress(Exception):
-            TEST_N = int(os.environ["PRE_S4D_TEST_N"]) 
-    if os.environ.get("PRE_S4D_VERIFY_N"):
-        with contextlib.suppress(Exception):
-            VERIFY_N = int(os.environ["PRE_S4D_VERIFY_N"]) 
-    if os.environ.get("PRE_S4D_MAX_SHARD_SIZE_GB"):
-        with contextlib.suppress(Exception):
-            MAX_SHARD_SIZE_GB = float(os.environ["PRE_S4D_MAX_SHARD_SIZE_GB"]) 
-    if os.environ.get("PRE_S4D_MAX_SAMPLES_PER_SHARD"):
-        with contextlib.suppress(Exception):
-            MAX_SAMPLES_PER_SHARD = int(os.environ["PRE_S4D_MAX_SAMPLES_PER_SHARD"]) 
+def _optimized_pcs(lengths: np.ndarray,
+                   track_indices: np.ndarray,
+                   track_coordinates: np.ndarray,
+                   idxs: np.ndarray) -> np.ndarray:
+    """scatter tracks -> (T,F,4) with validity channel (copied from your loader)."""
+    frame_idxs = np.asarray(idxs)
+    col_idx_full = track_indices
+    keep = np.isin(col_idx_full, frame_idxs)
 
+    if keep.any():
+        obs_idx = np.flatnonzero(keep)
+        row_s = np.searchsorted(lengths.cumsum(), obs_idx, side='right')
+        frames_kept = col_idx_full[keep]
+        max_track_frame = int(col_idx_full.max()) if col_idx_full.size > 0 else -1
+        max_req_frame = int(frame_idxs.max()) if len(frame_idxs) > 0 else -1
+        max_frame = max(max_track_frame, max_req_frame)
+        frame2col = np.full(max_frame + 1, -1, dtype=np.int32)
+        frame2col[frame_idxs] = np.arange(len(frame_idxs), dtype=np.int32)
+        col_s = frame2col[frames_kept]
+        coord_s = track_coordinates[keep]
+    else:
+        row_s = col_s = np.empty((0,), dtype=np.int32)
+        coord_s = np.empty((0, 3), dtype=np.float32)
 
-def _get_decord_ctx():
-    if DECORD_GPU:
-        try:
-            import torch
-            if torch.cuda.is_available():
-                from decord import gpu as _gpu
-                return _gpu(torch.cuda.current_device())
-        except Exception:
-            pass
-    return decord_cpu(0)
+    tracks = np.full((len(lengths), len(frame_idxs), 3), np.nan, np.float32)
+    if len(row_s):
+        tracks[row_s, col_s] = coord_s
+    valid = (~np.isnan(tracks[..., 0]))[..., None].astype(np.float32)
+    return np.concatenate([tracks, valid], axis=-1)  # (T,F,4)
 
+# -----------------------------------------------------------------------------#
+# Config dataclass (overlay on top of your Hydra config tree)
+# -----------------------------------------------------------------------------#
 
-def intrinsic_K(width: int, hfov: float) -> np.ndarray:
-    fx = width * 0.5 / math.tan(math.radians(hfov) * 0.5)
-    return np.array([[fx, 0, width/2], [0, fx, width/2], [0, 0, 1]], np.float32)
+@dataclass
+class PreprocArgs:
+    split: str = "train"            # which split to write (train/test)
+    seed: int = 1337
+    num_workers: int = 16           # used both for scanning and for writer workers
+    # presampling
+    num_triplets: int = 1_568_000   # default: 98k * 16
+    max_frame_window: Optional[int] = None  # if None, use cfg.dataset.stereo4d.max_frame_window
+    # writing
+    shard_size_gb: float = 4.0      # rotate at ~4GB per shard
+    samples_per_shard: int = 20000  # safety limit
+    image_format: str = "jpg"       # jpg|npy
+    jpeg_quality: int = 95
+    # debug / verify
+    debug: bool = False
+    debug_num_triplets: int = 256
+    verify: bool = False
+    verify_max_samples: int = 32
+    verify_workers: int = 16          # <--- parallel verify pool size
+    # indexing
+    make_dali_index: bool = True
+    wds_pattern: Optional[str] = None  # base pattern; workers insert their token before %06d
+    # scanning strategy
+    count_batch_size: int = 2000         # how many seqs to scan per batch
+    count_all_for_csv: bool = False      # if True, scan all for CSV at the very end
+    # housekeeping
+    clean_output: bool = False           # if True, remove old shards/idx before writing
 
+# -----------------------------------------------------------------------------#
+# FS discovery
+# -----------------------------------------------------------------------------#
 
-def _probe_dims_av(path: str | os.PathLike) -> Tuple[int, int] | None:
+def list_sequences(lefteye_split_dir: Path, data_root_split_dir: Path) -> List[Tuple[str, Path, Path]]:
+    """Return list of (seq_id, mp4_path, npz_path)."""
+    mp4s = sorted(lefteye_split_dir.glob("*-left_rectified.mp4"))
+    out = []
+    for mp4 in mp4s:
+        seq = mp4.name.replace("-left_rectified.mp4", "")
+        npz = data_root_split_dir / f"{seq}.npz"
+        if npz.is_file():
+            out.append((seq, mp4, npz))
+    return out
+
+# -----------------------------------------------------------------------------#
+# Frame counting: min(len(mp4), len(tracks)), batched scanning
+# -----------------------------------------------------------------------------#
+
+def _count_frames_one_both(arg: Tuple[str, str, str]) -> Tuple[str, int, int, int, int]:
+    """
+    Returns: (seq, n_min, width, n_mp4, n_npz)
+      - n_min = min(n_mp4, n_npz) if both >0; else max(valid) or -1 if none valid
+      - width is from MP4 (or -1 on failure)
+    """
+    seq, mp4_path, npz_path = arg
+    n_mp4, n_npz, width = -1, -1, -1
+
+    # MP4 length & width via Decord (cheap; uses container index)
     try:
-        import av  # type: ignore
-        with av.open(str(path)) as c:
-            for st in c.streams:
-                if st.type == 'video':
-                    w = int(st.codec_context.width)
-                    h = int(st.codec_context.height)
-                    if w > 0 and h > 0:
-                        return w, h
+        vr = VideoReader(mp4_path, ctx=decord_cpu(0))
+        n_mp4 = len(vr)
+        width = int(vr[0].shape[1])
+        del vr
     except Exception:
-        return None
-    return None
+        pass
 
-
-def _probe_dims_cv(path: str | os.PathLike) -> Tuple[int, int] | None:
+    # Tracks length from NPZ: number of frames in camera2world
     try:
-        cap = cv2.VideoCapture(str(path))
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
-        if w > 0 and h > 0:
-            return w, h
+        with np.load(npz_path, allow_pickle=True) as ann:
+            c2w = ann["camera2world"]
+            n_npz = int(c2w.shape[0])
     except Exception:
-        return None
-    return None
+        pass
+
+    if n_mp4 > 0 and n_npz > 0:
+        n_min = min(n_mp4, n_npz)
+    elif n_mp4 > 0:
+        n_min = n_mp4
+    elif n_npz > 0:
+        n_min = n_npz
+    else:
+        n_min = -1
+
+    return seq, n_min, width, n_mp4, n_npz
+
+def _count_frames_batch(pairs: List[Tuple[str, Path, Path]], max_workers: int
+                        ) -> Dict[str, Tuple[int, int, int, int]]:
+    """
+    Count a batch of sequences in parallel.
+    Returns mapping: seq -> (n_min, width, n_mp4, n_npz)
+    """
+    tasks = [(seq, str(mp4), str(npz)) for (seq, mp4, npz) in pairs]
+    out: Dict[str, Tuple[int, int, int, int]] = {}
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        for seq, n_min, width, n_mp4, n_npz in ex.map(_count_frames_one_both, tasks, chunksize=64):
+            out[seq] = (n_min, width, n_mp4, n_npz)
+    return out
+
+def _enough_triplets(seq_to_counts: Dict[str, Tuple[int, int, int, int]],
+                     max_frame_window: int,
+                     want_triplets: int,
+                     rng: random.Random) -> Tuple[bool, Dict[str, np.ndarray], List[Tuple[str,int,int,int]]]:
+    """
+    Uniformly sample triplets (seq, l, m, r) over the entire population of valid triplets
+    across the provided sequences, with constraint r - l <= max_frame_window.
+    """
+    # Build per-sequence pools of gaps with weights w_d = (n - d) * (d - 1)
+    pools: Dict[str, Dict[str, Any]] = {}
+    seq_names: List[str] = []
+    seq_totals: List[int] = []
+
+    for seq, (n_min, _w, _nm, _nn) in seq_to_counts.items():
+        n = int(n_min)
+        if n < 3:
+            continue
+        D = min(max_frame_window, n - 1)
+        if D < 2:
+            continue
+        ds = np.arange(2, D + 1, dtype=np.int64)
+        w = (n - ds) * (ds - 1)  # number of (l,m,r) with gap d
+        total_d = int(w.sum())
+        if total_d <= 0:
+            continue
+        cum_d = np.cumsum(w, dtype=np.int64).tolist()  # list for bisect
+        pools[seq] = {"n": n, "ds": ds.tolist(), "cum_d": cum_d, "total_d": total_d}
+        seq_names.append(seq)
+        seq_totals.append(total_d)
+
+    if not seq_names:
+        return False, {}, []
+
+    # Global sequence-level weights -> uniform over ALL valid triplets overall
+    seq_cum = np.cumsum(np.asarray(seq_totals, dtype=np.int64)).tolist()
+    global_total = int(seq_cum[-1])
+
+    # If the request exceeds the population, cap to avoid an endless loop
+    if want_triplets > global_total:
+        print(f"[presample] requested {want_triplets} triplets but only {global_total} possible; reducing.")
+        want_triplets = global_total
+
+    seen: set[Tuple[str,int,int,int]] = set()
+    triplets: List[Tuple[str,int,int,int]] = []
+
+    while len(triplets) < want_triplets:
+        # 1) choose a sequence proportional to its number of valid triplets
+        t_seq = rng.randrange(global_total)   # 0..global_total-1
+        si = bisect_left(seq_cum, t_seq + 1)
+        seq = seq_names[si]
+        pool = pools[seq]
+        n = pool["n"]
+
+        # 2) choose a gap d with probability proportional to its weight
+        t_d = rng.randrange(pool["total_d"])
+        di = bisect_left(pool["cum_d"], t_d + 1)
+        d = pool["ds"][di]
+
+        # 3) choose l, then m uniformly
+        #    l in [0, n - d - 1]  (n - d choices), r = l + d, m in (l, r)
+        l = rng.randrange(0, n - d)
+        r = l + d
+        m = rng.randrange(l + 1, r)
+
+        key = (seq, l, m, r)
+        if key in seen:
+            continue
+        seen.add(key)
+        triplets.append(key)
+
+    return True, pools, triplets
 
 
-def _probe_dims_decord(path: str | os.PathLike) -> Tuple[int, int] | None:
-    try:
-        vr = VideoReader(str(path), ctx=_get_decord_ctx())
-        f0 = vr[0]
-        return int(f0.shape[1]), int(f0.shape[0])
-    except Exception:
-        return None
 
 
-def probe_width_height(path: str | os.PathLike) -> Tuple[int, int]:
-    dims = _probe_dims_av(path) or _probe_dims_cv(path) or _probe_dims_decord(path)
-    if dims is None:
-        raise RuntimeError(f"Failed to probe video dimensions: {path}")
-    return dims
+def presample_with_minimal_scans(seqs: List[Tuple[str, Path, Path]],
+                                 pre: PreprocArgs,
+                                 ds_max_window: int,
+                                 rng: random.Random) -> Tuple[
+                                     Dict[str, Tuple[int,int,int,int]],
+                                     Dict[str, np.ndarray],
+                                     List[Tuple[str,int,int,int]]
+                                 ]:
+    """
+    New behavior:
+      1) Randomly pick at most `want` sequence IDs (no replacement).
+      2) Parallel-count ONLY those selected seqs.
+      3) Uniformly sample triplets (same rules as the newer _compute_triplets).
+    """
+    max_window = pre.max_frame_window or int(ds_max_window)
+    want = pre.debug_num_triplets if pre.debug else pre.num_triplets
+
+    # --- CHANGED: select exactly up to `want` seq IDs first
+    shuffled = seqs[:]
+    rng.shuffle(shuffled)
+    selected = shuffled[:min(len(shuffled), want)]
+
+    # parallel-count only the selected seqs
+    seq_to_counts: Dict[str, Tuple[int,int,int,int]] = {}
+    progress = tqdm(total=len(selected), desc="scan selected (batches)", leave=False)
+    for i in range(0, len(selected), pre.count_batch_size):
+        batch = selected[i:i+pre.count_batch_size]
+        batch_counts = _count_frames_batch(batch, pre.num_workers)
+        seq_to_counts.update(batch_counts)
+        progress.update(len(batch))
+    progress.close()
+
+    # --- CHANGED: uniform sampling; pools no longer used
+    ok, pools, triplets = _enough_triplets(seq_to_counts, max_window, want, rng)
+    if not ok:
+        print(f"[presample] WARNING: could not form {want} triplets from {len(selected)} selected sequences; got {len(triplets)}.")
+
+    return seq_to_counts, pools, triplets
 
 
-def _probe_frame_count_cv(path: str | os.PathLike) -> int | None:
-    try:
-        cap = cv2.VideoCapture(str(path))
-        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        if n and n > 0:
-            return n
-    except Exception:
-        return None
-    return None
+# -----------------------------------------------------------------------------#
+# Presampling helpers (triplet sampling)
+# -----------------------------------------------------------------------------#
 
+# -----------------------------------------------------------------------------#
+# Encoding helpers
+# -----------------------------------------------------------------------------#
 
-def _probe_frame_count_av(path: str | os.PathLike) -> int | None:
-    try:
-        import av  # type: ignore
-        with av.open(str(path)) as c:
-            for st in c.streams:
-                if st.type == 'video':
-                    if getattr(st, "frames", None) not in (None, 0):
-                        return int(st.frames)
-                    dur = getattr(st, "duration", None)
-                    tbase = getattr(st, "time_base", None)
-                    rate = getattr(st, "average_rate", None)
-                    if dur is not None and tbase is not None and rate is not None:
-                        seconds = float(dur * tbase)
-                        est = int(seconds * float(rate))
-                        if est > 0:
-                            return est
-    except Exception:
-        return None
-    return None
+def _encode_image(arr: np.ndarray, fmt: str, quality: int) -> bytes:
+    if fmt == "npy":
+        buf = io.BytesIO()
+        np.save(buf, arr)
+        return buf.getvalue()
+    # default: jpg
+    img = Image.fromarray(arr.astype(np.uint8), mode="RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
 
+def _npy_bytes(array: np.ndarray) -> bytes:
+    """Serialize a numpy array to true .npy bytes (with header)."""
+    buf = io.BytesIO()
+    np.save(buf, np.asarray(array))
+    return buf.getvalue()
 
-def _probe_frame_count_decord(path: str | os.PathLike) -> int | None:
-    try:
-        vr = VideoReader(str(path), ctx=_get_decord_ctx())
-        return int(len(vr))
-    except Exception:
-        return None
+def _prepare_sample_bytes(seq: str,
+                          l: int, m: int, r: int,
+                          vr: VideoReader,
+                          ann: Dict[str, Any],
+                          K: np.ndarray,
+                          image_fmt: str, jpeg_quality: int) -> Dict[str, bytes]:
+    # frames
+    frames = [vr[i].asnumpy() for i in (l, m, r)]
+    # world_pc_valid for (l,m,r)
+    pcs_all = _optimized_pcs(ann["track_lengths"], ann["track_indices"], ann["track_coordinates"],
+                             np.asarray([l, m, r], dtype=np.int32))  # (T,3,4)
+    l_pv = pcs_all[:, 0, :].astype(np.float32)
+    m_pv = pcs_all[:, 1, :].astype(np.float32)
+    r_pv = pcs_all[:, 2, :].astype(np.float32)
+    # extrinsics
+    c2w = ann["camera2world"]
+    l_cam = _safe_inv_pose(c2w[l])
+    m_cam = _safe_inv_pose(c2w[m])
+    r_cam = _safe_inv_pose(c2w[r])
 
+    # bytes
+    sample = {
+        "__key__": f"{seq}_{l:05d}_{m:05d}_{r:05d}",
+        "l." + ("jpg" if image_fmt == "jpg" else "npy"): _encode_image(frames[0], image_fmt, jpeg_quality),
+        "m." + ("jpg" if image_fmt == "jpg" else "npy"): _encode_image(frames[1], image_fmt, jpeg_quality),
+        "r." + ("jpg" if image_fmt == "jpg" else "npy"): _encode_image(frames[2], image_fmt, jpeg_quality),
+        "l.pv.npy": _npy_bytes(l_pv.astype(np.float32, copy=False)),
+        "m.pv.npy": _npy_bytes(m_pv.astype(np.float32, copy=False)),
+        "r.pv.npy": _npy_bytes(r_pv.astype(np.float32, copy=False)),
+        "l.cam.npy": _npy_bytes(np.asarray(l_cam, np.float32)),
+        "m.cam.npy": _npy_bytes(np.asarray(m_cam, np.float32)),
+        "r.cam.npy": _npy_bytes(np.asarray(r_cam, np.float32)),
+        "k.npy": _npy_bytes(np.asarray(K, np.float32)),
+        "seq.txt": (seq + "\n").encode("utf-8"),
+    }
+    return sample
 
-def probe_frame_count(path: str | os.PathLike) -> int | None:
-    """Fast frame count probe with minimal overhead and GPU-friendly fallback."""
-    return (
-        _probe_frame_count_cv(path)
-        or _probe_frame_count_av(path)
-        or _probe_frame_count_decord(path)
+# -----------------------------------------------------------------------------#
+# Direct-writer worker (no central queue)
+# -----------------------------------------------------------------------------#
+
+def _pattern_with_token(base_pattern: str, token: str) -> str:
+    """
+    Insert a unique token before %06d to avoid filename collisions across workers.
+    If '%06d' is missing, append '-{token}-%06d' before the file extension.
+    """
+    if "%06d" in base_pattern:
+        return base_pattern.replace("%06d", f"{token}-%06d")
+    # robust fallback
+    p = Path(base_pattern)
+    stem = p.stem
+    return str(p.with_name(f"{stem}-{token}-%06d{p.suffix}"))
+
+def _writer_worker(
+    worker_id: int,
+    assignments: List[Tuple[str, str, str, List[Tuple[int,int,int]]]],  # (seq, mp4_path, npz_path, triplets)
+    out_pattern: str,
+    shard_size_bytes: int,
+    samples_per_shard: int,
+    hfov: float,
+    image_fmt: str,
+    jpeg_quality: int,
+) -> None:
+    """
+    Each worker opens its own ShardWriter with a unique token (w{worker_id:02d})
+    and iterates through its assigned sequences, writing samples directly.
+    """
+    token = f"w{worker_id:02d}"
+    my_pattern = _pattern_with_token(out_pattern, token)
+    out_dir = Path(str(my_pattern)).parent
+    os.makedirs(out_dir, exist_ok=True)
+
+    total_to_write = sum(len(t) for (_seq, _mp4, _npz, t) in assignments)
+    pbar = tqdm(
+        total=total_to_write,
+        desc=f"writer[{token}]",
+        position=worker_id + 1,   # <-- unique line per process
+        leave=True,
+        dynamic_ncols=True,
     )
 
 
-def _cleanup_dir(path: Path):
-    path.mkdir(parents=True, exist_ok=True)
-    # remove indices and summaries
-    (path / "stereo4d-idx.json").unlink(missing_ok=True)
-    (path / "key_to_idx.json").unlink(missing_ok=True)
-    (path / "frame_counts.csv").unlink(missing_ok=True)
-    # remove stray temp/fragment files from previous runs
-    for frag in list(path.glob("frame_counts-*-merged.tmp")):
-        frag.unlink(missing_ok=True)
-    for frag in list(path.glob("frame_counts-*-p*.csv")):
-        frag.unlink(missing_ok=True)
-    # optionally remove existing shards to ensure a clean rerun
-    if CLEAN_SHARDS:
-        for tar in list(path.glob("stereo4d-*.tar")):
-            tar.unlink(missing_ok=True)
-
-
-def discover_sequences(cfg: DictConfig) -> List[str]:
-    if USE_ALL_VIDEOS:
-        root = Path(cfg.dataset.stereo4d.lefteye_dir) / SPLIT
-        mp4s = sorted(root.glob("*-left_rectified.mp4"))
-        tqdm.write(f"discover: scanning {len(mp4s)} videos under {root}")
-        seqs: List[str] = []
-        for mp4_path in tqdm(mp4s, desc="discover (all videos)", total=len(mp4s), dynamic_ncols=True):
-            seq = mp4_path.name[:-len("-left_rectified.mp4")]
-            npz_path = Path(cfg.dataset.stereo4d.path) / SPLIT / f"{seq}.npz"
-            if not npz_path.exists():
-                continue
-            # Fast path: only check presence and minimal size; detailed probing happens in workers
+    # one ShardWriter per worker to accumulate across sequences -> large shards
+    with wds.ShardWriter(my_pattern, maxsize=shard_size_bytes, maxcount=samples_per_shard) as sink:
+        for seq, mp4_path, npz_path, trips in assignments:
             try:
-                if mp4_path.stat().st_size > 0 and npz_path.stat().st_size > 0:
-                    seqs.append(seq)
-            except Exception:
-                continue
-        return sorted(set(seqs))
+                vr = VideoReader(mp4_path, ctx=decord_cpu(0))
+                w = vr[0].shape[1]
+                ann = np.load(npz_path, allow_pickle=True)
+                K = _intrinsic_K(int(w), hfov)
 
-    # CSV-guided
-    meta_csv  = Path(cfg.dataset.stereo4d.meta_dir) / "stereo4d_id_to_time_and_fov_metadata.csv"
-    stats_csv = Path(cfg.dataset.stereo4d.meta_dir) / "stats.csv"
-    meta = pd.read_csv(meta_csv, header=0,
-                       names=["vid","clipid","timestamp","start_yaw","end_yaw","start_tilt","end_tilt"])
-    stats = pd.read_csv(stats_csv, skipinitialspace=True)
-    stats = stats.query("displacement_percentage_50 > 0.10 and d_frame > 5*16")
+                for (l, m, r) in trips:
+                    sample = _prepare_sample_bytes(seq, l, m, r, vr, ann, K,
+                                                   image_fmt=image_fmt, jpeg_quality=jpeg_quality)
+                    key = sample.pop("__key__")
+                    sink.write({"__key__": key, **sample})
+                    pbar.update(1)
+            except Exception as e:
+                logging.exception(f"[writer {token} | seq={seq}] {e}")
+            finally:
+                # ensure NPZ file handle is closed (np.load returns NpzFile if not using context)
+                try:
+                    if 'ann' in locals() and hasattr(ann, 'close'):
+                        ann.close()
+                except Exception:
+                    pass
+    pbar.close()
 
-    def _keep(row) -> bool:
-        vid, cid = row["ytid"], row["clipid"]
-        ts = meta.loc[(meta.vid == vid) & (meta.clipid == cid), "timestamp"]
-        if ts.empty:
-            return False
-        seq = f"{vid}_{int(ts.values[0])}"
-        mp4_path = Path(cfg.dataset.stereo4d.lefteye_dir) / SPLIT / f"{seq}-left_rectified.mp4"
-        npz_path = Path(cfg.dataset.stereo4d.path) / SPLIT / f"{seq}.npz"
-        if not (mp4_path.exists() and npz_path.exists()):
-            return False
-        # Fast presence/size check only; decoding/width probing deferred to writer stage
+# -----------------------------------------------------------------------------#
+# Verification helpers (debug)
+# -----------------------------------------------------------------------------#
+
+def _decode_image(bytes_or_arr: bytes, fmt: str) -> np.ndarray:
+    if fmt == "npy":
+        if isinstance(bytes_or_arr, np.ndarray):
+            return bytes_or_arr
         try:
-            return mp4_path.stat().st_size > 0 and npz_path.stat().st_size > 0
+            return np.load(io.BytesIO(bytes_or_arr), allow_pickle=False)
         except Exception:
-            return False
+            arr = np.frombuffer(bytes_or_arr, dtype=np.uint8)
+            return arr
+    return np.array(Image.open(io.BytesIO(bytes_or_arr)).convert("RGB")).astype(np.uint8)
 
-    mask_vals: List[bool] = []
-    for _, row in tqdm(stats.iterrows(), total=len(stats), desc="discover (csv check)", dynamic_ncols=True):
-        mask_vals.append(_keep(row))
-    exist_mask = pd.Series(mask_vals, index=stats.index)
-    stats = stats[exist_mask]
-    seqs: List[str] = []
-    for _, r in tqdm(stats.iterrows(), total=len(stats), desc="discover (collect)", dynamic_ncols=True):
-        ts = meta.loc[(meta.vid == r["ytid"]) & (meta.clipid == r["clipid"]), "timestamp"]
-        if not ts.empty:
-            seqs.append(f"{r['ytid']}_{int(ts.values[0])}")
-    return sorted(set(seqs))
+def _decode_image_auto(sample: Dict[str, Any], base: str) -> np.ndarray:
+    if f"{base}.npy" in sample:
+        return _decode_image(sample[f"{base}.npy"], "npy")
+    if f"{base}.jpg" in sample:
+        return _decode_image(sample[f"{base}.jpg"], "jpg")
+    for k in sample.keys():
+        if isinstance(k, str) and k.startswith(base + "."):
+            ext = k.rsplit(".", 1)[-1].lower()
+            if ext in ("npy", "jpg", "jpeg"):
+                return _decode_image(sample[k], "npy" if ext == "npy" else "jpg")
+    raise KeyError(f"{base}.(npy|jpg)")
+
+def _get_sample_field(sample: Dict[str, Any], key: str) -> Any:
+    if key in sample:
+        return sample[key]
+    if "." in key:
+        base = key.split(".", 1)[0]
+        if base in sample:
+            return sample[base]
+        for k in sample.keys():
+            if isinstance(k, str) and k.startswith(base + "."):
+                return sample[k]
+    raise KeyError(key)
+
+def _as_array(val: Any, dtype: np.dtype, shape: Optional[Tuple[int, ...]] = None) -> np.ndarray:
+    if isinstance(val, np.ndarray):
+        arr = val
+    else:
+        buf = bytes(val)
+        if len(buf) >= 6 and buf[:6] == b"\x93NUMPY":
+            arr = np.load(io.BytesIO(buf), allow_pickle=False)
+        else:
+            arr = np.frombuffer(buf, dtype=dtype)
+    if dtype is not None and arr.dtype != dtype:
+        arr = arr.astype(dtype, copy=False)
+    if shape is not None:
+        arr = arr.reshape(shape)
+    return arr
 
 
-def _open_vr_from_blob(vbytes: bytes):
-    if len(vbytes) > SPILL_THRESHOLD_BYTES:
-        tf = tempfile.NamedTemporaryFile(suffix=".mp4", delete=True)
-        tf.write(vbytes)
-        tf.flush()
-        try:
-            vr = VideoReader(tf.name, ctx=_get_decord_ctx())
-        except Exception:
-            vr = VideoReader(tf.name, ctx=decord_cpu(0))
-        vr._tmpfile = tf
-        return vr
+def _verify_worker_ordered(
+    worker_id: int,
+    assignments: List[Tuple[str, str, str, List[Tuple[int,int,int]]]],  # (seq, mp4_path, npz_path, triplets)
+    out_pattern: str,
+    split_dirs: Tuple[Path, Path],
+    hfov: float,
+    image_fmt: str,
+    per_worker_limit: Optional[int] = None,
+    mse_tol: float = 2.0,
+    atol: float = 1e-5,
+) -> Tuple[int, int, int, int, int, int]:
+    """
+    Verify that this worker's shards contain exactly the samples implied by `assignments`,
+    in the SAME ORDER they would have been written (seq-by-seq, triplet-by-triplet).
+
+    Returns: (total_expected, total_read, passed_content, order_mismatch, wrong_shard, exceptions)
+    """
+    import webdataset as wds
+
+    token = f"w{worker_id:02d}"
+    my_pattern = _pattern_with_token(out_pattern, token)
+    shard_glob = Path(str(my_pattern)).name.replace("%06d", "*")
+    shard_paths = sorted(Path(str(my_pattern)).parent.glob(shard_glob))
+
+    # Build expected stream for this worker
+    expected: List[Tuple[str,int,int,int]] = []
+    seq_to_paths: Dict[str, Tuple[str, str]] = {}
+    for seq, mp4_path, npz_path, trips in assignments:
+        seq_to_paths[seq] = (mp4_path, npz_path)
+        expected.extend([(seq, l, m, r) for (l, m, r) in trips])
+
+    total_expected = len(expected)
+    if per_worker_limit is not None:
+        total_expected = min(total_expected, per_worker_limit)
+        expected = expected[:per_worker_limit]
+
+    # No shards for this worker token -> everything is missing
+    if not shard_paths:
+        print(f"[verify {token}] no shards found matching {shard_glob}; expected {len(expected)} samples.")
+        return (len(expected), 0, 0, len(expected), len(expected), 0)
+
+    # Stream this worker's shards in order (no shuffling)
+    urls = [str(p) for p in shard_paths]
+    ds = wds.WebDataset(urls, shardshuffle=False)
+
+    # stats & progress
+    passed_content = 0
+    order_mismatch = 0
+    wrong_shard = 0
+    exceptions = 0
+    total_read = 0
+
+    pbar = tqdm(
+        total=total_expected,
+        desc=f"verify[{token}]",
+        position=worker_id + 1,
+        leave=True,
+        dynamic_ncols=True,
+    )
+
+    it = iter(ds)
+    extra = 0
     try:
-        return VideoReader(io.BytesIO(vbytes), ctx=_get_decord_ctx())
-    except Exception:
-        return VideoReader(io.BytesIO(vbytes), ctx=decord_cpu(0))
-
-
-# ----------------------------------------------------------------------------
-# Writing workers
-# ----------------------------------------------------------------------------
-def _process_chunk(args) -> int:
-    seqs, cfg_dict, out_dir_str, jobid, worker_id, progress_queue = args
-    # lightweight DictConfig passthrough
-    class _Cfg:
-        pass
-    cfg = _Cfg()
-    cfg.dataset = _Cfg()
-    cfg.dataset.stereo4d = _Cfg()
-    for k, v in cfg_dict.items():
-        setattr(cfg.dataset.stereo4d, k, v)
-
-    out_dir = Path(out_dir_str)
-    pid = os.getpid()
-    pattern = out_dir / f"stereo4d-{jobid}-p{pid}-%06d.tar"
-    writer = None
-    total_written = 0
-
-    # per-process progress bar
-    pbar = tqdm(total=len(seqs), desc=f"worker-{worker_id}", position=worker_id+1,
-                leave=False, dynamic_ncols=True)
-
-    # per-process frame count CSV
-    frame_csv_path = out_dir / f"frame_counts-{jobid}-p{pid}.csv"
-    try:
-        frame_csv_fh = open(frame_csv_path, "w")
-    except Exception:
-        frame_csv_fh = None
-
-    try:
-        for seq in seqs:
+        for i, (seq_exp, l, m, r) in enumerate(expected):
             try:
-                mp4 = Path(cfg.dataset.stereo4d.lefteye_dir) / SPLIT / f"{seq}-left_rectified.mp4"
-                npz = Path(cfg.dataset.stereo4d.path) / SPLIT / f"{seq}.npz"
-                if not (mp4.is_file() and npz.is_file()):
+                sample = next(it)
+            except StopIteration:
+                # ran out of samples before fulfilling expected stream
+                order_mismatch += (len(expected) - i)
+                break
+
+            total_read += 1
+            key = sample["__key__"]
+            exp_key = f"{seq_exp}_{l:05d}_{m:05d}_{r:05d}"
+
+            # 1) Order check (strict)
+            if key != exp_key:
+                order_mismatch += 1
+                # also check if this sample even belongs to this worker's assignments
+                try:
+                    seq_chk, ls, ms, rs = key.rsplit("_", 3)
+                    l_use, m_use, r_use = int(ls), int(ms), int(rs)
+                except Exception:
+                    # couldn't parse the key at all
+                    exceptions += 1
+                    pbar.update(1)
                     continue
+                if seq_chk not in seq_to_paths:
+                    wrong_shard += 1
+                seq_for_content = seq_chk
+            else:
+                # ordered; verify the expected (seq_exp,l,m,r)
+                seq_for_content = seq_exp
+                l_use, m_use, r_use = l, m, r
 
-                w, _h = probe_width_height(mp4)
-                # Fast frame count probe (no decode)
-                n_frames = probe_frame_count(mp4)
-                if n_frames is None or n_frames <= 0:
-                    with contextlib.suppress(Exception):
-                        ann_np = np.load(npz, allow_pickle=True)
-                        if "camera2world" in ann_np:
-                            n_frames = int(ann_np["camera2world"].shape[0])
-                        elif "track_indices" in ann_np:
-                            n_frames = int(ann_np["track_indices"].max()) + 1
-                K = intrinsic_K(int(w), cfg.dataset.stereo4d.hfov)
+            # 2) Content check against ground truth (no caching; open per-sample)
+            try:
+                mp4_path, npz_path = seq_to_paths[seq_for_content]
 
-                with open(mp4, "rb") as f:
-                    video_data = f.read()
-                with open(npz, "rb") as f:
-                    ann_data = f.read()
+                # decode images from wds sample
+                a_l = _decode_image_auto(sample, "l")
+                a_m = _decode_image_auto(sample, "m")
+                a_r = _decode_image_auto(sample, "r")
 
-                if len(video_data) == 0 or len(ann_data) == 0:
-                    continue
+                # open ground-truth video and grab frames
+                vr = VideoReader(mp4_path, ctx=decord_cpu(0))
+                try:
+                    f_l = vr[l_use].asnumpy()
+                    f_m = vr[m_use].asnumpy()
+                    f_r = vr[r_use].asnumpy()
+                finally:
+                    # ensure decoder resources are freed promptly
+                    del vr
 
-                buf = io.BytesIO()
-                np.save(buf, K.astype(np.float32))
-                intr_bytes = buf.getvalue()
-                if len(intr_bytes) == 0:
-                    continue
+                # compute K from the decoded frame width
+                width = int(f_l.shape[1])
+                K = _intrinsic_K(width, hfov)
 
-                sample = {
-                    "__key__": seq,
-                    "video.mp4": video_data,
-                    "ann.npz": ann_data,
-                    "intr.npy": intr_bytes,
-                }
+                # open annotations just for this sample
+                with np.load(npz_path, allow_pickle=True) as ann:
+                    pcs_all = _optimized_pcs(
+                        ann["track_lengths"], ann["track_indices"], ann["track_coordinates"],
+                        np.asarray([l_use, m_use, r_use], dtype=np.int32)
+                    )
+                    c2w = ann["camera2world"]
+                    cams = [_safe_inv_pose(c2w[idx]) for idx in (l_use, m_use, r_use)]
 
-                if writer is None:
-                    writer = wds.ShardWriter(str(pattern), maxcount=MAX_SAMPLES_PER_SHARD, maxsize=MAX_SHARD_SIZE_GB*1e9)
+                # from sample
+                v_l = _as_array(_get_sample_field(sample, "l.pv.npy"), np.float32, (-1, 4))
+                v_m = _as_array(_get_sample_field(sample, "m.pv.npy"), np.float32, (-1, 4))
+                v_r = _as_array(_get_sample_field(sample, "r.pv.npy"), np.float32, (-1, 4))
+                k_key = "K.npy" if ("K.npy" in sample) else ("k.npy" if ("k.npy" in sample) else "K.npy")
+                k_w = _as_array(_get_sample_field(sample, k_key), np.float32, (3, 3))
+                c_l = _as_array(_get_sample_field(sample, "l.cam.npy"), np.float32, (4, 4))
 
-                writer.write(sample)
-                total_written += 1
+                # basic presence checks
+                img_ext = "npy" if image_fmt == "npy" else "jpg"
+                need_keys = [
+                    f"l.{img_ext}", f"m.{img_ext}", f"r.{img_ext}",
+                    "l.pv.npy", "m.pv.npy", "r.pv.npy",
+                    "l.cam.npy", "m.cam.npy", "r.cam.npy",
+                    "k.npy", "seq.txt",
+                ]
+                missing = [k for k in need_keys if k not in sample]
+                if missing:
+                    raise KeyError(f"missing keys: {missing}")
 
-                if CLOSE_EACH_SAMPLE and writer is not None:
-                    writer.close(); writer = None
+                # checks
+                img_ok = (
+                    a_l.shape == f_l.shape and a_m.shape == f_m.shape and a_r.shape == f_r.shape and
+                    float(np.mean(np.abs(a_l.astype(np.int16) - f_l.astype(np.int16)))) < mse_tol and
+                    float(np.mean(np.abs(a_m.astype(np.int16) - f_m.astype(np.int16)))) < mse_tol and
+                    float(np.mean(np.abs(a_r.astype(np.int16) - f_r.astype(np.int16)))) < mse_tol
+                )
+                pcs_ok = (
+                    np.allclose(v_l, pcs_all[:, 0, :], atol=atol, equal_nan=True) and
+                    np.allclose(v_m, pcs_all[:, 1, :], atol=atol, equal_nan=True) and
+                    np.allclose(v_r, pcs_all[:, 2, :], atol=atol, equal_nan=True)
+                )
+                K_ok = np.allclose(k_w, K, atol=atol)
+                cam_ok = np.allclose(c_l, cams[0], atol=atol)
+                seqtxt_ok = (bytes(sample["seq.txt"]).decode("utf-8", errors="ignore").strip() == seq_for_content)
 
-                # Write frame count row
-                if frame_csv_fh is not None:
-                    with contextlib.suppress(Exception):
-                        frame_csv_fh.write(f"{seq},{int(n_frames) if n_frames else -1},{int(w)},{int(_h)}\n")
+                if img_ok and pcs_ok and K_ok and cam_ok and seqtxt_ok:
+                    passed_content += 1
+                else:
+                    # compact diagnostics
+                    if not img_ok:
+                        ml = float(np.mean(np.abs(a_l.astype(np.int16) - f_l.astype(np.int16))))
+                        mm = float(np.mean(np.abs(a_m.astype(np.int16) - f_m.astype(np.int16))))
+                        mr = float(np.mean(np.abs(a_r.astype(np.int16) - f_r.astype(np.int16))))
+                        print(f"[verify {token}] image mismatch {key} | l={ml:.2f} m={mm:.2f} r={mr:.2f}")
+                    if not pcs_ok:
+                        print(f"[verify {token}] pcs mismatch {key}")
+                    if not K_ok:
+                        print(f"[verify {token}] K mismatch {key}")
+                    if not cam_ok:
+                        print(f"[verify {token}] cam mismatch {key}")
+                    if not seqtxt_ok:
+                        print(f"[verify {token}] seq.txt mismatch {key}")
 
             except Exception as e:
-                tqdm.write(f"[WORKER-ERROR] {seq}: {type(e).__name__}: {e}")
-                continue
-            finally:
-                # advance both per-worker and global progress
-                with contextlib.suppress(Exception):
-                    pbar.update(1)
-                with contextlib.suppress(Exception):
-                    progress_queue.put(1)
+                exceptions += 1
+                try:
+                    present = sorted([k for k in sample.keys() if isinstance(k, str)])
+                except Exception:
+                    present = []
+                print(f"[verify {token}] exception on {key}: {e} | present_keys={present}")
+
+            pbar.update(1)
+
+        # If there are more samples in shards than expected, consume one to count “extra”
+        try:
+            next(it)
+            # if we get here, at least one extra sample exists
+            extra = 1
+            for _ in it:
+                extra += 1
+        except StopIteration:
+            pass
+
     finally:
-        if writer is not None:
-            with contextlib.suppress(Exception):
-                writer.close()
-        if 'frame_csv_fh' in locals() and frame_csv_fh is not None:
-            with contextlib.suppress(Exception):
-                frame_csv_fh.close()
-        with contextlib.suppress(Exception):
-            pbar.close()
+        pbar.close()
 
-    return total_written
+    # Missing = expected but not read (due to early StopIteration or limit)
+    missing = max(0, len(expected) - total_read)
+    if extra:
+        print(f"[verify {token}] WARNING: found {extra} extra samples beyond expected stream")
+
+    return (len(expected), total_read, passed_content, order_mismatch, wrong_shard, exceptions)
 
 
-# ----------------------------------------------------------------------------
-# Indexing & verify
-# ----------------------------------------------------------------------------
-def build_index_and_map(out_dir: Path) -> Tuple[str, dict]:
-    idx_json = out_dir / "stereo4d-idx.json"
-    shard_glob = str(out_dir / "stereo4d-*.tar")
-    if idx_json.exists():
-        idx_json.unlink()
-    os.system(f"widsindex create {shard_glob} -o {idx_json}")
-
-    import wids
-    idx_ds = wids.ShardListDataset(str(idx_json), transformations=[])
-    with open(idx_json) as f:
-        desc = json.load(f)
-    entries = desc.get("samples") or desc.get("entries") or []
-    if entries:
-        key_to_idx = {e.get("key") or e.get("name"): e["index"] for e in tqdm(entries)}
-    else:
-        key_to_idx = {idx_ds[i]["__key__"]: i for i in tqdm(range(len(idx_ds)))}
-    with open(out_dir / "key_to_idx.json", "w") as f:
-        json.dump(key_to_idx, f)
-    return str(idx_json), key_to_idx
-
-
-def _merge_frame_count_csvs(out_dir: Path, jobid: int) -> Path:
-    """Merge per-process frame count CSV fragments into a single CSV with header.
-
-    Returns the final CSV path.
+def _verify_worker_ordered_entry(args):
     """
-    final_csv = out_dir / "frame_counts.csv"
-    tmp_csv = out_dir / f"frame_counts-{jobid}-merged.tmp"
-
-    frags = sorted(out_dir.glob(f"frame_counts-{jobid}-p*.csv"))
-    # Always write header
-    with open(tmp_csv, "w") as out_f:
-        out_f.write("seq,d_frame,width,height\n")
-        for frag in frags:
-            try:
-                with open(frag, "r") as in_f:
-                    shutil.copyfileobj(in_f, out_f)
-            except Exception:
-                continue
-
-    # Atomic finalize
-    tmp_csv.replace(final_csv)
-
-    # Clean up fragments
-    for frag in frags:
-        frag.unlink(missing_ok=True)
-
-    return final_csv
-
-
-def quick_benchmark(cfg: DictConfig, keys: List[str], key_to_idx: dict, idx_json: str):
-    import wids
-    idx_ds = wids.ShardListDataset(idx_json, transformations=[])
-    pairs = keys
-    t0 = time.perf_counter()
-    for s in pairs:
-        _ = idx_ds[key_to_idx[s]]
-    t_fast = (time.perf_counter() - t0) / max(len(pairs), 1)
-
-    t0 = time.perf_counter()
-    for s in pairs:
-        open(Path(cfg.dataset.stereo4d.lefteye_dir) / SPLIT / f"{s}-left_rectified.mp4", "rb").read(1)
-    t_naive = (time.perf_counter() - t0) / max(len(pairs), 1)
-    tqdm.write(f"avg webdataset seek={t_fast*1e3:.1f} ms  disk open={t_naive*1e3:.1f} ms")
-
-
-def verify_samples(idx_json: str, key_to_idx: dict, verify_n: int):
-    if verify_n <= 0:
-        return
-    import wids
-    idx_ds = wids.ShardListDataset(idx_json, transformations=[])
-    bad: List[Tuple[str, str]] = []
-    keys = list(key_to_idx.keys())[:verify_n]
-    for s in tqdm(keys, desc="verify"):
-        try:
-            sample = idx_ds[key_to_idx[s]]
-        except Exception as e:
-            bad.append((s, f"tar read: {e}")); continue
-        try:
-            vdat = sample.get(".video.mp4")
-            if vdat is None: bad.append((s, f"missing .video.mp4 key, has: {list(sample.keys())}")); continue
-            vbytes = vdat.read() if hasattr(vdat, "read") else vdat
-            if len(vbytes) == 0: bad.append((s, "video empty")); continue
-            vr = _open_vr_from_blob(vbytes); _ = vr[0]
-        except Exception as e:
-            bad.append((s, f"video decode: {type(e).__name__}: {e}"))
-        try:
-            import numpy as _np
-            _np.load(sample[".ann.npz"], allow_pickle=True)
-        except Exception as e:
-            bad.append((s, f"ann npz: {e}"))
-        try:
-            import numpy as _np
-            _np.load(sample[".intr.npy"], allow_pickle=True)
-        except Exception as e:
-            bad.append((s, f"intr npy: {e}"))
-    if bad:
-        tqdm.write(f"\n{len(bad)} / {len(keys)} sequences failed verification:")
-        for seq, msg in bad:
-            tqdm.write(f"  {seq}: {msg}")
-    else:
-        tqdm.write("\nverification passed ✔︎")
-
-
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
-@hydra.main(version_base=None, config_path="../config", config_name="config")
-def main(cfg: DictConfig):
-    _apply_env_overrides()
-
-    # set WIDS cache from config if provided; fallback to scratch tmp
-    os.environ.setdefault("TMPDIR", "/scratch/km6748/tmp")
-    os.environ.setdefault("TMP",    "/scratch/km6748/tmp")
-    os.environ.setdefault("TEMP",   "/scratch/km6748/tmp")
-    cache_dir = str(getattr(cfg.dataset.stereo4d, "cache", os.path.join(os.environ.get("TMP", "/tmp"), "_wids_cache")))
-    os.environ.setdefault("WIDS_CACHE", cache_dir)
-    Path(os.environ["WIDS_CACHE"]).mkdir(parents=True, exist_ok=True)
-
-    out_dir = Path(cfg.dataset.stereo4d.wds_dir) / SPLIT
-    _cleanup_dir(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"SPLIT={SPLIT}")
-    print(f"USE_ALL_VIDEOS={USE_ALL_VIDEOS}")
-    print(f"WRITE_MODE={WRITE_MODE}")
-    print(f"NUM_WORKERS={NUM_WORKERS}")
-    print(f"TEST_N={TEST_N}")
-    print(f"VERIFY_N={VERIFY_N}")
-    print(f"MAX_SHARD_SIZE_GB={MAX_SHARD_SIZE_GB}")
-    print(f"MAX_SAMPLES_PER_SHARD={MAX_SAMPLES_PER_SHARD}")
-
-    seqs = discover_sequences(cfg)
-    if TEST_N is not None:
-        import random
-        random.seed(0)
-        seqs = random.sample(seqs, min(TEST_N, len(seqs)))
-    tqdm.write(f"processing {len(seqs)} sequences → {out_dir}")
-
-    # partition into chunks per worker
-    if len(seqs) == 0:
-        tqdm.write("no sequences found; exiting")
-        return
-    chunks: List[List[str]] = []
-    for i in range(NUM_WORKERS):
-        chunks.append([])
-    for j, s in enumerate(seqs):
-        chunks[j % NUM_WORKERS].append(s)
-    chunks = [c for c in chunks if c]
-
-    # thin cfg dict for workers (avoid pickling Hydra objects)
-    cfg_dict = dict(
-        path=str(cfg.dataset.stereo4d.path),
-        lefteye_dir=str(cfg.dataset.stereo4d.lefteye_dir),
-        meta_dir=str(cfg.dataset.stereo4d.meta_dir),
-        hfov=float(cfg.dataset.stereo4d.hfov),
+    Thin wrapper around _verify_worker_ordered so ProcessPoolExecutor/joblib
+    can pickle the callable. 'args' is a tuple of the arguments.
+    """
+    (worker_id, assignments, out_pattern, split_dirs, hfov, image_fmt, cap) = args
+    return _verify_worker_ordered(
+        worker_id=worker_id,
+        assignments=assignments,
+        out_pattern=out_pattern,
+        split_dirs=split_dirs,
+        hfov=hfov,
+        image_fmt=image_fmt,
+        per_worker_limit=cap,
     )
 
-    jobid = int(time.time())
 
-    if WRITE_MODE == "per_process":
-        manager = mp.Manager()
-        progress_queue = manager.Queue()
-        total_items = sum(len(c) for c in chunks)
-        with Pool(processes=len(chunks)) as pool:
-            tasks = []
-            for worker_id, c in enumerate(chunks):
-                tasks.append(pool.apply_async(_process_chunk, [(c, cfg_dict, str(out_dir), jobid, worker_id, progress_queue)]))
+def verify_shards_by_buckets(
+    buckets: List[List[Tuple[str, str, str, List[Tuple[int,int,int]]]]],
+    out_pattern: str,
+    split_dirs: Tuple[Path, Path],
+    hfov: float,
+    image_fmt: str,
+    verify_max_samples: Optional[int] = None,
+) -> None:
+    """
+    Launch one verifier process per worker token (w00, w01, ...), mirroring the writer structure.
+    Uses ProcessPoolExecutor with a top-level entry to avoid pickling errors on loky/spawn.
+    """
+    # Distribute a per-worker cap if a global cap is requested
+    grand_total = sum(sum(len(t) for (_s, _m, _n, t) in b) for b in buckets)
+    per_worker_caps: List[Optional[int]] = []
+    for b in buckets:
+        w_total = sum(len(t) for (_s, _m, _n, t) in b)
+        if verify_max_samples is None or verify_max_samples <= 0 or grand_total == 0:
+            per_worker_caps.append(None)
+        else:
+            cap = int(round(verify_max_samples * (w_total / grand_total)))
+            per_worker_caps.append(max(1, cap) if w_total > 0 else 0)
 
-            overall = tqdm(total=total_items, desc="overall", position=0, dynamic_ncols=True)
-            finished = 0
-            while finished < len(tasks):
+    # Build argument tuples (all picklable)
+    args_list = []
+    for wid, assignments in enumerate(buckets):
+        if not assignments:
+            continue
+        args_list.append(
+            (
+                wid,
+                assignments,
+                out_pattern,
+                (split_dirs[0], split_dirs[1]),
+                float(hfov),
+                image_fmt,
+                per_worker_caps[wid],
+            )
+        )
+
+    # Fan out
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import os
+    agg = {"expected": 0, "read": 0, "passed": 0, "order": 0, "wrong_shard": 0, "exceptions": 0}
+    if not args_list:
+        print("[verify summary] nothing to verify")
+        return
+
+    max_workers = min(len(args_list), os.cpu_count() or 1) // 2
+    ctx = mp.get_context('spawn')
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+        futures = [ex.submit(_verify_worker_ordered_entry, args) for args in args_list]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="verifiers", dynamic_ncols=True):
+            try:
+                expd, read, passed, order, wrong, exc = fut.result()
+                agg["expected"] += expd
+                agg["read"] += read
+                agg["passed"] += passed
+                agg["order"] += order
+                agg["wrong_shard"] += wrong
+                agg["exceptions"] += exc
+            except Exception as e:
+                print(f"[verify] worker raised: {e}")
+                agg["exceptions"] += 1
+
+    print(
+        "[verify summary] "
+        f"expected={agg['expected']} read={agg['read']} "
+        f"content_passed={agg['passed']} order_mismatch={agg['order']} "
+        f"wrong_shard={agg['wrong_shard']} exceptions={agg['exceptions']}"
+    )
+
+
+# -----------------------------------------------------------------------------#
+# DALI index generation
+# -----------------------------------------------------------------------------#
+
+def run_wds2idx_for_dir(out_pattern: str, max_workers: int = 8) -> None:
+    """Run DALI's wds2idx over all shards matching the pattern (parent process)."""
+    out_dir = Path(str(out_pattern)).parent
+    pattern_name = Path(str(out_pattern)).name.replace("%06d", "*")
+    tars = sorted(out_dir.glob(pattern_name))
+    if not tars:
+        return
+    if shutil.which("wds2idx") is None:
+        logging.info("wds2idx not found in PATH; skipping DALI index generation.")
+        return
+    with ProcessPoolExecutor(max_workers=min(max_workers, len(tars))) as ex:
+        list(tqdm(ex.map(_make_dali_idx, tars), total=len(tars), desc="wds2idx"))
+
+def _make_dali_idx(tar_path: Path) -> None:
+    idx_path = tar_path.with_suffix(".idx")
+    try:
+        subprocess.run(["wds2idx", str(tar_path), str(idx_path)],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        logging.error("wds2idx not found in PATH. Install NVIDIA DALI and ensure wds2idx is available.")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"wds2idx failed for {tar_path}:\n{e.stderr.decode('utf-8', errors='ignore')}")
+
+# -----------------------------------------------------------------------------#
+# Work partitioning for direct writers
+# -----------------------------------------------------------------------------#
+
+def _partition_sequences_for_workers(
+    by_seq: Dict[str, List[Tuple[int,int,int]]],
+    path_map: Dict[str, Tuple[str,str]],
+    num_workers: int
+) -> List[List[Tuple[str, str, str, List[Tuple[int,int,int]]]]]:
+    """
+    Greedy bin-packing by triplet count: sort sequences by descending triplet
+    count and assign to the worker with the smallest current load.
+    Returns: list of length num_workers; each element is a list of
+      (seq, mp4_path, npz_path, triplets_for_seq)
+    """
+    num_workers = max(1, num_workers)
+    buckets: List[List[Tuple[str, str, str, List[Tuple[int,int,int]]]]] = [[] for _ in range(num_workers)]
+    loads = [0 for _ in range(num_workers)]
+
+    items = [(seq, trips, len(trips)) for seq, trips in by_seq.items()]
+    items.sort(key=lambda x: x[2], reverse=True)
+    for seq, trips, n in items:
+        wid = loads.index(min(loads))
+        mp4_path, npz_path = path_map[seq]
+        buckets[wid].append((seq, mp4_path, npz_path, trips))
+        loads[wid] += n
+    return buckets
+
+# -----------------------------------------------------------------------------#
+# Main
+# -----------------------------------------------------------------------------#
+
+@hydra.main(version_base=None, config_path="../config", config_name="config")
+def main(cfg: DictConfig):
+    """
+    Uses the same Hydra tree as your training config:
+      cfg.dataset.stereo4d.{name,path,wds_dir,cache,lefteye_dir,train_split,valid_split,max_frame_window,hfov,pm_source}
+    """
+    # Resolve preprocessing args (we keep them under cfg.preproc.* to avoid clashing)
+    pre: PreprocArgs = PreprocArgs()
+    if "preproc" in cfg:
+        pre = OmegaConf.merge(pre, cfg.preproc)  # allow overrides
+    # split selection
+    split = pre.split or cfg.dataset.stereo4d.train_split
+    # folders
+    ds = cfg.dataset.stereo4d
+    lefteye_split_dir = Path(ds.lefteye_dir) / split
+    npz_split_dir = Path(ds.path) / split
+    # WIDS cache + tmp
+    os.environ.setdefault("WIDS_CACHE", str(Path(ds.cache)))
+    os.environ.setdefault("TMPDIR", str(Path(ds.cache)))
+    os.environ.setdefault("TMP", str(Path(ds.cache)))
+    os.environ.setdefault("TEMP", str(Path(ds.cache)))
+    Path(os.environ["WIDS_CACHE"]).mkdir(parents=True, exist_ok=True)
+
+    # output WDS dir
+    ds_wds_dir = getattr(ds, "wds_dir", None)
+    wds_dir = Path(ds_wds_dir) if (ds_wds_dir and ds_wds_dir not in ("???",)) else (Path(ds.path) / "wds" / split)
+    wds_dir.mkdir(parents=True, exist_ok=True)
+    out_pattern = str(pre.wds_pattern or (wds_dir / "stereo4d-%06d.tar"))
+
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s)")
+
+    print("== Stereo4D -> WebDataset Preprocessor (direct writers) ==")
+    print(f"split                 : {split}")
+    print(f"lefteye mp4 dir       : {lefteye_split_dir}")
+    print(f"tracks npz dir        : {npz_split_dir}")
+    print(f"out shards (base)     : {out_pattern}")
+    print(f"num_workers (writers) : {pre.num_workers}")
+    print(f"num_triplets          : {pre.debug_num_triplets if pre.debug else pre.num_triplets}")
+    print(f"image_format          : {pre.image_format} (jpeg_quality={pre.jpeg_quality})")
+    print(f"make_dali_index       : {pre.make_dali_index}")
+    print(f"WIDS_CACHE            : {os.environ.get('WIDS_CACHE')}")
+
+    # 0) Optional cleanup of existing shards/idx
+    if pre.clean_output:
+        out_dir = Path(str(out_pattern)).parent.resolve()
+
+        if not out_dir.exists():
+            print(f"[cleanup] nothing to delete (missing dir): {out_dir}")
+        else:
+            # ---- safety rails: refuse obviously dangerous deletes
+            if out_dir == Path("/") or len(out_dir.parts) < 3:
+                raise RuntimeError(f"Refusing to delete suspicious directory: {out_dir}")
+
+            print(f"[cleanup] removing entire directory recursively: {out_dir}")
+            try:
+                shutil.rmtree(out_dir)
+            except Exception as e:
+                logging.warning(f"Failed to remove {out_dir}: {e}")
+            else:
+                # recreate the directory so writers have a target
                 try:
-                    n = progress_queue.get(timeout=0.1)
-                    overall.update(n)
-                except queue.Empty:
-                    pass
-                finished = sum(1 for t in tasks if t.ready())
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    logging.error(f"Failed to recreate {out_dir}: {e}")
+                    raise
 
-            # Drain any remaining updates
-            while True:
-                try:
-                    n = progress_queue.get_nowait()
-                    overall.update(n)
-                except queue.Empty:
-                    break
-            with contextlib.suppress(Exception):
-                overall.close()
 
-            written_counts = [t.get() for t in tasks]
-    else:
-        # single_writer mode: fallback to serial write with a single per-process bar
-        # Local queue to keep signature compatibility
-        _local_q = mp.Queue()
-        written_counts = [_process_chunk((seqs, cfg_dict, str(out_dir), jobid, 0, _local_q))]
+    # 1) Discover sequences
+    seqs = list_sequences(lefteye_split_dir, npz_split_dir)
+    if not seqs:
+        print("No sequences discovered. Check paths.")
+        sys.exit(1)
+    print(f"discovered sequences  : {len(seqs)}")
 
-    total_written = int(sum(written_counts))
-    tqdm.write(f"wrote {total_written:,} sequence-level samples")
+    # 2–3) Iteratively scan in small batches until we can presample enough triplets.
+    rng = random.Random(int(pre.seed))
+    seq_to_counts, pools, triplets = presample_with_minimal_scans(
+        seqs, pre, int(ds.max_frame_window), rng
+    )
 
-    # index & keymap
-    idx_json, key_to_idx = build_index_and_map(out_dir)
-    tqdm.write(f"Indexed shards → {idx_json}")
+    # 4) Group triplets by sequence (to open mp4/npz once per sequence)
+    by_seq: Dict[str, List[Tuple[int,int,int]]] = {}
+    for seq, l, m, r in triplets:
+        by_seq.setdefault(seq, []).append((l, m, r))
 
-    # merge per-process frame count CSVs
-    final_fc = _merge_frame_count_csvs(out_dir, jobid)
-    tqdm.write(f"Frame counts → {final_fc}")
+    # 5) Partition sequences across writer workers and launch them
+    maxsize_bytes = int(pre.shard_size_gb * (1024**3))
+    path_map: Dict[str, Tuple[str,str]] = {seq: (str(mp4), str(npz)) for (seq, mp4, npz) in seqs}
+    buckets = _partition_sequences_for_workers(by_seq, path_map, max(1, pre.num_workers))
 
-    # quick benchmark & optional verify
-    keys = list(key_to_idx.keys())
-    keys_small = keys[: min(VERIFY_N, len(keys))] if VERIFY_N and VERIFY_N > 0 else keys[: min(32, len(keys))]
-    if len(keys_small) > 0:
-        quick_benchmark(cfg, keys_small, key_to_idx, idx_json)
-    if VERIFY_N and VERIFY_N > 0:
-        verify_samples(idx_json, key_to_idx, VERIFY_N)
+    procs: List[Process] = []
+    for wid, assignments in enumerate(buckets):
+        if not assignments:
+            continue
+        p = Process(
+            target=_writer_worker,
+            args=(wid, assignments, out_pattern, maxsize_bytes, pre.samples_per_shard,
+                  float(ds.hfov), pre.image_format, pre.jpeg_quality),
+            daemon=True
+        )
+        procs.append(p)
+        p.start()
+
+    # Join writer workers
+    for p in tqdm(procs, desc="writers", position=0, leave=True, dynamic_ncols=True):
+        p.join()
+
+    # Collect shard paths once writing is complete
+    shard_glob = Path(out_pattern).name.replace("%06d", "*")
+    shard_paths = sorted(Path(out_pattern).parent.glob(shard_glob))
+
+    # 6) Ordered, per-worker verification against assignments
+    if pre.verify:
+        verify_shards_by_buckets(
+            buckets=buckets,
+            out_pattern=out_pattern,
+            split_dirs=(lefteye_split_dir, npz_split_dir),
+            hfov=float(ds.hfov),
+            image_fmt=pre.image_format,
+            verify_max_samples=min(pre.verify_max_samples, sum(len(t) for xs in buckets for (_s, _m, _n, t) in xs)),
+        )
+
+
+    # 6.5) Optional: build DALI .idx files (parent process, safe)
+    if pre.make_dali_index:
+        run_wds2idx_for_dir(out_pattern, max_workers=pre.num_workers)
 
 
 if __name__ == "__main__":
     main()
-
-
