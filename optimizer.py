@@ -183,39 +183,6 @@ def get_optimizer(model, config):
 
     opt = OPTIMIZERS[name.lower()](param_groups, **opt_config)
 
-    # Write debug info about param groups once on rank 0
-    try:
-        rank = int(os.environ.get("RANK", "0"))
-    except Exception:
-        rank = 0
-    if rank == 0:
-        try:
-            debug = {
-                "num_groups": len(param_groups),
-                "mask_token_group": None,
-                "groups": []
-            }
-            for idx, g in enumerate(param_groups):
-                names = g.get("names", [])
-                has_mask = any(n == "mask_token" or n.endswith(".mask_token") for n in names)
-                if has_mask and debug["mask_token_group"] is None:
-                    debug["mask_token_group"] = {
-                        "index": idx,
-                        "weight_decay": g.get("weight_decay"),
-                        "lr_scale": g.get("lr_scale", 1.0)
-                    }
-                debug["groups"].append({
-                    "index": idx,
-                    "weight_decay": g.get("weight_decay"),
-                    "lr_scale": g.get("lr_scale", 1.0),
-                    "has_mask_token": has_mask,
-                    "num_names": len(names)
-                })
-            with open("param_groups_debug.json", "w") as f:
-                json.dump(debug, f, indent=2)
-        except Exception:
-            pass
-
     return opt
 
 
