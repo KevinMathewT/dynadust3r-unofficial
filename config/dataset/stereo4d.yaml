@@ -3,7 +3,7 @@ path: /scratch/projects/fouheylab/km6748/stereo4d-data/
 wds_dir: ???
 cache: /scratch/projects/fouheylab/km6748/stereo4d-data/.cache
 lefteye_dir: /scratch/projects/fouheylab/km6748/stereo4d-data/lefteye-perspective
-meta_dir: /scratch/projects/fouheylab/km6748/stereo4d-data/meta
+sequences_csv: /scratch/km6748/vision-experiments/utils/data/stereo4d_all_sequences.csv
 train_split: train # train, test
 valid_split: test # train, test
 # path: /scratch/projects/fouheylab/km6748/stereo4d-data/

@@ -410,11 +410,18 @@ def create_pm_from_dm_in_ref_frame(depthmap: torch.Tensor, cam_source: tuple, ca
 
     valid_mask = pm_in_source[..., 3] > 0
     if torch.any(valid_mask):
-        valid_points_source = pm_in_source[valid_mask, :3]
+        # Use flat indexing to avoid boolean mask broadcasting quirks across dims
+        flat_pm = pm_in_source.view(-1, 4)
+        flat_mask = valid_mask.view(-1)
+        valid_points_source = flat_pm[flat_mask, :3]
         valid_points_world = cam_pc_to_world_pc(valid_points_source, cam_source)
         valid_points_ref = world_pc_to_cam_pc(valid_points_world, cam_reference)
-        pm_in_reference[valid_mask, :3] = valid_points_ref
-        pm_in_reference[valid_mask, 3] = 1
+
+        # Scatter back to reference point map at valid pixel locations
+        idxs = torch.nonzero(flat_mask, as_tuple=False).squeeze(1)
+        pm_in_reference_flat = pm_in_reference.view(-1, 4)
+        pm_in_reference_flat[idxs, :3] = valid_points_ref
+        pm_in_reference_flat[idxs, 3] = 1
     return pm_in_reference
 
 

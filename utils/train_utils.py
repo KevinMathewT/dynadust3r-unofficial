@@ -178,3 +178,31 @@ class AverageMeter(object):
     def __str__(self):
         fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
         return fmtstr.format(**self.__dict__)
+
+
+def save_last_model(accelerator, model, optimizer, scheduler, iteration, current_epoch, config, output_dir):
+    """
+    Save the final model checkpoint with the same iter/epoch suffix as best models,
+    but without validation metric values.
+    """
+    if not accelerator.is_local_main_process:
+        return None
+
+    checkpoints_dir = os.path.join(output_dir, "checkpoints")
+    os.makedirs(checkpoints_dir, exist_ok=True)
+
+    filename = f"last_iter_{iteration+1}_epoch_{current_epoch+1}.pth"
+    checkpoint_path = os.path.join(checkpoints_dir, filename)
+
+    checkpoint = {
+        "iteration": iteration + 1,
+        "epoch": current_epoch + 1,
+        "state_dict": accelerator.unwrap_model(model).state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "config": OmegaConf.to_container(config, resolve=True),
+    }
+
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Saved last checkpoint: {checkpoint_path}")
+    return checkpoint_path

@@ -105,25 +105,9 @@ class Stereo4D(StereoMotionBase):
         # lightweight per-seq memo for intrinsics width
         self._intrinsics_by_seq: Dict[str, np.ndarray] = {}
 
-        # build available sequences + frame counts using provided metadata
-        stats_csv = Path(config.dataset.stereo4d.meta_dir) / "stats.csv"
-        meta_csv = Path(config.dataset.stereo4d.meta_dir) / "stereo4d_id_to_time_and_fov_metadata.csv"
-
-        stats_df = pd.read_csv(stats_csv, skipinitialspace=True)
-        meta_df = pd.read_csv(
-            meta_csv,
-            header=0,
-            names=["vid", "clipid", "timestamp", "start_yaw", "end_yaw", "start_tilt", "end_tilt"],
-        )
-
-        merged = stats_df.merge(
-            meta_df[["vid", "clipid", "timestamp"]],
-            left_on=["ytid", "clipid"],
-            right_on=["vid", "clipid"],
-            how="inner",
-        )
-        merged = merged.groupby(["ytid", "clipid"]).first().reset_index()
-        merged["seq"] = merged["ytid"] + "_" + merged["timestamp"].astype(int).astype(str)
+        # build available sequences + frame counts from precomputed CSV (from config)
+        sequences_csv = Path(config.dataset.stereo4d.sequences_csv)
+        df = pd.read_csv(sequences_csv)
 
         # keep only seqs that have both mp4 + npz on disk
         def _exists(seq: str) -> bool:
@@ -131,10 +115,13 @@ class Stereo4D(StereoMotionBase):
             npz = self.npz_path(seq)
             return mp4.is_file() and npz.is_file()
 
-        merged = merged[merged["seq"].map(_exists)]
-        seq_to_frame_count = dict(zip(merged["seq"], merged["d_frame"].astype(int)))
+        df = df[df["sequence_id"].map(_exists)]
 
-        print(f"found {len(seq_to_frame_count)} sequences on disk")
+        # frame counts and per-sequence width (if present)
+        seq_to_frame_count = dict(zip(df["sequence_id"], df["length"].astype(int)))
+        # width column may exist in CSV, but we do not use it for intrinsics
+
+        print(f"found {len(seq_to_frame_count)} sequences on disk (from CSV)")
 
         # sample sequences
         available = list(seq_to_frame_count.keys())

@@ -1,10 +1,28 @@
 # DynaDUSt3R
 
+<p align="center">
+  <img src="extras/viz/heading.png" alt="DynaDUSt3R heading" />
+</p>
+
+
 Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stereo4D paper details a DynaDUSt3R implementation but does **not** release model weights; this repo recreates that training pipeline based on the paper description and public **DUSt3R** code — for research purposes only.
 
 **Links:** [Stereo4D paper (CVPR 2025)](https://openaccess.thecvf.com/content/CVPR2025/papers/Jin_Stereo4D_Learning_How_Things_Move_in_3D_from_Internet_Stereo_CVPR_2025_paper.pdf) · [arXiv](https://arxiv.org/abs/2412.09621) · [Project page](https://stereo4d.github.io/) · [Processing code](https://github.com/Stereo4d/stereo4d-code)
 
 **Datasets:** [Stereo4D annotations (GCS)](https://console.cloud.google.com/storage/browser/stereo4d) · [Left-eye perspective (HF)](https://huggingface.co/datasets/KevinMathew/stereo4d-lefteye-perspective) · [Right-eye perspective (HF)](https://huggingface.co/datasets/KevinMathew/stereo4d-righteye-perspective) *(not used in this training)*
+
+<table>
+<tr>
+<td width="50%" align="center">
+<b>Input (cow.gif)</b><br>
+<img src="extras/viz/input_cow.gif" alt="input cow" />
+</td>
+<td width="50%" align="center">
+<b>Output visualization</b><br>
+<img src="extras/viz/output_vis.gif" alt="output visualization" />
+</td>
+</tr>
+</table>
 
 ---
 
@@ -40,17 +58,24 @@ pip install -r <(poetry export -f requirements.txt --without-hashes)
 export TORCH_CUDA_ARCH_LIST="7.5;8.0;9.0+PTX"
 pip install -v --no-build-isolation -e models/croco/curope
 
-# prepare stereo4d shards (see section below)
-python extras/preprocess_stereo4d.py \
-  dataset.stereo4d.path=/data/stereo4d \
-  dataset.stereo4d.lefteye_dir=/data/stereo4d/lefteye-perspective \
-  dataset.stereo4d.meta_dir=/data/stereo4d/meta
-
-# train (single gpu example)
+# train (direct-from-disk; no WebDataset needed)
+# ensure you downloaded mp4s + npz files as in the Datasets section
 python -m train data.loader=stereo4d \
   dataset.stereo4d.path=/data/stereo4d \
   dataset.stereo4d.lefteye_dir=/data/stereo4d/lefteye-perspective \
-  dataset.stereo4d.meta_dir=/data/stereo4d/meta
+  dataset.stereo4d.sequences_csv=$(pwd)/utils/data/stereo4d_all_sequences.csv  # absolute path recommended
+
+# (optional) Use WebDataset streaming instead of direct-from-disk
+# 1) Create shards (see Datasets → convert to WebDataset)
+#    python extras/preprocess_stereo4d.py \
+#      dataset.stereo4d.path=/data/stereo4d \
+#      dataset.stereo4d.lefteye_dir=/data/stereo4d/lefteye-perspective
+# 2) In loaders/__init__.py, switch the mapping to Stereo4DWDSStream
+#    (comment out the Stereo4D line and uncomment the Stereo4DWDSStream line)
+# 3) Train (same CLI, optionally set wds_dir if not under /data/stereo4d/wds)
+#    python -m train data.loader=stereo4d \
+#      dataset.stereo4d.path=/data/stereo4d \
+#      dataset.stereo4d.wds_dir=/data/stereo4d/wds
 ```
 
 ---
@@ -76,7 +101,7 @@ Builds `curope` against your current torch install. Make sure you have a CUDA-en
 
 #### what you download
 - **annotations (.npz)** from Google Cloud Storage: `gs://stereo4d/{train,test}/*.npz`.
-- **left-eye perspective mp4s** from Hugging Face: `KevinMathew/stereo4d-lefteye-perspective` (tar archives of **plain mp4s**, not WebDataset). You’ll convert them to WebDataset with our script in `extras/`.
+ - **left-eye perspective mp4s** from Hugging Face: `KevinMathew/stereo4d-lefteye-perspective` (tar archives of **plain mp4s**, not WebDataset). Optionally convert them to WebDataset with our script in `extras/` if you want to use the streaming loader.
 - **right-eye perspective mp4s** from Hugging Face: `KevinMathew/stereo4d-righteye-perspective` *(not used in this training, listed for completeness).*
 
 #### download: annotations (.npz) from GCS
@@ -122,62 +147,118 @@ Files are named like `<videoid>_<timestamp>-left_rectified.mp4`.
   ├── lefteye-perspective/
   │   ├── train/*.mp4   # <videoid>_<timestamp>-left_rectified.mp4
   │   └── test/*.mp4
-  └── meta/
-      ├── stereo4d_id_to_time_and_fov_metadata.csv
-      └── stats.csv
 ```
 
-> the `meta/` csvs are used for filtering & timestamp lookup.
+
 
 ---
 
-### convert to **webdataset** shards (required for training)
+### convert to **webdataset** shards (optional)
 
-We merge **mp4** (left-eye perspective) + **npz** annotations per clip into **sequence-level** WebDataset samples with keys:
-- `video.mp4` — rectified left-eye video bytes
-- `ann.npz` — official annotations for the clip
-- `intr.npy` — 3×3 intrinsics matrix computed from frame width + `hfov` (deg)
+We merge **mp4** (left-eye perspective) + **npz** annotations per clip into WebDataset samples (triplets per sample) with keys expected by the streaming loader (set `image_format=npy`):
+- `l.npy`, `m.npy`, `r.npy` — left/mid/right frames as uint8 HWC arrays
+- `l.pv.npy`, `m.pv.npy`, `r.pv.npy` — per-point 3D tracks with validity `(T,4)`
+- `l.cam.npy`, `m.cam.npy`, `r.cam.npy` — extrinsics `(4,4)` world-to-camera
+- `k.npy` — intrinsics `(3,3)` computed from frame width and `hfov`
+- `__key__` — `<seq>_<l>_<m>_<r>`
 
 Output structure:
 ```
 /data/stereo4d/wds/
-  ├── train/stereo4d-000000.tar
-  ├── train/stereo4d-000001.tar
-  ├── ...
-  └── test/stereo4d-000000.tar
-        stereo4d-idx.json
-        key_to_idx.json
+  ├── train/
+  │   ├── stereo4d-w00-000000.tar
+  │   ├── stereo4d-w00-000000.idx
+  │   ├── stereo4d-w00-000001.tar
+  │   ├── stereo4d-w00-000001.idx
+  │   ├── stereo4d-w01-000000.tar
+  │   ├── stereo4d-w01-000000.idx
+  │   └── ...
+  └── test/
+      ├── stereo4d-w00-000000.tar
+      ├── stereo4d-w00-000000.idx
+      └── ...
 ```
+
+#### DALI indexing (optional, recommended)
+
+NVIDIA DALI provides fast readers for WebDataset when you generate `.idx` files for each `.tar`.
+
+- Verify the DALI indexer CLI is available:
+```bash
+wds2idx --help
+```
+
+Indexing runs automatically when you execute the preprocessor (default enabled); see the command under “run the preprocessor” below.
+
+ 
+
+How this repo triggers indexing:
+- The preprocessor calls DALI’s `wds2idx` automatically at the end (step 6.5) if `+preproc.make_dali_index=true` (default).
+- It derives the shard glob from the base pattern (default `stereo4d-%06d.tar`), which also matches worker-tokenized names like `stereo4d-w00-000123.tar`.
+- Indices are written next to shards as `*.idx` files (e.g., `stereo4d-w00-000123.idx`).
+- It runs indexing in parallel (up to `+preproc.num_workers`), and safely skips indexing if `wds2idx` is not on PATH.
+- You can override the base naming with `+preproc.wds_pattern=...</custom-%06d.tar>` if needed.
 
 #### run the preprocessor
 
 ```bash
-# base invocation with hydra overrides for paths
+# base invocation with hydra overrides for paths (npy images for streaming)
 python extras/preprocess_stereo4d.py \
   dataset.stereo4d.path=/data/stereo4d \
   dataset.stereo4d.lefteye_dir=/data/stereo4d/lefteye-perspective \
-  dataset.stereo4d.meta_dir=/data/stereo4d/meta \
-  dataset.stereo4d.hfov=60
+  dataset.stereo4d.hfov=60 \
+  +preproc.split=train \
+  +preproc.image_format=npy
 ```
 
-**Important knobs (edit at the top of `extras/preprocess_stereo4d.py`):**
-- `SPLIT = "train" | "test"`
-- `NUM_WORKERS = 32`
-- `MAX_SHARD_SIZE_GB = 50`, `MAX_SAMPLES_PER_SHARD = 8000`
+**Important knobs (Hydra overrides; no file edits required):**
+- `+preproc.split={train|test}`
+- `+preproc.num_workers=<int>`
+- `+preproc.shard_size_gb=<float>`, `+preproc.samples_per_shard=<int>`
 
-The script will:
-1) **Discover sequences** via metadata CSVs, filtering to reasonable motion.
-2) **Validate assets**: ensure each `<seq>-left_rectified.mp4` and `<seq>.npz` exist and decode.
-3) **Compute intrinsics** `K` from frame width & `hfov`.
-4) **Write shards** with a multiprocessing pool (pattern `stereo4d-%06d.tar`).
-5) **Index** shards with WIDS → `stereo4d-idx.json` and `key_to_idx.json`.
-6) **Verify** random samples (video + ann + intr).
+The script will (high-level, matching code):
+1) Environment & output
+   - Set cache/temp envs to `cfg.dataset.stereo4d.cache` (`WIDS_CACHE`, `TMPDIR`, etc.).
+   - Choose output dir: `dataset.stereo4d.wds_dir` or `<path>/wds/<split>`.
+   - Base pattern: `stereo4d-%06d.tar`; writers insert tokens → `stereo4d-wXX-%06d.tar`.
+2) Discover sequences (filesystem)
+   - Scan `lefteye-perspective/<split>` for `*-left_rectified.mp4` and pair with `<path>/<split>/*.npz`.
+   - Build a list of `(seq_id, mp4_path, npz_path)` only when both exist.
+3) Lightweight counting (batched, parallel)
+   - For selected sequences, read MP4 length and width via Decord (cheap header access).
+   - Read NPZ frame count from `camera2world.shape[0]`.
+   - Keep `n_min = min(n_mp4, n_npz)` (or whichever is valid); done in batches via `ProcessPoolExecutor`.
+4) Uniform triplet presampling (global over all sequences)
+   - Respect `max_frame_window` (from config unless overridden).
+   - Sample `(l, m, r)` uniformly over ALL valid triplets across the population (gap-weighted) until `num_triplets`.
+   - Ensure uniqueness of triplets; cap if the requested count exceeds the population.
+5) Group & partition work (by sequence)
+   - Group triplets per sequence to minimize re-opening mp4/npz.
+   - Greedy bin-pack sequences across writer workers by triplet count (balanced workload).
+6) Write shards (parallel producers)
+   - Each worker opens its own WebDataset `ShardWriter` (tokenized pattern), rotates by size (`shard_size_gb`) or count (`samples_per_shard`).
+   - Per sequence: open `VideoReader` once, open NPZ once, compute `K` from frame width and `hfov`.
+   - For each `(l, m, r)`: write keys
+     - `l.npy|m.npy|r.npy` (or `.jpg` if `image_format=jpg`)
+     - `l.pv.npy|m.pv.npy|r.pv.npy` (tracks with validity)
+     - `l.cam.npy|m.cam.npy|r.cam.npy` (extrinsics, world→camera)
+     - `k.npy` (intrinsics 3×3), `seq.txt`
+7) Optional ordered verification (`+preproc.verify=true`)
+   - For each worker token, stream that worker’s shards (no shuffle) and compare sample-by-sample against ground truth decoded from mp4/npz.
+   - Check image content/shape, tracks, intrinsics/extrinsics, and key order; report stats.
+8) Optional DALI indexing (`+preproc.make_dali_index=true`)
+   - Run `wds2idx` over all matching shard files in parallel; write `*.idx` next to each `.tar`.
+   - Skips gracefully if `wds2idx` is not on PATH.
 
 > tip: put TMP/WIDS cache on fast local scratch; adjust envs at the top of the script.
 
-**What the dataloader expects** (`data.loader=stereo4d` → v5 loader):
-- WIDS index at `.../wds/{split}/stereo4d-idx.json` and the key map `key_to_idx.json`.
-- Each sample contains `video.mp4`, `ann.npz`, `intr.npy`.
+**What the dataloader expects**:
+- Direct loader (`loaders/stereo4d.py`, default):
+  - On-disk mp4s under `lefteye-perspective/{split}` and `.npz` under `{split}`
+  - A sequences CSV via `dataset.stereo4d.sequences_csv`
+- Streaming loader (`loaders/stereo4d_stream.py`, optional):
+  - Shards matching `.../wds/{split}/stereo4d-*.tar` (or set `dataset.stereo4d.wds_dir`)
+  - Per-sample keys: `l.npy|m.npy|r.npy`, `l.pv.npy|m.pv.npy|r.pv.npy`, `l.cam.npy|m.cam.npy|r.cam.npy`, `k.npy`
 
 ---
 
@@ -191,6 +272,7 @@ Key knobs:
 - `data.loader` (default `stereo4d`)
 - `data.size`, `data.batch_size`
 - `train.iterations`, `train.validation_frequency`
+- `train.grad_acc` (gradient accumulation steps)
 - `logging.use_wandb`
 - `sched` (`cosine`, `linear`, `onecycle`, `steplr`, `exponentiallr`, `reducelronplateau`) or leave unset to disable scheduler
 
@@ -200,15 +282,21 @@ python -m train \
   data.loader=stereo4d \
   dataset.stereo4d.path=/data/stereo4d \
   dataset.stereo4d.lefteye_dir=/data/stereo4d/lefteye-perspective \
-  dataset.stereo4d.meta_dir=/data/stereo4d/meta \
+  dataset.stereo4d.sequences_csv=$(pwd)/utils/data/stereo4d_all_sequences.csv \
   data.batch_size=4 train.iterations=49000 train.validation_frequency=1000 \
   logging.use_wandb=true
 ```
+
+Notes:
+- `data.len` and `data.valid_len` are computed automatically from `train.iterations × data.batch_size × WORLD_SIZE`; no manual sizing needed.
+- If `debug=true`, the script uses a tiny dataset and sets `train.grad_acc=1`, `data.batch_size=4`, frequent viz, and short validation periods.
 
 ### multi-gpu
 ```bash
 # accelerate
 accelerate launch -m train data.loader=stereo4d ...
+# or (inside Poetry)
+poetry run accelerate launch -m train data.loader=stereo4d ...
 
 # torchrun
 torchrun --nproc_per_node=8 -m train data.loader=stereo4d ...
@@ -218,9 +306,16 @@ sbatch extras/train_dynadust3r.sbatch
 ```
 
 ### checkpoints, logs, viz
-- enable W&B via `logging.use_wandb=true`.
-- periodic visualizations land in the Hydra run dir (`.../valid/...`).
-- top-K checkpoints are kept under `.../checkpoints/` with metric+value in filename.
+- Enable W&B via `logging.use_wandb=true` (initialized only on main process).
+- Visualizations:
+  - Training: saved every 250 iterations by default (every 5 in debug) in the Hydra run directory.
+  - Validation: saved after each validation phase under the Hydra run dir at `.../valid/...`.
+- Checkpoints (under `.../checkpoints/`):
+  - Best: `best_<metric>_<value>_iter_<N>_epoch_<E>.pth` (top‑K kept; metric and value embedded in filename).
+  - Last: `last_iter_<N>_epoch_<E>.pth` (always written at the end of training).
+
+Distribution notes:
+- Accelerate handles data parallelism and splits batches across GPUs. Use the full `data.batch_size` in config; do not divide it by the number of GPUs.
 
 ---
 
@@ -229,7 +324,7 @@ sbatch extras/train_dynadust3r.sbatch
 - `config/model/dynadust3r.yaml` – model + DUSt3R weights
 - `config/criterion/*.yaml` – loss configs
 - `config/optim/*.yaml`, `config/sched/*.yaml` – optimizers & schedulers
-- `config/dataset/stereo4d.yaml` – set `path`, `lefteye_dir`, `meta_dir`, `hfov`, `max_frame_window`, splits
+- `config/dataset/stereo4d.yaml` – set `path`, `lefteye_dir`, `hfov`, `max_frame_window`, splits
 
 ---
 

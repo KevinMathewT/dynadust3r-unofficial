@@ -204,6 +204,19 @@ class StereoMotionBase(Dataset):
                         right_info["image"].shape[:2], pm_source="3d_tracks"
                     )
                 elif pm_source == "dm":
+                    # Validate depth map shapes before geometry
+                    assert left_info["dm"].ndim == 2, f"left dm ndim={left_info['dm'].ndim}, shape={tuple(left_info['dm'].shape)}"
+                    assert mid_info["dm"].ndim == 2, f"mid dm ndim={mid_info['dm'].ndim}, shape={tuple(mid_info['dm'].shape)}"
+                    assert right_info["dm"].ndim == 2, f"right dm ndim={right_info['dm'].ndim}, shape={tuple(right_info['dm'].shape)}"
+                    H_l, W_l = left_info["dm"].shape
+                    H_m, W_m = mid_info["dm"].shape
+                    H_r, W_r = right_info["dm"].shape
+                    Hi_l, Wi_l = left_info["image"].shape[:2]
+                    Hi_m, Wi_m = mid_info["image"].shape[:2]
+                    Hi_r, Wi_r = right_info["image"].shape[:2]
+                    assert (H_l, W_l) == (Hi_l, Wi_l), f"left dm shape {H_l,W_l} != image shape {Hi_l,Wi_l}"
+                    assert (H_m, W_m) == (Hi_m, Wi_m), f"mid dm shape {H_m,W_m} != image shape {Hi_m,Wi_m}"
+                    assert (H_r, W_r) == (Hi_r, Wi_r), f"right dm shape {H_r,W_r} != image shape {Hi_r,Wi_r}"
                     left_pm = geo.dm_to_cam_pm(left_info["dm"], reference_cam)
                     mid_pm = geo.create_pm_from_dm_in_ref_frame(
                         mid_info["dm"], mid_info["cam"], reference_cam

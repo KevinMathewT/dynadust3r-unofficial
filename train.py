@@ -27,7 +27,7 @@ from models import get_model
 from loaders import get_loaders
 from optimizer import get_optimizer, get_scheduler
 from utils.train_utils import (
-    setup_distributed, init_wandb, save_best_model,
+    setup_distributed, init_wandb, save_best_model, save_last_model,
     create_symlink_for_wids_cache, AverageMeter,
 )
 import utils.wandb_utils as wandb_logger
@@ -231,23 +231,31 @@ def main(config: DictConfig):
                 f"(global: {global_bs}) | eta: {eta_str}"
             )
 
-        if iteration % config.logging.wandb_interval == 0 and accelerator.is_local_main_process:
+        if (
+            config.logging.use_wandb
+            and iteration % config.logging.wandb_interval == 0
+            and accelerator.is_local_main_process
+        ):
             lr = optimizer.param_groups[0]["lr"]
             wandb_logger.log_training_batch(
                 iteration, current_epoch, loss.item(), lr, loss_details, train_metrics, config, accelerator
             )
 
-        if iteration % train_viz_interval == 0 and accelerator.is_local_main_process:
+        if (
+            config.logging.use_wandb
+            and iteration % train_viz_interval == 0
+            and accelerator.is_local_main_process
+        ):
             unwrapped_model = accelerator.unwrap_model(model)
             base_name = f"t_e_{current_epoch}_b_{iteration}"
             unwrapped_model.save_visualizations(batch, outputs, base_name)  # imgs/grids  # (B,H,W,3)
 
-        if iteration % train_viz_interval == 0:
+        if config.logging.use_wandb and iteration % train_viz_interval == 0:
             accelerator.wait_for_everyone()  # barrier after rank-0 training viz
 
         # validation
         if (iteration + 1) % validation_frequency == 0 or iteration == total_iterations - 1:
-            if accelerator.is_local_main_process:
+            if config.logging.use_wandb and accelerator.is_local_main_process:
                 wandb_logger.log_training_epoch(
                     iteration, current_epoch, train_losses, train_metrics, optimizer, config, accelerator
                 )
@@ -293,7 +301,11 @@ def main(config: DictConfig):
 
                     val_losses.update(val_loss.item(), v_local_bs)
 
-                    if val_batch_idx % config.logging.wandb_interval == 0 and accelerator.is_local_main_process:
+                    if (
+                        config.logging.use_wandb
+                        and val_batch_idx % config.logging.wandb_interval == 0
+                        and accelerator.is_local_main_process
+                    ):
                         wandb_logger.log_validation_batch(
                             iteration, current_epoch, val_batch_idx, val_loss.item(),
                             val_loss_details, val_batch_metrics, config, accelerator
@@ -304,15 +316,16 @@ def main(config: DictConfig):
                             f"[{current_epoch+1}][{iteration+1:5d}/{total_iterations}][{val_batch_idx+1:5d}/{len(valid_loader)}] valid loss: {val_loss.item():.10f}"
                         )
 
-                if accelerator.is_local_main_process:
+                if config.logging.use_wandb and accelerator.is_local_main_process:
                     valid_vis_dir = os.path.join(output_dir, "valid")
                     os.makedirs(valid_vis_dir, exist_ok=True)
                     unwrapped_model = accelerator.unwrap_model(model)
                     base_name = f"v_e_{current_epoch}_b_{iteration}"
                     unwrapped_model.save_visualizations(val_batch, val_outputs, base_name)  # (B,H,W,3)
-                accelerator.wait_for_everyone()  # barrier after rank-0 validation viz
+                if config.logging.use_wandb:
+                    accelerator.wait_for_everyone()  # barrier after rank-0 validation viz
 
-            if accelerator.is_local_main_process:
+            if config.logging.use_wandb and accelerator.is_local_main_process:
                 wandb_logger.log_validation_epoch(iteration, current_epoch, val_losses, val_metrics, config, accelerator)
 
             accelerator.print(f"[{current_epoch+1}][{iteration+1:5d}/{total_iterations}] val epoch loss: {val_losses.avg:.10f}")
@@ -366,6 +379,15 @@ def main(config: DictConfig):
             model.train()
 
         iteration += 1
+
+    # save final (last) checkpoint regardless of validation
+    last_iter_index = max(0, iteration - 1)
+    last_epoch = last_iter_index // max(validation_frequency, 1)
+    save_last_model(
+        accelerator, model, optimizer, scheduler,
+        last_iter_index, last_epoch, config, output_dir
+    )
+    accelerator.wait_for_everyone()
 
     accelerator.print("Training completed!")
 

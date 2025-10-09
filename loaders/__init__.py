@@ -12,15 +12,13 @@ from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
 
 from loaders.pointodyssey import PointOdyssey
-from loaders.stereo4d import Stereo4D  # noqa: F401
-# from loaders.stereo4d_wds import Stereo4DWDS
+from loaders.stereo4d import Stereo4D
 from loaders.stereo4d_stream import Stereo4DWDSStream
 
 LOADERS = {
     "pointodyssey": PointOdyssey,
-    # "stereo4d": Stereo4D,
-    # "stereo4d": Stereo4DWDS,
-    "stereo4d": Stereo4DWDSStream,
+    "stereo4d": Stereo4D,
+    # "stereo4d": Stereo4DWDSStream,
 }
 
 def get_loaders(config, num_workers_multiplier=1, loader_kwargs=None):

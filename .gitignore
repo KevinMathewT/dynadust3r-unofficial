@@ -177,6 +177,8 @@ cython_debug/
 .pypirc
 .vscode/
 .v
+
+# self
 tmp/
 data/
 stereo4d_dataset/
@@ -193,3 +195,5 @@ job_output_*
 scratch/
 metrics/
 adt_eval_out/
+tests/
+*.sbatch

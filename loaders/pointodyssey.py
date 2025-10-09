@@ -7,6 +7,7 @@ LinkedIn: https://www.linkedin.com/in/kevinmathewt/
 import os
 import cv2
 import numpy as np
+import torch
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .stereo_motion_base import StereoMotionBase
@@ -133,10 +134,10 @@ class PointOdyssey(StereoMotionBase):
             image, dm, cam = self.crop_data(image, dm, cam, out_res)  # apply cropping
 
         return {
-            "image": image,                        # (H, W, 3)
-            "world_pc_valid": world_pc_valid,      # (N, 4)
-            "cam": cam,                             # ((3, 3), (4, 4))
-            "dm": dm,                               # (H, W)
+            "image": torch.from_numpy(image),      # (H, W, 3)
+            "world_pc_valid": torch.from_numpy(world_pc_valid),  # (N, 4)
+            "cam": (torch.from_numpy(cam[0]), torch.from_numpy(cam[1])),  # ((3, 3), (4, 4))
+            "dm": torch.from_numpy(dm),            # (H, W)
             "instance": os.path.split(self._rgb_path(sequence_path, frame_index))[1],  # string
         }
 
@@ -217,10 +218,10 @@ class PointOdyssey(StereoMotionBase):
                 img, dm, cam = self.crop_data(img, dm, cam, out_res)
 
             results[j] = {
-                "image": img,                         # (H, W, 3)
-                "world_pc_valid": world_pc_valid,     # (N, 4)
-                "cam": cam,                            # ((3, 3), (4, 4))
-                "dm": dm,                              # (H, W)
+                "image": torch.from_numpy(img),       # (H, W, 3)
+                "world_pc_valid": torch.from_numpy(world_pc_valid),     # (N, 4)
+                "cam": (torch.from_numpy(cam[0]), torch.from_numpy(cam[1])),  # ((3, 3), (4, 4))
+                "dm": torch.from_numpy(dm),           # (H, W)
                 "instance": os.path.split(self._rgb_path(sequence_path, int(fidx)))[1],  # string
             }
 
