@@ -13,13 +13,13 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 
 <table>
 <tr>
-<td width="50%" align="center">
+<td width="40%" align="center">
 <b>Input (cow.gif)</b><br>
-<img src="extras/viz/input_cow.gif" alt="input cow" />
+<img src="extras/viz/input_cow.gif" alt="input cow" height="390" />
 </td>
-<td width="50%" align="center">
+<td width="60%" align="center">
 <b>Output visualization</b><br>
-<img src="extras/viz/output_vis.gif" alt="output visualization" />
+<img src="extras/viz/output_vis.gif" alt="output visualization" height="390" />
 </td>
 </tr>
 </table>
