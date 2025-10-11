@@ -197,3 +197,4 @@ metrics/
 adt_eval_out/
 tests/
 *.sbatch
+dynadust3r-unofficial-weights/
