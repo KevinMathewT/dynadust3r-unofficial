@@ -13,12 +13,23 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 
 **Pretrained weights:** [DynaDUSt3R (HF)](https://huggingface.co/KevinMathew/dynadust3r-unofficial-weights) — ADT benchmark scores are listed on the repo page.
 
-<p align="center" style="margin:0;">
-  <img src="extras/viz/rolling-input.gif"  height="248" alt="Input">
-  <img src="extras/viz/rolling-points.gif" height="248" alt="Point map">
-  <img src="extras/viz/rolling-motion.gif" height="248" alt="Motion map">
-</p>
-<p align="center"><b>Input</b> &nbsp;·&nbsp; <b>Point Map Predictions</b> &nbsp;·&nbsp; <b>Motion Map Predictions</b></p>
+<!-- One row, fills 100% width, equal heights, correct aspect ratios -->
+<table width="100%">
+  <tr>
+    <td width="25.41%" align="center">
+      <img src="extras/viz/rolling-input.gif" width="100%" alt="Input"><br>
+      <b>Input</b>
+    </td>
+    <td width="37.30%" align="center">
+      <img src="extras/viz/rolling-points.gif" width="100%" alt="Point Map Predictions"><br>
+      <b>Point Map Predictions</b>
+    </td>
+    <td width="37.30%" align="center">
+      <img src="extras/viz/rolling-motion.gif" width="100%" alt="Motion Map Predictions"><br>
+      <b>Motion Map Predictions</b>
+    </td>
+  </tr>
+</table>
 
 
 ---
