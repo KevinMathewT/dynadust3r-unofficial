@@ -450,6 +450,153 @@ def visualize_sequence_from_pms(pms, motion_map, image_seq=None, name="seq_pm", 
             pc = pc_next
 
 
+def visualize_trajectories_from_pms(pms, motion_map, image_seq=None, name="seq_pm", save=False, path=None, traj_percentile_threshold=None, group_tile_size=11):
+    """
+    Visualize animated point clouds over time and a static set of grouped full-length trajectories.
+
+    Parameters:
+    - pms: list/array of T point maps, each (H, W, 3) or (H, W, 4) or flattened (N, 3/4)
+    - motion_map: accepted for API compatibility (unused for static trajectories)
+    - image_seq: optional list of T RGB images for point coloring
+    - name, save, path: same semantics as visualize_sequence_from_pms
+    - traj_percentile_threshold: motion percentile (0..1) to select candidates
+    - group_tile_size: integer tile size in pixels for 2D grouping (default: 3)
+    """
+    import colorsys
+
+    def to_np(x):
+        if hasattr(x, 'detach'):
+            return x.detach().cpu().numpy()
+        return x
+
+    def ensure_4d(x):
+        if x.shape[-1] == 3:
+            if x.ndim == 3:
+                x = np.concatenate([x, np.ones((x.shape[0], x.shape[1], 1), dtype=x.dtype)], axis=-1)
+                x = x.reshape(-1, 4)
+            else:
+                x = np.concatenate([x, np.ones((x.shape[0], 1), dtype=x.dtype)], axis=-1)
+            return x
+        return x.reshape(-1, 4) if x.ndim == 3 else x
+
+    rr.init(name)
+    if save and path is not None:
+        rr.save(path)
+    else:
+        rr.connect_tcp("127.0.0.1:9876")
+
+    pms = [to_np(pm) for pm in pms]
+    # Try to recover grid shape (H, W) before any flattening
+    grid_shape = None
+    if isinstance(pms[0], np.ndarray) and pms[0].ndim == 3:
+        grid_shape = pms[0].shape[:2]
+    T = len(pms)
+    if T == 0:
+        return
+
+    if image_seq is None:
+        image_seq = [None] * T
+
+    # Build positions and validity across time
+    pc0 = ensure_4d(pms[0])
+    N = pc0.shape[0]
+    positions_all = np.zeros((T, N, 3), dtype=pc0.dtype)
+    valid_all = np.ones((N,), dtype=bool)
+
+    for t in range(T):
+        pc_t = ensure_4d(pms[t])
+        # strict shape check to match point-cloud logic
+        assert pc_t.shape[0] == N, "All pms[t] must share the same flattened size"
+        positions_all[t] = pc_t[:, :3]
+        valid_all &= (pc_t[:, 3] > 0)
+
+    valid_idx = np.where(valid_all)[0]
+
+    # Select persistent sparse trajectories by top motion percentile from first->last
+    if T >= 2:
+        p = 0.75 if (traj_percentile_threshold is None) else float(traj_percentile_threshold)
+        p = max(0.0, min(1.0, p))
+        disp = np.linalg.norm(positions_all[-1] - positions_all[0], axis=1)  # (N,)
+        disp_valid = disp[valid_all]
+        if disp_valid.size > 0:
+            thresh_val = np.percentile(disp_valid, p * 100.0)
+            keep_mask = (disp >= thresh_val) & valid_all
+            selected_idx = np.where(keep_mask)[0]
+        else:
+            selected_idx = valid_idx
+    else:
+        selected_idx = valid_idx
+
+    # Group nearby trajectories by image-grid tiles when grid is known
+    strips = []
+    if grid_shape is not None and len(selected_idx) > 0:
+        H, W = grid_shape
+        tile = max(1, int(group_tile_size))
+        groups = {}
+        for i in selected_idx:
+            r = int(i // W)
+            c = int(i % W)
+            key = (r // tile, c // tile)
+            groups.setdefault(key, []).append(i)
+        # Aggregate by mean per tile
+        for key in sorted(groups.keys()):
+            idxs = groups[key]
+            pts = positions_all[:, idxs, :]  # (T, K, 3)
+            mean_poly = pts.mean(axis=1).astype(np.float32)  # (T, 3)
+            strips.append(mean_poly)
+    else:
+        # Fallback: one strip per selected index
+        strips = [positions_all[:, i, :].astype(np.float32) for i in selected_idx]
+
+    # Unique color per trajectory (HSV ramp)
+    num_traj = len(strips)
+    traj_entity = "trajectories/grouped" if grid_shape is not None else "trajectories/persistent"
+    traj_colors = None
+    if num_traj > 0:
+        # build distinct color per trajectory, replicated per-vertex (per Rerun API)
+        palette = []
+        for i in range(num_traj):
+            h = (i / max(1, num_traj))
+            s = 0.75
+            v = 1.0
+            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+            palette.append([int(r * 255), int(g * 255), int(b * 255)])
+        traj_colors = np.concatenate([np.tile(np.asarray(palette[i], dtype=np.uint8), (T, 1)) for i in range(num_traj)], axis=0)
+        # log once before the time loop as well
+        rr.log(traj_entity, rr.LineStrips3D(strips=strips, colors=traj_colors, radii=0.002))
+
+    # Animate point clouds exactly as in visualize_sequence_from_pms (no motion interleaving)
+    pc = pc0
+    valid_mask = pc[:, 3] > 0
+    pc_valid = pc[valid_mask][:, :3]
+
+    img_flat = image_seq[0].reshape(-1, 3) if image_seq[0] is not None else None
+    colors = (img_flat[valid_mask].astype(float) / 255.0
+        if image_seq[0] is not None
+        else np.array([[255, 95, 31]] * len(pc_valid), dtype=np.uint8) / 255.0)
+
+    for t in range(T):
+        rr.set_time_sequence("time", 2 * t)
+        rr.log("point_cloud", rr.Points3D(positions=pc_valid, colors=colors))
+        if num_traj > 0:
+            rr.log(traj_entity, rr.LineStrips3D(strips=strips, colors=traj_colors, radii=0.002))
+
+        if t < T - 1:
+            pc_next = ensure_4d(pms[t + 1])
+            valid_mask = pc_next[:, 3] > 0
+            pc_valid = pc_next[valid_mask][:, :3]
+
+            colors = (image_seq[t + 1].reshape(-1, 3)[valid_mask].astype(float) / 255.0
+                if image_seq[t + 1] is not None
+                else np.array([[255, 95, 31]] * len(pc_valid), dtype=np.uint8) / 255.0)
+
+            # keep the same cadence: next cloud at 2*t+1
+            rr.set_time_sequence("time", 2 * t + 1)
+            rr.log("point_cloud", rr.Points3D(positions=pc_valid, colors=colors))
+            if num_traj > 0:
+                rr.log(traj_entity, rr.LineStrips3D(strips=strips, colors=traj_colors, radii=0.002))
+            pc = pc_next
+
 def test_visualize_pc():
     test_points = np.array([
         [0, 0, 1],

@@ -30,7 +30,7 @@ from omegaconf import DictConfig
 
 from models import get_model
 from models.dust3r.utils.heads.postprocess import reg_dense_depth
-from utils.rerun_viz import visualize_sequence_from_pms
+from utils.rerun_viz import visualize_trajectories_from_pms
 from utils.viz import make_depth_and_disp_imgs, conf_to_gray_img
 
 
@@ -127,7 +127,7 @@ def main(config: DictConfig):
     
     # If debug mode, only process first example
     if config.debug:
-        gif_paths = [gif_paths[0]]
+        gif_paths = [gif_paths[-1]]
 
     # Query times (assume >= 2)
     num_query_times = int(config.infer.num_query_times)
@@ -216,8 +216,10 @@ def main(config: DictConfig):
 
         # Save rerun visualization
         rerun_file = rerun_dir / f"{base}_sequence.rrd"
-        visualize_sequence_from_pms(pms_seq, motion_seq, image_seq=image_seq, 
-                                   name=f"paper_seq_{base}", save=True, path=str(rerun_file))
+        # Top-percentile persistent trajectories
+        traj_percentile = float(config.infer.get("traj_percentile_threshold", 0.75))
+        visualize_trajectories_from_pms(pms_seq, motion_seq, image_seq=image_seq, 
+                                        name=f"paper_seq_{base}", traj_percentile_threshold=traj_percentile) #, save=True, path=str(rerun_file))
 
         print(f"Processed {gif_path}")
 

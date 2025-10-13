@@ -16,21 +16,17 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 
 ---
 
-## examples
+## example
 <!-- One row, fills 100% width, equal heights, correct aspect ratios -->
 <table width="100%">
   <tr>
-    <td width="25.41%" align="center">
+    <td width="50%" align="center">
       <img src="extras/viz/rolling-input.gif" width="100%" alt="Input"><br>
       <b>Input</b>
     </td>
-    <td width="37.30%" align="center">
-      <img src="extras/viz/rolling-points.gif" width="100%" alt="Point Map Predictions"><br>
+    <td width="50%" align="center">
+      <img src="extras/viz/rolling-points.gif" width="100%" alt="Point + Motion Map Predictions"><br>
       <b>Point Map Predictions</b>
-    </td>
-    <td width="37.30%" align="center">
-      <img src="extras/viz/rolling-motion.gif" width="100%" alt="Motion Map Predictions"><br>
-      <b>Motion Map Predictions</b>
     </td>
   </tr>
 </table>
