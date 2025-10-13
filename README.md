@@ -13,23 +13,12 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 
 **Pretrained weights:** [DynaDUSt3R (HF)](https://huggingface.co/KevinMathew/dynadust3r-unofficial-weights) — ADT benchmark scores are listed on the repo page.
 
-<!-- Responsive 3-GIF row, equal heights, 100% width -->
-<!-- Tile sizes match each GIF's aspect ratio exactly:
-     tile1 = 545×545 (1:1), tile2 = 800×545, tile3 = 800×545
-     Total viewBox width = 545 + 800 + 800 = 2145; height = 545 -->
-<svg xmlns="http://www.w3.org/2000/svg"
-     viewBox="0 0 2145 545" width="100%" role="img" aria-label="Rolling visualizations">
-  <title>Rolling visualizations</title>
-  <image href="extras/viz/rolling-input.gif"
-         x="0" y="0" width="545" height="545"
-         preserveAspectRatio="xMidYMid meet" />
-  <image href="extras/viz/rolling-points.gif"
-         x="545" y="0" width="800" height="545"
-         preserveAspectRatio="xMidYMid meet" />
-  <image href="extras/viz/rolling-motion.gif"
-         x="1345" y="0" width="800" height="545"
-         preserveAspectRatio="xMidYMid meet" />
-</svg>
+<p align="center" style="margin:0;">
+  <img src="extras/viz/rolling-input.gif"  height="248" alt="Input">
+  <img src="extras/viz/rolling-points.gif" height="248" alt="Point map">
+  <img src="extras/viz/rolling-motion.gif" height="248" alt="Motion map">
+</p>
+<p align="center"><b>Input</b> &nbsp;·&nbsp; <b>Point Map Predictions</b> &nbsp;·&nbsp; <b>Motion Map Predictions</b></p>
 
 
 ---
