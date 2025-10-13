@@ -276,8 +276,8 @@ def visualize_pm(pm, image=None, cam=None, valid=True, name="pm", pc_in_cam_coor
     rr.init(name)
     if save and path is not None:
         rr.save(path)  # must be called before the first log
-        print(f"Saved visualization to {path}.")
-    rr.connect_tcp("127.0.0.1:9876")
+    else:
+        rr.connect_tcp("127.0.0.1:9876")
     
     # normalize pm to array with time dim
     if isinstance(pm, list):
@@ -396,8 +396,8 @@ def visualize_sequence_from_pms(pms, motion_map, image_seq=None, name="seq_pm", 
     rr.init(name)
     if save and path is not None:
         rr.save(path)  # must be called before the first log
-        print(f"Saved visualization to {path}.")
-    rr.connect_tcp("127.0.0.1:9876")
+    else:
+        rr.connect_tcp("127.0.0.1:9876")
     
     pms = [to_np(pm) for pm in pms]
     motion_map = to_np(motion_map)

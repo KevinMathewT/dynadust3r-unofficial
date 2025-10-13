@@ -13,6 +13,8 @@ Purpose:
 Strict assumptions version:
 - All inputs, files, and model outputs exist and are valid.
 - No optional branches, no fallbacks, no warnings.
+
+usage: poetry run python -m infer.infer_example
 """
 
 import os
@@ -115,9 +117,17 @@ def main(config: DictConfig):
     input_dir = Path(str(config.infer.input_dir))
     output_dir = Path(str(config.infer.output_dir))
     _ensure_dir(output_dir)
+    
+    # Rerun visualization output directory
+    rerun_dir = Path("/scratch/km6748/vision-experiments/scratch/rerun_visualizations")
+    _ensure_dir(rerun_dir)
 
     gif_glob = str(config.infer.gif_glob)
     gif_paths = sorted(input_dir.glob(gif_glob))
+    
+    # If debug mode, only process first example
+    if config.debug:
+        gif_paths = [gif_paths[0]]
 
     # Query times (assume >= 2)
     num_query_times = int(config.infer.num_query_times)
@@ -160,6 +170,17 @@ def main(config: DictConfig):
         conf_left_np = c_left[..., 0] if c_left.ndim == 3 and c_left.shape[-1] == 1 else c_left
         conf_right_np = c_right[..., 0] if c_right.ndim == 3 and c_right.shape[-1] == 1 else c_right
 
+        # Confidence-based filtering for Rerun visualization
+        # Check for per-file override
+        gif_stem = gif_path.stem
+        overrides = config.infer.get("conf_percentile_overrides", {})
+        if gif_stem in overrides:
+            conf_percentile = float(overrides[gif_stem])
+        else:
+            conf_percentile = float(config.infer.conf_percentile_threshold)
+        threshold_value = np.percentile(conf_left_np, conf_percentile * 100.0)
+        conf_mask = (conf_left_np >= threshold_value)
+
         # Post depth mapping (strict)
         left_pred_pp = reg_dense_depth(outputs["left_map_pred"][0], model.depth_post_mode).detach().cpu().numpy()
         right_pred_pp = reg_dense_depth(outputs["right_map_pred_in_left_frame"][0], model.depth_post_mode).detach().cpu().numpy()
@@ -183,11 +204,20 @@ def main(config: DictConfig):
                 disp_np = motion_pred[f"l_to_t{t_idx}"][0].detach().cpu().numpy()[..., :3]
             disps.append(disp_np)
 
-        pms_seq = [left_pred_pp + d for d in disps]
-        motion_seq = np.stack([disps[i + 1] - disps[i] for i in range(T - 1)], axis=0)
+        # Build point maps with validity channel (4th channel = confidence mask)
+        pms_seq = [np.concatenate([left_pred_pp + d, conf_mask[..., None].astype(np.float32)], axis=-1) 
+                   for d in disps]
+        
+        # Build motion sequence with validity channel
+        motion_deltas = [disps[i + 1] - disps[i] for i in range(T - 1)]
+        motion_seq = np.stack([np.concatenate([md, conf_mask[..., None].astype(np.float32)], axis=-1) 
+                               for md in motion_deltas], axis=0)
         image_seq = [left_r for _ in range(T)]
 
-        visualize_sequence_from_pms(pms_seq, motion_seq, image_seq=image_seq, name=f"paper_seq_{base}")
+        # Save rerun visualization
+        rerun_file = rerun_dir / f"{base}_sequence.rrd"
+        visualize_sequence_from_pms(pms_seq, motion_seq, image_seq=image_seq, 
+                                   name=f"paper_seq_{base}", save=True, path=str(rerun_file))
 
         print(f"Processed {gif_path}")
 

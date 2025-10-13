@@ -198,3 +198,6 @@ adt_eval_out/
 tests/
 *.sbatch
 dynadust3r-unofficial-weights/
+
+# Track specific dataset listing explicitly
+!utils/data/stereo4d_all_sequences.csv

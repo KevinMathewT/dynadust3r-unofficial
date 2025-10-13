@@ -15,13 +15,17 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 
 <table>
 <tr>
-<td width="40%" align="center">
-<b>Input (cow.gif)</b><br>
-<img src="extras/viz/input_cow.gif" alt="input cow" height="390" />
+<td width="33%" align="center">
+<b>Input</b><br>
+<img src="extras/viz/rolling-input.gif" alt="input rolling" style="height: 390px; width: auto;" />
 </td>
-<td width="60%" align="center">
-<b>Output visualization</b><br>
-<img src="extras/viz/output_vis.gif" alt="output visualization" height="390" />
+<td width="33%" align="center">
+<b>Point Cloud Output</b><br>
+<img src="extras/viz/rolling-points.gif" alt="point cloud output" style="height: 390px; width: auto;" />
+</td>
+<td width="33%" align="center">
+<b>Motion Output</b><br>
+<img src="extras/viz/rolling-motion.gif" alt="motion output" style="height: 390px; width: auto;" />
 </td>
 </tr>
 </table>

@@ -52,7 +52,8 @@ infer:
   # checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-09-28/06-01-28/checkpoints/best_loss_1.482034_iter_84000_epoch_42.pth
   # checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-09-14/13-03-43/checkpoints/best_loss_1.521715_iter_70000_epoch_35.pth
   # checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-10-01/14-57-07/checkpoints/best_loss_0.482816_iter_92000_epoch_46.pth
-  checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-10-09/21-11-57/checkpoints/last_iter_98000_epoch_49.pth
+  # checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-10-09/21-11-57/checkpoints/last_iter_98000_epoch_49.pth
+  checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-10-09/21-11-57/checkpoints/best_loss_0.480798_iter_90000_epoch_45.pth
   input_dir: /scratch/km6748/vision-experiments/scratch/paper
   output_dir: /scratch/km6748/vision-experiments/scratch/paper/results
   gif_glob: "*.gif"
@@ -60,8 +61,15 @@ infer:
   num_query_times: 5
 
   # === filtering knobs ===
-  motion_conf_top_percentile: 1.0   # keep top p fraction by confidence (0..1); 0.25 => top 25%
-  mask_motion_top_percentile: 0.05   # among those, keep top p fraction by |motion| (0..1); 0.01 => top 1%
+  conf_percentile_threshold: 0.45   # keep points with confidence >= this percentile (0..1); 0.75 => top 25%, 0.0 => all
+  conf_percentile_overrides:
+    cow: 0.45
+    dog_on_field: 0.45
+    exhibition: 0.45
+    guitar: 0.45
+    museum: 0.45
+    park: 0.45
+    rolling: 0.45
 
 eval:
   adt:
