@@ -13,6 +13,7 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 
 **Pretrained weights:** [DynaDUSt3R (HF)](https://huggingface.co/KevinMathew/dynadust3r-unofficial-weights) — ADT benchmark scores are listed on the repo page.
 
+<div style="overflow-x: auto;">
 <table style="border-collapse: collapse;">
 <tr>
 <td align="center" style="vertical-align: top; padding: 0 10px;">
@@ -29,6 +30,7 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 </td>
 </tr>
 </table>
+</div>
 
 ---
 
