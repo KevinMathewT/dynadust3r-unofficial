@@ -13,19 +13,19 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 
 **Pretrained weights:** [DynaDUSt3R (HF)](https://huggingface.co/KevinMathew/dynadust3r-unofficial-weights) — ADT benchmark scores are listed on the repo page.
 
-<table style="table-layout: fixed; width: 100%; border-collapse: collapse;">
+<table style="border-collapse: collapse;">
 <tr>
-<td width="33%" align="center" style="vertical-align: top;">
+<td align="center" style="vertical-align: top; padding: 0 10px;">
 <b>Input</b><br>
-<img src="extras/viz/rolling-input.gif" alt="input rolling" style="height: 300px; width: auto; max-width: 100%; display: block; margin: 0 auto;" />
+<img src="extras/viz/rolling-input.gif" alt="input rolling" width="300" height="300" style="display: block; margin: 0 auto;" />
 </td>
-<td width="33%" align="center" style="vertical-align: top;">
+<td align="center" style="vertical-align: top; padding: 0 10px;">
 <b>Point Map Predictions</b><br>
-<img src="extras/viz/rolling-points.gif" alt="point cloud output" style="height: 300px; width: auto; max-width: 100%; display: block; margin: 0 auto;" />
+<img src="extras/viz/rolling-points.gif" alt="point cloud output" width="441" height="300" style="display: block; margin: 0 auto;" />
 </td>
-<td width="33%" align="center" style="vertical-align: top;">
+<td align="center" style="vertical-align: top; padding: 0 10px;">
 <b>Motion Map Predictions</b><br>
-<img src="extras/viz/rolling-motion.gif" alt="motion output" style="height: 300px; width: auto; max-width: 100%; display: block; margin: 0 auto;" />
+<img src="extras/viz/rolling-motion.gif" alt="motion output" width="441" height="300" style="display: block; margin: 0 auto;" />
 </td>
 </tr>
 </table>
