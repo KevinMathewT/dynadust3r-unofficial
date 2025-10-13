@@ -26,7 +26,7 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
     </td>
     <td width="50%" align="center">
       <img src="extras/viz/rolling-points.gif" width="100%" alt="Point + Motion Map Predictions"><br>
-      <b>Point Map Predictions</b>
+      <b>Point + Motion Map Predictions</b>
     </td>
   </tr>
 </table>
