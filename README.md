@@ -21,7 +21,7 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 </td>
 <td align="center">
 <b>Point Map Predictions</b><br>
-<img src="extras/viz/rolling-points.gif" alt="point cloud output" width="367" />
+<img src="extras/viz/rolling-points.gif" alt="point cloud output" width="300" />
 </td>
 <td align="center">
 <b>Motion Map Predictions</b><br>
