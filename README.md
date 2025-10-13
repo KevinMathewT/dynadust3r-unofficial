@@ -13,24 +13,22 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 
 **Pretrained weights:** [DynaDUSt3R (HF)](https://huggingface.co/KevinMathew/dynadust3r-unofficial-weights) — ADT benchmark scores are listed on the repo page.
 
-<div style="overflow-x: auto;">
-<table style="border-collapse: collapse;">
+<table>
 <tr>
-<td align="center" style="vertical-align: top; padding: 0 10px;">
+<td align="center">
 <b>Input</b><br>
-<img src="extras/viz/rolling-input.gif" alt="input rolling" width="300" height="300" style="display: block; margin: 0 auto;" />
+<img src="extras/viz/rolling-input.gif" alt="input rolling" width="250" />
 </td>
-<td align="center" style="vertical-align: top; padding: 0 10px;">
+<td align="center">
 <b>Point Map Predictions</b><br>
-<img src="extras/viz/rolling-points.gif" alt="point cloud output" width="441" height="300" style="display: block; margin: 0 auto;" />
+<img src="extras/viz/rolling-points.gif" alt="point cloud output" width="367" />
 </td>
-<td align="center" style="vertical-align: top; padding: 0 10px;">
+<td align="center">
 <b>Motion Map Predictions</b><br>
-<img src="extras/viz/rolling-motion.gif" alt="motion output" width="441" height="300" style="display: block; margin: 0 auto;" />
+<img src="extras/viz/rolling-motion.gif" alt="motion output" width="367" />
 </td>
 </tr>
 </table>
-</div>
 
 ---
 
