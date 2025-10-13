@@ -13,22 +13,20 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 
 **Pretrained weights:** [DynaDUSt3R (HF)](https://huggingface.co/KevinMathew/dynadust3r-unofficial-weights) — ADT benchmark scores are listed on the repo page.
 
-<table>
-<tr>
-<td width="33%" align="center">
-<b>Input</b><br>
-<img src="extras/viz/rolling-input.gif" alt="input rolling" style="height: 390px; width: auto;" />
-</td>
-<td width="33%" align="center">
-<b>Point Cloud Output</b><br>
-<img src="extras/viz/rolling-points.gif" alt="point cloud output" style="height: 390px; width: auto;" />
-</td>
-<td width="33%" align="center">
-<b>Motion Output</b><br>
-<img src="extras/viz/rolling-motion.gif" alt="motion output" style="height: 390px; width: auto;" />
-</td>
-</tr>
-</table>
+<div style="display: flex; align-items: flex-start; justify-content: center; gap: 12px; width: 100%; flex-wrap: nowrap;">
+  <div style="text-align: center;">
+    <b>Input</b><br>
+    <img src="extras/viz/rolling-input.gif" alt="input rolling" style="height: clamp(120px, 16.5vw, 360px); width: auto; max-width: 100%; display: block;" />
+  </div>
+  <div style="text-align: center;">
+    <b>Point Cloud Output</b><br>
+    <img src="extras/viz/rolling-points.gif" alt="point cloud output" style="height: clamp(120px, 16.5vw, 360px); width: auto; max-width: 100%; display: block;" />
+  </div>
+  <div style="text-align: center;">
+    <b>Motion Output</b><br>
+    <img src="extras/viz/rolling-motion.gif" alt="motion output" style="height: clamp(120px, 16.5vw, 360px); width: auto; max-width: 100%; display: block;" />
+  </div>
+</div>
 
 ---
 
