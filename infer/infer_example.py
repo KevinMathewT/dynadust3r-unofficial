@@ -219,7 +219,7 @@ def main(config: DictConfig):
         # Top-percentile persistent trajectories
         traj_percentile = float(config.infer.get("traj_percentile_threshold", 0.75))
         visualize_trajectories_from_pms(pms_seq, motion_seq, image_seq=image_seq, 
-                                        name=f"paper_seq_{base}", traj_percentile_threshold=traj_percentile) #, save=True, path=str(rerun_file))
+                                        name=f"paper_seq_{base}", traj_percentile_threshold=traj_percentile, save=True, path=str(rerun_file))
 
         print(f"Processed {gif_path}")
 

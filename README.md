@@ -11,12 +11,13 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 
 **Datasets:** [Stereo4D annotations (GCS)](https://console.cloud.google.com/storage/browser/stereo4d) · [Left-eye perspective (HF)](https://huggingface.co/datasets/KevinMathew/stereo4d-lefteye-perspective) · [Right-eye perspective (HF)](https://huggingface.co/datasets/KevinMathew/stereo4d-righteye-perspective) *(not used in this training)*
 
-**Pretrained weights:** [DynaDUSt3R (HF)](https://huggingface.co/KevinMathew/dynadust3r-unofficial-weights) — ADT benchmark scores are listed on the repo page.
+**Pretrained weights:** [DynaDUSt3R (HF)](https://huggingface.co/KevinMathew/dynadust3r-unofficial-weights) — ADT benchmark scores are listed on the repo page · **Training**: ~29 hours, 4xH100 GPUs, 98k iterations, batch-size 16 (grad acc: 2 iterations).
 
+**Model Output Visualizations**: [Best ADT EPE3D Score Model Visualizations](https://triborough.cs.nyu.edu/km6748/dynadust3r.html)
 
 ---
 
-## example
+## example viz
 <!-- One row, fills 100% width, equal heights, correct aspect ratios -->
 <table width="100%">
   <tr>
@@ -31,6 +32,34 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
   </tr>
 </table>
 
+<table width="100%">
+  <tr>
+    <td width="50%" align="center">
+      <img src="extras/viz/dog-on-field-input.gif" width="100%" alt="Input"><br>
+      <b>Input</b>
+    </td>
+    <td width="50%" align="center">
+      <img src="extras/viz/dog-on-field-points.gif" width="100%" alt="Point + Motion Map Predictions"><br>
+      <b>Point + Motion Map Predictions</b>
+    </td>
+  </tr>
+</table>
+
+<table width="100%">
+  <tr>
+    <td width="50%" align="center">
+      <img src="extras/viz/exhibition-input.gif" width="100%" alt="Input"><br>
+      <b>Input</b>
+    </td>
+    <td width="50%" align="center">
+      <img src="extras/viz/exhibition-points.gif" width="100%" alt="Point + Motion Map Predictions"><br>
+      <b>Point + Motion Map Predictions</b>
+    </td>
+  </tr>
+</table>
+
+
+- find more visualizations [here](https://triborough.cs.nyu.edu/km6748/dynadust3r.html).
 
 ---
 
