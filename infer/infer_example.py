@@ -119,7 +119,7 @@ def main(config: DictConfig):
     _ensure_dir(output_dir)
     
     # Rerun visualization output directory
-    rerun_dir = Path("/scratch/km6748/vision-experiments/scratch/rerun_visualizations")
+    rerun_dir = Path(f"{str(output_dir)}/rerun_visualizations")
     _ensure_dir(rerun_dir)
 
     gif_glob = str(config.infer.gif_glob)

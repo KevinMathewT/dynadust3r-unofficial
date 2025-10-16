@@ -13,8 +13,6 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 
 **Pretrained weights:** [DynaDUSt3R (HF)](https://huggingface.co/KevinMathew/dynadust3r-unofficial-weights) — ADT benchmark scores are listed on the repo page · **Training**: ~29 hours, 4xH100 GPUs, 98k iterations, batch-size 16 (grad acc: 2 iterations).
 
-**Model Output Visualizations**: [Best ADT EPE3D Score Model Visualizations](https://triborough.cs.nyu.edu/km6748/dynadust3r.html)
-
 ---
 
 ## example viz
@@ -57,9 +55,6 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
     </td>
   </tr>
 </table>
-
-
-- find more visualizations [here](https://triborough.cs.nyu.edu/km6748/dynadust3r.html).
 
 ---
 

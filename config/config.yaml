@@ -53,9 +53,10 @@ infer:
   # checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-09-14/13-03-43/checkpoints/best_loss_1.521715_iter_70000_epoch_35.pth
   # checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-10-01/14-57-07/checkpoints/best_loss_0.482816_iter_92000_epoch_46.pth
   # checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-10-09/21-11-57/checkpoints/last_iter_98000_epoch_49.pth
-  checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-10-09/21-11-57/checkpoints/best_loss_0.480798_iter_90000_epoch_45.pth
-  input_dir: /scratch/km6748/vision-experiments/scratch/paper
-  output_dir: /scratch/km6748/vision-experiments/scratch/paper/results
+  # checkpoint_path: /scratch/km6748/vision-experiments/outputs/2025-10-09/21-11-57/checkpoints/best_loss_0.480798_iter_90000_epoch_45.pth
+  checkpoint_path: /scratch/km6748/dynadust3r-unofficial/dynadust3r-unofficial-weights/best_loss_0.480798_iter_90000_epoch_45.pth
+  input_dir: scratch/gifs/new
+  output_dir: scratch/gifs/results
   gif_glob: "*.gif"
   device: auto  # auto|cuda|cpu
   num_query_times: 5
