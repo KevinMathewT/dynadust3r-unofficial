@@ -17,14 +17,64 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 
 ## example viz
 
-| Input | Point + Motion Map Predictions |
-|:-----:|:-------------------------------:|
-| <img src="extras/viz/rolling-input.gif" width="100%" alt="Input"> | <img src="extras/viz/rolling-points.gif" width="100%" alt="Point + Motion Map Predictions"> |
-| <img src="extras/viz/dog-on-field-input.gif" width="100%" alt="Input"> | <img src="extras/viz/dog-on-field-points.gif" width="100%" alt="Point + Motion Map Predictions"> |
-| <img src="extras/viz/exhibition-input.gif" width="100%" alt="Input"> | <img src="extras/viz/exhibition-points.gif" width="100%" alt="Point + Motion Map Predictions"> |
-| <img src="extras/viz/cow-input.gif" width="100%" alt="Input"> | <img src="extras/viz/cow-points.gif" width="100%" alt="Point + Motion Map Predictions"> |
-| <img src="extras/viz/museum-input.gif" width="100%" alt="Input"> | <img src="extras/viz/museum-points.gif" width="100%" alt="Point + Motion Map Predictions"> |
-| <img src="extras/viz/park-input.gif" width="100%" alt="Input"> | <img src="extras/viz/park-points.gif" width="100%" alt="Point + Motion Map Predictions"> |
+<table width="100%">
+  <thead>
+    <tr>
+      <th width="50%" align="center">Input</th>
+      <th width="50%" align="center">Point + Motion Map Predictions</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td width="50%" align="center">
+        <img src="extras/viz/rolling-input.gif" width="100%" alt="Input">
+      </td>
+      <td width="50%" align="center">
+        <img src="extras/viz/rolling-points.gif" width="100%" alt="Point + Motion Map Predictions">
+      </td>
+    </tr>
+    <tr>
+      <td width="50%" align="center">
+        <img src="extras/viz/dog-on-field-input.gif" width="100%" alt="Input">
+      </td>
+      <td width="50%" align="center">
+        <img src="extras/viz/dog-on-field-points.gif" width="100%" alt="Point + Motion Map Predictions">
+      </td>
+    </tr>
+    <tr>
+      <td width="50%" align="center">
+        <img src="extras/viz/exhibition-input.gif" width="100%" alt="Input">
+      </td>
+      <td width="50%" align="center">
+        <img src="extras/viz/exhibition-points.gif" width="100%" alt="Point + Motion Map Predictions">
+      </td>
+    </tr>
+    <tr>
+      <td width="50%" align="center">
+        <img src="extras/viz/cow-input.gif" width="100%" alt="Input">
+      </td>
+      <td width="50%" align="center">
+        <img src="extras/viz/cow-points.gif" width="100%" alt="Point + Motion Map Predictions">
+      </td>
+    </tr>
+    <tr>
+      <td width="50%" align="center">
+        <img src="extras/viz/museum-input.gif" width="100%" alt="Input">
+      </td>
+      <td width="50%" align="center">
+        <img src="extras/viz/museum-points.gif" width="100%" alt="Point + Motion Map Predictions">
+      </td>
+    </tr>
+    <tr>
+      <td width="50%" align="center">
+        <img src="extras/viz/park-input.gif" width="100%" alt="Input">
+      </td>
+      <td width="50%" align="center">
+        <img src="extras/viz/park-points.gif" width="100%" alt="Point + Motion Map Predictions">
+      </td>
+    </tr>
+  </tbody>
+</table>
 
 ---
 
