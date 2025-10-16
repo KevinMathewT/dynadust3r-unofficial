@@ -20,7 +20,7 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 <table width="100%">
   <thead>
     <tr>
-      <th width="50%" align="center">Input</th>
+      <th width="50%" align="center">Input (Left + Right Images)</th>
       <th width="50%" align="center">Point + Motion Map Predictions</th>
     </tr>
   </thead>
