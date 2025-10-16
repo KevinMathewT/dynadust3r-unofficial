@@ -16,80 +16,15 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
 ---
 
 ## example viz
-<!-- Column headers -->
-<table width="100%">
-  <tr>
-    <td width="50%" align="center"><b>Input</b></td>
-    <td width="50%" align="center"><b>Point + Motion Map Predictions</b></td>
-  </tr>
-</table>
 
-<!-- Examples -->
-<table width="100%">
-  <tr>
-    <td width="50%" align="center">
-      <img src="extras/viz/rolling-input.gif" width="100%" alt="Input">
-    </td>
-    <td width="50%" align="center">
-      <img src="extras/viz/rolling-points.gif" width="100%" alt="Point + Motion Map Predictions">
-    </td>
-  </tr>
-</table>
-
-<table width="100%">
-  <tr>
-    <td width="50%" align="center">
-      <img src="extras/viz/dog-on-field-input.gif" width="100%" alt="Input">
-    </td>
-    <td width="50%" align="center">
-      <img src="extras/viz/dog-on-field-points.gif" width="100%" alt="Point + Motion Map Predictions">
-    </td>
-  </tr>
-</table>
-
-<table width="100%">
-  <tr>
-    <td width="50%" align="center">
-      <img src="extras/viz/exhibition-input.gif" width="100%" alt="Input">
-    </td>
-    <td width="50%" align="center">
-      <img src="extras/viz/exhibition-points.gif" width="100%" alt="Point + Motion Map Predictions">
-    </td>
-  </tr>
-</table>
-
-<table width="100%">
-  <tr>
-    <td width="50%" align="center">
-      <img src="extras/viz/cow-input.gif" width="100%" alt="Input">
-    </td>
-    <td width="50%" align="center">
-      <img src="extras/viz/cow-points.gif" width="100%" alt="Point + Motion Map Predictions">
-    </td>
-  </tr>
-</table>
-
-<table width="100%">
-  <tr>
-    <td width="50%" align="center">
-      <img src="extras/viz/museum-input.gif" width="100%" alt="Input">
-    </td>
-    <td width="50%" align="center">
-      <img src="extras/viz/museum-points.gif" width="100%" alt="Point + Motion Map Predictions">
-    </td>
-  </tr>
-</table>
-
-<table width="100%">
-  <tr>
-    <td width="50%" align="center">
-      <img src="extras/viz/park-input.gif" width="100%" alt="Input">
-    </td>
-    <td width="50%" align="center">
-      <img src="extras/viz/park-points.gif" width="100%" alt="Point + Motion Map Predictions">
-    </td>
-  </tr>
-</table>
+| Input | Point + Motion Map Predictions |
+|:-----:|:-------------------------------:|
+| <img src="extras/viz/rolling-input.gif" width="100%" alt="Input"> | <img src="extras/viz/rolling-points.gif" width="100%" alt="Point + Motion Map Predictions"> |
+| <img src="extras/viz/dog-on-field-input.gif" width="100%" alt="Input"> | <img src="extras/viz/dog-on-field-points.gif" width="100%" alt="Point + Motion Map Predictions"> |
+| <img src="extras/viz/exhibition-input.gif" width="100%" alt="Input"> | <img src="extras/viz/exhibition-points.gif" width="100%" alt="Point + Motion Map Predictions"> |
+| <img src="extras/viz/cow-input.gif" width="100%" alt="Input"> | <img src="extras/viz/cow-points.gif" width="100%" alt="Point + Motion Map Predictions"> |
+| <img src="extras/viz/museum-input.gif" width="100%" alt="Input"> | <img src="extras/viz/museum-points.gif" width="100%" alt="Point + Motion Map Predictions"> |
+| <img src="extras/viz/park-input.gif" width="100%" alt="Input"> | <img src="extras/viz/park-points.gif" width="100%" alt="Point + Motion Map Predictions"> |
 
 ---
 
