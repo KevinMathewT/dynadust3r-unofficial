@@ -59,18 +59,18 @@ Unofficial reimplementation of **DynaDUSt3R** trained on **Stereo4D**. The Stere
     </tr>
     <tr>
       <td width="50%" align="center">
-        <img src="extras/viz/museum-input.gif" width="100%" alt="Input">
-      </td>
-      <td width="50%" align="center">
-        <img src="extras/viz/museum-points.gif" width="100%" alt="Point + Motion Map Predictions">
-      </td>
-    </tr>
-    <tr>
-      <td width="50%" align="center">
         <img src="extras/viz/park-input.gif" width="100%" alt="Input">
       </td>
       <td width="50%" align="center">
         <img src="extras/viz/park-points.gif" width="100%" alt="Point + Motion Map Predictions">
+      </td>
+    </tr>
+    <tr>
+      <td width="50%" align="center">
+        <img src="extras/viz/dog-input.gif" width="100%" alt="Input">
+      </td>
+      <td width="50%" align="center">
+        <img src="extras/viz/dog-points.gif" width="100%" alt="Point + Motion Map Predictions">
       </td>
     </tr>
   </tbody>
