@@ -347,14 +347,9 @@ Notes:
 ```bash
 # accelerate
 accelerate launch -m train data.loader=stereo4d ...
+
 # or (inside Poetry)
 poetry run accelerate launch -m train data.loader=stereo4d ...
-
-# torchrun
-torchrun --nproc_per_node=8 -m train data.loader=stereo4d ...
-
-# slurm (template provided)
-sbatch extras/train_dynadust3r.sbatch
 ```
 
 ### checkpoints, logs, viz
